@@ -164,7 +164,10 @@ fn manifest_v2_uses_manifest_identity_without_mutating_content_identity() {
     );
 
     let path = write_manifest(dir.path(), &manifest).unwrap();
-    assert_eq!(path.file_name().unwrap(), format!("{manifest_id}.json"));
+    assert_eq!(
+        path.file_name().unwrap().to_string_lossy(),
+        format!("{manifest_id}.json")
+    );
 
     let written: Manifest = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(written.schema, 2);

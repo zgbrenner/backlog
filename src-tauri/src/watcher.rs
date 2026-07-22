@@ -48,7 +48,7 @@ pub fn spawn(pipeline: Arc<Pipeline>, dir: PathBuf) -> anyhow::Result<()> {
                 match result {
                     DebounceEventResult::Ok(events) => {
                         for event in events {
-                            for path in event.paths {
+                            for path in event.paths.clone() {
                                 if is_candidate(&path) {
                                     enqueue(&runtime, &pipeline, path);
                                 }
