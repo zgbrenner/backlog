@@ -36,8 +36,26 @@ const NATIVE_TYPES: &[&str] = &[
 
 const IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/tiff", "image/bmp", "image/webp"];
 
+/// Read at most `max` bytes of the header for type detection. Never buffers a
+/// whole (possibly enormous or adversarial) file just to sniff magic bytes —
+/// a malicious oversized drop would otherwise OOM the process.
+fn read_header(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; max];
+    let mut filled = 0;
+    while filled < max {
+        match f.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
 pub fn detect(path: &Path) -> RouteDecision {
-    let bytes = match std::fs::read(path) {
+    let bytes = match read_header(path, 8192) {
         Ok(b) if !b.is_empty() => b,
         Ok(_) => {
             return RouteDecision {

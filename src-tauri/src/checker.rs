@@ -45,6 +45,24 @@ pub enum CheckError {
     TooLong(usize, usize),
 }
 
+impl CheckError {
+    /// Value-free reason code for logs and audit trails. The `Display` form
+    /// embeds the offending subject/date/description (needed to re-prompt the
+    /// on-device model), so anything that PERSISTS a rejection must log this
+    /// instead — never the raw document-derived text.
+    pub fn code(&self) -> &'static str {
+        match self {
+            CheckError::BadDate(_) => "BAD_DATE",
+            CheckError::DateOutOfRange(_) => "DATE_OUT_OF_RANGE",
+            CheckError::DateNotInEvidence(_) => "DATE_NOT_IN_EVIDENCE",
+            CheckError::BadDateSource(_) => "BAD_DATE_SOURCE",
+            CheckError::BadSubject(_) => "BAD_SUBJECT",
+            CheckError::BadDescription(_) => "BAD_DESCRIPTION",
+            CheckError::TooLong(_, _) => "TOO_LONG",
+        }
+    }
+}
+
 static GENERIC_SUBJECTS: &[&str] = &[
     "document", "scan", "scanned document", "untitled", "pdf", "file",
     "attachment", "img", "image", "doc", "new document", "letter",

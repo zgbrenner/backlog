@@ -60,6 +60,13 @@ pub fn spawn(pipeline: Arc<Pipeline>, dir: PathBuf) -> anyhow::Result<()> {
 fn enqueue(rt: &tokio::runtime::Handle, pipeline: &Arc<Pipeline>, path: PathBuf) {
     let pl = pipeline.clone();
     rt.spawn(async move {
+        // Global backpressure: bound how many files are stability-probed and
+        // hashed at once. A 3,000-file backfill still enqueues 3,000 cheap
+        // parked tasks, but only a bounded few do blocking work concurrently.
+        let _permit = match pl.ingest_slots.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return, // semaphore closed on shutdown
+        };
         if !wait_stable(&path).await {
             return;
         }

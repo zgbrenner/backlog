@@ -26,6 +26,10 @@ pub struct Pipeline {
     pub paused: Arc<AtomicBool>,
     convert_slots: Arc<Semaphore>,
     slm_slots: Arc<Semaphore>,
+    /// Global cap on files being hashed / stability-probed / processed at once,
+    /// so a large backfill applies backpressure instead of spawning thousands
+    /// of concurrent blocking probes.
+    pub ingest_slots: Arc<Semaphore>,
     pacer: Arc<Pacer>,
     model_versions: serde_json::Value,
 }
@@ -44,7 +48,8 @@ impl Pipeline {
         let model_versions = sidecar.versions().unwrap_or_else(|_| json!({}));
         Arc::new(Self {
             convert_slots: Arc::new(Semaphore::new(cfg.convert_workers.max(1))),
-            slm_slots: Arc::new(Semaphore::new(4)),
+            slm_slots: Arc::new(Semaphore::new(cfg.slm_parallel.max(1) as usize)),
+            ingest_slots: Arc::new(Semaphore::new((cfg.convert_workers.max(1) * 4).clamp(8, 64))),
             pacer: Arc::new(Pacer::new(cfg.manifest_emit_per_min)),
             cfg,
             ledger,
@@ -109,7 +114,9 @@ impl Pipeline {
                 return;
             }
         }
-        let _ = self.ledger.log_event(&sha, "ingest", &format!("path={}", path.display()));
+        // The sha256 is the event's key and original_path/name live in the
+        // jobs row; don't duplicate the (PII) path into the audit log.
+        let _ = self.ledger.log_event(&sha, "ingest", "ingested");
         self.emit_update(&sha);
 
         // ---- Route ---------------------------------------------------------
@@ -276,6 +283,8 @@ impl Pipeline {
             Ok(_) => {
                 let _ = self.ledger.set_state(&sha, JobState::Emitted);
                 let _ = self.ledger.log_event(&sha, "emit", "manifest written");
+                // File is done; drop its raw document text from the cache.
+                self.purge_cache(&sha);
             }
             Err(e) => {
                 self.flag(&sha, &path, format!("RUNTIME_FAIL:manifest {e}")).await;
@@ -394,10 +403,14 @@ impl Pipeline {
                         return Some(v);
                     }
                     Err(ce) => {
+                        // Full message (with the offending text) drives the
+                        // on-device re-prompt; the persisted log gets the code.
                         violation = Some(ce.to_string());
-                        let _ = self
-                            .ledger
-                            .log_event(sha, "validate", &format!("attempt {attempt} rejected: {ce}"));
+                        let _ = self.ledger.log_event(
+                            sha,
+                            "validate",
+                            &format!("attempt {attempt} rejected: {}", ce.code()),
+                        );
                         if matches!(ce, CheckError::TooLong(_, _)) && attempt >= 2 {
                             // Length problems rarely improve with escalation;
                             // ask for a shorter subject explicitly.
@@ -422,7 +435,7 @@ impl Pipeline {
         ext: &str,
         existing: &crate::ledger::Job,
     ) {
-        let _ = self.ledger.log_event(sha, "ingest", &format!("duplicate content at {}", path.display()));
+        let _ = self.ledger.log_event(sha, "ingest", "duplicate content detected");
         if existing.state != JobState::Emitted {
             return; // duplicate of a flagged file: nothing sane to emit
         }
@@ -634,8 +647,20 @@ impl Pipeline {
         };
         write_manifest(&self.cfg.manifests_dir(), &m)?;
         self.ledger.set_state(sha, JobState::Emitted)?;
+        self.purge_cache(sha);
         self.emit_update(sha);
         Ok(())
+    }
+
+    /// Delete a job's cached raw markdown unless the operator opted into
+    /// corpus retention. Keeps document text off disk once a file is resolved;
+    /// flagged files awaiting human review are purged only after resubmit.
+    fn purge_cache(&self, sha: &str) {
+        if self.cfg.retain_cache {
+            return;
+        }
+        let cache = self.cfg.cache_dir.join(format!("{sha}.md"));
+        let _ = std::fs::remove_file(cache);
     }
 }
 
@@ -652,6 +677,31 @@ fn relpath(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// Sweep cache entries older than `ttl_days` on startup: orphaned document
+/// text from crashed or aborted runs must not linger on disk indefinitely.
+pub fn sweep_cache(cache_dir: &Path, ttl_days: u64) {
+    if cache_dir.as_os_str().is_empty() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(cache_dir) else { return };
+    let Some(cutoff) = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(ttl_days.saturating_mul(86_400)))
+    else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("md") {
+            continue;
+        }
+        if let Ok(modified) = e.metadata().and_then(|m| m.modified()) {
+            if modified < cutoff {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
 }
 
 /// Deterministic, filesystem-safe identity for a physical duplicate copy:

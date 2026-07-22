@@ -6,7 +6,13 @@ downloads anything at runtime.
 
 Records SHA-256 of every file into models.lock.json on first download and
 VERIFIES against the lockfile on every subsequent run. Commit models.lock.json
-to the repo once generated; do not hand-edit it.
+to the repo once generated (it MUST be committed for reproducible verification);
+do not hand-edit it.
+
+Windows: Developer Mode / admin is no longer required. HF downloads are forced
+to copy files instead of creating symlinks (local_dir_use_symlinks=False), which
+avoids the WinError 1314 "a required privilege is not held" failure on large
+model snapshots.
 
 Usage:
   python download_models.py            # core models
@@ -61,6 +67,28 @@ def record(lock: dict, rel: str, path: Path):
     print(f"  {rel}  sha256={digest[:16]}...")
 
 
+def _locked_rels(lock: dict, target: str):
+    """Lockfile keys belonging to `target` (a single file key, or a dir prefix)."""
+    if target in lock:
+        return [target]
+    prefix = target + "/"
+    return [rel for rel in lock if rel.startswith(prefix)]
+
+
+def is_complete(lock: dict, target: str, dest: Path) -> bool:
+    """A download is complete only if `dest` exists AND every file the committed
+    lock records for it is present. A bare-directory existence check treats an
+    interrupted (partial) download as done and skips it forever; verifying
+    against the lock re-fetches when any locked file is missing. With no lock
+    entries yet (first run) we fall back to plain existence."""
+    if not dest.exists():
+        return False
+    rels = _locked_rels(lock, target)
+    if not rels:
+        return True
+    return all((HERE / rel).exists() for rel in rels)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vl", action="store_true", help="also fetch LFM2.5-VL-450M-Extract")
@@ -73,34 +101,45 @@ def main():
         sys.exit(1)
     import urllib.request
 
-    lock = json.loads(LOCK.read_text()) if LOCK.exists() else {}
+    lock = json.loads(LOCK.read_text(encoding="utf-8")) if LOCK.exists() else {}
     items = CORE + (VL if args.vl else [])
 
     for repo, filename, target in items:
         dest = HERE / target
         print(f"[{repo}]")
         if filename:
-            if not dest.exists():
-                got = hf_hub_download(repo_id=repo, filename=filename, local_dir=HERE)
+            if not is_complete(lock, target, dest):
+                # local_dir_use_symlinks=False -> copy, not symlink, so Windows
+                # downloads work without Developer Mode/admin (avoids WinError 1314).
+                got = hf_hub_download(repo_id=repo, filename=filename, local_dir=HERE,
+                                      local_dir_use_symlinks=False)
                 got = Path(got)
                 if got != dest:
                     got.replace(dest)
             record(lock, target, dest)
         else:
-            if not dest.exists():
-                snapshot_download(repo_id=repo, local_dir=dest)
-            # lock every file in the snapshot
+            if not is_complete(lock, target, dest):
+                # local_dir_use_symlinks=False -> copy, not symlink, so Windows
+                # downloads work without Developer Mode/admin (avoids WinError 1314).
+                # snapshot_download resumes, completing a partial/interrupted dir.
+                snapshot_download(repo_id=repo, local_dir=dest,
+                                  local_dir_use_symlinks=False)
+            # lock every file in the snapshot. Use as_posix() so a lock generated
+            # on Windows (backslashes) still verifies on macOS/Linux and vice versa.
             for f in sorted(dest.rglob("*")):
                 if f.is_file() and not f.name.startswith("."):
-                    record(lock, str(f.relative_to(HERE)), f)
+                    record(lock, f.relative_to(HERE).as_posix(), f)
 
     ft = HERE / "lid.176.ftz"
     print("[fasttext lid.176]")
     if not ft.exists():
-        urllib.request.urlretrieve(FASTTEXT_URL, ft)
+        # timeout so a stalled connection fails fast instead of hanging forever
+        # (urlretrieve has no timeout).
+        with urllib.request.urlopen(FASTTEXT_URL, timeout=60) as resp:
+            ft.write_bytes(resp.read())
     record(lock, "lid.176.ftz", ft)
 
-    LOCK.write_text(json.dumps(lock, indent=2, sort_keys=True))
+    LOCK.write_text(json.dumps(lock, indent=2, sort_keys=True), encoding="utf-8")
     print(f"\nWrote {LOCK} ({len(lock)} entries). Commit this file.")
     print("Copy the whole models/ directory to the deployment machine.")
 

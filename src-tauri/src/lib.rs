@@ -81,6 +81,15 @@ fn get_stats(state: tauri::State<AppState>) -> Result<serde_json::Value, String>
 
 #[tauri::command]
 fn get_evidence(state: tauri::State<AppState>, sha256: String) -> Result<String, String> {
+    // The id is a ledger key (a content hash, optionally with a duplicate
+    // suffix). Reject anything that isn't hex/'-' so a crafted value can't
+    // traverse out of the cache dir through the `{sha256}.md` join.
+    if sha256.is_empty()
+        || sha256.len() > 90
+        || !sha256.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+    {
+        return Err("invalid id".into());
+    }
     let cfg = state.cfg.lock().unwrap().clone();
     let p = cfg.cache_dir.join(format!("{sha256}.md"));
     std::fs::read_to_string(p).map_err(|e| e.to_string())
@@ -118,8 +127,10 @@ fn set_paused(state: tauri::State<AppState>, paused: bool) -> Result<(), String>
 #[tauri::command]
 fn start_pipeline(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
     let cfg = state.cfg.lock().unwrap().clone();
-    if !cfg.ready() {
-        return Err("Configure the Processing, Outbox, and Quarantine folders first.".into());
+    cfg.validate()?;
+    // Sweep orphaned cached document text past its TTL before starting.
+    if !cfg.retain_cache {
+        pipeline::sweep_cache(&cfg.cache_dir, cfg.cache_ttl_days);
     }
     let mut slot = state.pipeline.lock().unwrap();
     if slot.is_some() {
@@ -147,9 +158,11 @@ fn start_pipeline(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
 pub fn run() {
     env_logger::init();
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+        // Sidecars (convertd, llama-server) are spawned from Rust via
+        // std::process::Command, so the webview needs neither the shell plugin
+        // nor shell:allow-execute; the opener plugin is unused. Both removed to
+        // shrink the IPC attack surface.
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir().expect("app data dir");
             std::fs::create_dir_all(&data_dir).ok();

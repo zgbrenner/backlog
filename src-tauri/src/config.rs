@@ -47,6 +47,15 @@ pub struct Config {
     /// Retry policy.
     pub max_stage_attempts: u8,
     pub per_file_wall_clock_secs: u64,
+
+    /// Keep converted markdown in the cache after a file is successfully
+    /// emitted. Default false: the raw document text is purged on emit so the
+    /// cache never accumulates document bodies (flagged files awaiting review
+    /// keep their cache until resolved). Set true only to deliberately build
+    /// an Ettin training corpus — an explicit, auditable opt-in.
+    pub retain_cache: bool,
+    /// Days after which an orphaned cache entry is swept on startup.
+    pub cache_ttl_days: u64,
 }
 
 impl Default for Config {
@@ -69,8 +78,16 @@ impl Default for Config {
             max_filename_len: 120,
             max_stage_attempts: 3,
             per_file_wall_clock_secs: 90,
+            retain_cache: false,
+            cache_ttl_days: 7,
         }
     }
+}
+
+fn lexical_norm(p: &Path) -> PathBuf {
+    // Lexical normalization only — folders may not exist yet, so canonicalize
+    // isn't available. Good enough to catch equal/nested paths.
+    p.components().collect()
 }
 
 fn default_convert_workers() -> usize {
@@ -106,5 +123,81 @@ impl Config {
         self.processing_dir.as_os_str().len() > 0
             && self.outbox_dir.as_os_str().len() > 0
             && self.quarantine_dir.as_os_str().len() > 0
+    }
+
+    /// Reject configurations that would corrupt processing: unset folders,
+    /// duplicate folders, or folders nested inside one another. The watcher is
+    /// recursive over the processing dir, so a nested outbox/cache/quarantine
+    /// would feed the app's own manifests and cached markdown back into the
+    /// pipeline as if they were intake documents.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.ready() {
+            return Err("Set the Processing, Outbox, and Quarantine folders first.".into());
+        }
+        let named: [(&str, &Path); 4] = [
+            ("Processing", self.processing_dir.as_path()),
+            ("Outbox", self.outbox_dir.as_path()),
+            ("Quarantine", self.quarantine_dir.as_path()),
+            ("Cache", self.cache_dir.as_path()),
+        ];
+        for i in 0..named.len() {
+            let (a_name, a_path) = named[i];
+            if a_path.as_os_str().is_empty() {
+                continue;
+            }
+            let a = lexical_norm(a_path);
+            for (b_name, b_path) in named.iter().skip(i + 1) {
+                if b_path.as_os_str().is_empty() {
+                    continue;
+                }
+                let b = lexical_norm(b_path);
+                if a == b {
+                    return Err(format!("{a_name} and {b_name} folders must be different."));
+                }
+                if a.starts_with(&b) || b.starts_with(&a) {
+                    return Err(format!(
+                        "{a_name} and {b_name} folders must not be nested inside each other."
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(proc: &str, out: &str, quar: &str, cache: &str) -> Config {
+        Config {
+            processing_dir: proc.into(),
+            outbox_dir: out.into(),
+            quarantine_dir: quar.into(),
+            cache_dir: cache.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn accepts_distinct_folders() {
+        assert!(cfg("/a/proc", "/a/out", "/a/quar", "/a/cache").validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_nested_outbox_under_processing() {
+        let c = cfg("/a/proc", "/a/proc/out", "/a/quar", "/a/cache");
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_folders() {
+        let c = cfg("/a/proc", "/a/proc", "/a/quar", "/a/cache");
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unset_folders() {
+        assert!(cfg("", "", "", "").validate().is_err());
     }
 }

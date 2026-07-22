@@ -234,7 +234,12 @@ def op_convert(args):
             doc.close()
             if n > head + tail and len(markdown) > 40000:
                 per_page = max(1, len(markdown) // n)
-                markdown = markdown[: per_page * head] + "\n\n[...]\n\n" + markdown[-per_page * tail:]
+                # tail slice must be "" when tail<=0: markdown[-0:] is the WHOLE
+                # document, which would make the "trimmed" output larger than
+                # the input instead of smaller.
+                head_md = markdown[: per_page * head]
+                tail_md = markdown[-per_page * tail:] if tail > 0 else ""
+                markdown = head_md + "\n\n[...]\n\n" + tail_md
         except Exception:
             pass
 
@@ -262,8 +267,14 @@ def _render_pages(path, dpi, head, tail):
             page = doc[i]
             scale = dpi / 72.0
             bitmap = page.render(scale=scale)
-            yield bitmap.to_pil().convert("RGB")
+            # .convert("RGB") copies pixels into a fresh PIL image, so the
+            # pdfium bitmap (native memory) and the page handle can be released
+            # immediately. Without bitmap.close() this long-lived process leaks
+            # native memory on every rendered page.
+            img = bitmap.to_pil().convert("RGB")
+            bitmap.close()
             page.close()
+            yield img
     finally:
         doc.close()
 
@@ -428,7 +439,7 @@ def op_versions(_args):
     lock = MODELS_DIR / "models.lock.json"
     if lock.exists():
         try:
-            versions["models"] = json.loads(lock.read_text())
+            versions["models"] = json.loads(lock.read_text(encoding="utf-8"))
         except Exception:
             pass
     return versions

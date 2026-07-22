@@ -167,8 +167,10 @@ impl SlmLane {
         if content.is_empty() {
             anyhow::bail!("SLM returned empty content");
         }
+        // Do not embed `content` in the error: grammar-constrained output is
+        // document-derived and this string is logged. Keep it value-free.
         let out: SlmOutput = serde_json::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("SLM output failed JSON parse despite grammar: {e}; raw: {content}"))?;
+            .map_err(|e| anyhow::anyhow!("SLM output failed JSON parse despite grammar: {e}"))?;
         Ok(out)
     }
 

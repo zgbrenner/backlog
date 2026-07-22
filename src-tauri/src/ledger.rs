@@ -193,15 +193,22 @@ impl Ledger {
     }
 
     pub fn update_fields(&self, sha256: &str, kv: &[(&str, Option<String>)]) -> anyhow::Result<()> {
-        // Column names come from a fixed allowlist at call sites; assert anyway.
+        // Column names come from a fixed allowlist at call sites; enforce it
+        // here too, but BEFORE taking the lock and as a returned error, not a
+        // panic — panicking while holding the connection lock would poison it
+        // and take down every subsequent ledger access.
         const ALLOWED: &[&str] = &[
             "detected_type", "route", "flag_reason", "proposed_date", "date_source",
             "proposed_subject", "description", "final_filename", "doc_type",
             "language", "duplicate_of", "soft_flags", "model_versions",
         ];
+        for (col, _) in kv {
+            if !ALLOWED.contains(col) {
+                anyhow::bail!("disallowed ledger column: {col}");
+            }
+        }
         let conn = self.conn.lock().unwrap();
         for (col, val) in kv {
-            assert!(ALLOWED.contains(col), "disallowed ledger column: {col}");
             let sql = format!(
                 "UPDATE jobs SET {col}=?2, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE sha256=?1"
             );

@@ -36,6 +36,8 @@ type Config = {
   max_filename_len: number;
   max_stage_attempts: number;
   per_file_wall_clock_secs: number;
+  retain_cache: boolean;
+  cache_ttl_days: number;
 };
 
 const app = document.getElementById("app")!;
