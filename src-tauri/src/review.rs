@@ -1,10 +1,10 @@
 //! Instance-aware human review and corrected-manifest emission.
 //!
-//! Content jobs are intentionally keyed by SHA-256, but the review queue must
-//! not collapse several flagged physical deliveries into one row. This module
-//! reads flagged file instances, overlays any still-present flagged manifest,
-//! restores the matching quarantined source, and re-emits one corrected
-//! manifest using the same stable ManifestId.
+//! Content jobs are keyed by SHA-256, but review must not collapse several
+//! flagged physical deliveries into one row. This module queries flagged file
+//! instances, overlays a still-present flagged manifest, restores the matching
+//! quarantined source, and re-emits one corrected manifest with the same stable
+//! ManifestId.
 
 use crate::checker::{Checker, SlmOutput, Validated};
 use crate::config::Config;
@@ -15,6 +15,7 @@ use crate::pipeline::{hash_file, Pipeline};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 use tauri::Emitter;
 
 #[derive(Debug, Clone, Serialize)]
@@ -37,6 +38,7 @@ pub fn list_review_items(
     limit: usize,
 ) -> anyhow::Result<Vec<ReviewItem>> {
     let connection = Connection::open(db_path)?;
+    connection.busy_timeout(Duration::from_secs(2))?;
     let mut statement = connection.prepare(
         "SELECT fi.instance_id,
                 fi.sha256,
@@ -73,14 +75,16 @@ pub fn list_review_items(
     let mut items = Vec::new();
     for row in rows {
         let mut item = row?;
-        if let Some(manifest) = read_flagged_manifest(
-            manifests_dir,
-            &item.instance_id,
-            &item.sha256,
-        )? {
-            item.flag_reason = manifest.flag_reason;
-            if !manifest.soft_flags.is_empty() {
-                item.soft_flags = Some(manifest.soft_flags.join(","));
+        match read_flagged_manifest(manifests_dir, &item.instance_id, &item.sha256) {
+            Ok(Some(manifest)) => {
+                item.flag_reason = manifest.flag_reason;
+                if !manifest.soft_flags.is_empty() {
+                    item.soft_flags = Some(manifest.soft_flags.join(","));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                item.flag_reason = Some(format!("REVIEW_MANIFEST_ERROR:{error}"));
             }
         }
         items.push(item);
@@ -126,8 +130,7 @@ impl Pipeline {
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();
-        let human_dates = vec![date];
-        let validated = checker.check(&output, &harvest, &human_dates, &today, None)?;
+        let validated = checker.check(&output, &harvest, &[date], &today, None)?;
 
         let owner_id = content_owner_instance_id(&self.cfg.processing_dir, &job);
         self.ledger.register_instance(
@@ -163,14 +166,13 @@ impl Pipeline {
         )?;
         restore_source_for_instance(&self.cfg, &instance, &original_relpath)?;
 
-        let instance_flags = corrected_instance_flags(&job, duplicate);
         let corrected = corrected_manifest(
             &instance,
             &job,
             &validated,
             final_filename,
             original_relpath,
-            instance_flags,
+            corrected_instance_flags(&job, duplicate),
             duplicate,
         );
         write_manifest(&self.cfg.manifests_dir(), &corrected)?;
@@ -222,16 +224,11 @@ fn read_flagged_manifest(
         manifest.manifest_id == instance_id && manifest.sha256 == sha256,
         "pending review manifest does not match the ledger instance"
     );
-    if manifest.status == "flagged" {
-        Ok(Some(manifest))
-    } else {
-        Ok(None)
-    }
+    Ok((manifest.status == "flagged").then_some(manifest))
 }
 
 fn content_owner_instance_id(processing_dir: &Path, job: &Job) -> String {
-    let owner_path = PathBuf::from(&job.original_path);
-    let relative = relative_path(processing_dir, &owner_path);
+    let relative = relative_path(processing_dir, Path::new(&job.original_path));
     derive_instance_id(&job.sha256, &normalize_relpath(&relative))
 }
 
@@ -373,7 +370,7 @@ fn relative_path(root: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::Ledger;
+    use sha2::{Digest, Sha256};
 
     const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const FIRST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -457,7 +454,7 @@ mod tests {
         std::fs::create_dir_all(&processing).unwrap();
         std::fs::create_dir_all(&quarantine).unwrap();
         let correct = b"correct bytes";
-        let digest = crate::pipeline::hash_bytes_for_test(correct);
+        let digest = hex::encode(Sha256::digest(correct));
         let specific = quarantine.join(format!("{}-same.pdf", &SECOND[..12]));
         let ordinary = quarantine.join("same.pdf");
         std::fs::write(&specific, correct).unwrap();
