@@ -11,6 +11,14 @@ on:
         description: Expected lowercase SHA-256 for llama-server.exe
         required: true
         type: string
+      model_bundle_url:
+        description: Direct HTTPS URL to the reviewed BackLog model-bundle ZIP
+        required: true
+        type: string
+      model_bundle_sha256:
+        description: Expected lowercase SHA-256 for the model-bundle ZIP
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -26,21 +34,31 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: "22"
-          package-manager-cache: false
+          cache: npm
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
 
-      - name: Install frontend dependencies
-        run: npm install --ignore-scripts
+      - name: Install locked frontend dependencies
+        run: npm ci --ignore-scripts
 
       - name: Validate frontend
         run: npm run check
+
+      - name: Run lightweight Python tests
+        shell: pwsh
+        run: |
+          python -m unittest discover -s sidecar/tests -v
+          python -m unittest discover -s models/tests -v
+          python -m compileall -q sidecar models training power-automate scripts
 
       - name: Build and smoke-test convertd
         shell: pwsh
@@ -60,17 +78,43 @@ jobs:
             throw "llama-server hash mismatch. Expected $env:LLAMA_SHA256, got $actual"
           }
 
-      - name: Verify committed model bundle when present
+      - name: Stage and verify the reviewed model bundle
         shell: pwsh
+        env:
+          MODEL_BUNDLE_URL: ${{ inputs.model_bundle_url }}
+          MODEL_BUNDLE_SHA256: ${{ inputs.model_bundle_sha256 }}
         run: |
-          if (Test-Path "models/models.lock.json") {
-            python models/download_models.py --verify-only
-          } else {
-            Write-Host "No model lockfile is committed. Building an installer shell for pilot validation only."
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "backlog-models.zip"
+          $expanded = Join-Path $env:RUNNER_TEMP "backlog-models"
+          Invoke-WebRequest -Uri $env:MODEL_BUNDLE_URL -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $env:MODEL_BUNDLE_SHA256.ToLowerInvariant()) {
+            throw "model bundle hash mismatch. Expected $env:MODEL_BUNDLE_SHA256, got $actual"
+          }
+          Expand-Archive -Path $archive -DestinationPath $expanded -Force
+          $source = $expanded
+          if (Test-Path (Join-Path $expanded "models\models.lock.json")) {
+            $source = Join-Path $expanded "models"
+          }
+          if (-not (Test-Path (Join-Path $source "models.lock.json"))) {
+            throw "model bundle must contain models.lock.json at its root or under models/"
+          }
+          Copy-Item -Path (Join-Path $source "*") -Destination "models" -Recurse -Force
+          python models/download_models.py --verify-only
+          foreach ($required in @(
+            "models/Qwen3-0.6B-Q8_0.gguf",
+            "models/Qwen3-1.7B-Q8_0.gguf",
+            "models/gliclass-base-v3.0",
+            "models/granite-embedding-small-english-r2"
+          )) {
+            if (-not (Test-Path $required)) {
+              throw "required model asset is missing: $required"
+            }
           }
 
-      - name: Build Tauri installer
-        run: npm run tauri build
+      - name: Build Tauri NSIS installer
+        run: npm run tauri build -- --bundles nsis
 
       - name: Write package checksums
         shell: pwsh
@@ -85,8 +129,9 @@ jobs:
         with:
           name: backlog-windows-pilot-${{ github.sha }}
           path: |
-            src-tauri/target/release/bundle/**
+            src-tauri/target/release/bundle/nsis/**
             package-checksums.txt
             sidecar/sidecar-build-lock.txt
+            models/models.lock.json
           if-no-files-found: error
           retention-days: 7
