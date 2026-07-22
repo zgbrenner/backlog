@@ -2,6 +2,7 @@ mod checker;
 mod config;
 mod filter;
 mod harvest;
+mod identity;
 mod ledger;
 mod manifest;
 mod pipeline;
@@ -9,6 +10,9 @@ mod routing;
 mod sidecar;
 mod slm;
 mod watcher;
+
+#[cfg(test)]
+mod task3_tests;
 
 use config::Config;
 use ledger::Ledger;
