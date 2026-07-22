@@ -110,6 +110,8 @@ impl Manifest {
 
 /// Write a validated manifest atomically. Replaying an identical manifest is a
 /// no-op; attempting to reuse a manifest ID for different content fails closed.
+/// A matching pending `flagged` delivery may transition to `ok` after human
+/// review through the guarded replacement path below.
 pub fn write_manifest(dir: &Path, manifest: &Manifest) -> anyhow::Result<PathBuf> {
     manifest.validate()?;
     std::fs::create_dir_all(dir)?;
@@ -118,9 +120,13 @@ pub fn write_manifest(dir: &Path, manifest: &Manifest) -> anyhow::Result<PathBuf
     let bytes = serde_json::to_vec_pretty(manifest)?;
 
     if final_path.exists() {
-        let existing = std::fs::read(&final_path)?;
+        let existing_bytes = std::fs::read(&final_path)?;
+        let existing: Manifest = serde_json::from_slice(&existing_bytes)?;
+        if existing.status == "flagged" && manifest.status == "ok" {
+            return replace_flagged_manifest(dir, manifest);
+        }
         anyhow::ensure!(
-            same_delivery(&existing, manifest)?,
+            same_delivery(&existing_bytes, manifest)?,
             "manifest ID {} already exists with different content",
             manifest.manifest_id
         );
@@ -143,9 +149,8 @@ pub fn write_manifest(dir: &Path, manifest: &Manifest) -> anyhow::Result<PathBuf
 }
 
 /// Replace one still-pending flagged delivery after a human approves corrected
-/// metadata. This is intentionally narrower than `write_manifest`: the stable
-/// manifest ID, true content SHA, and physical source identity must all match,
-/// and the only permitted status transition is `flagged` to `ok`.
+/// metadata. The stable manifest ID, true content SHA, and physical source
+/// identity must all match, and the only permitted transition is flagged to ok.
 pub fn replace_flagged_manifest(
     dir: &Path,
     corrected: &Manifest,
@@ -158,6 +163,8 @@ pub fn replace_flagged_manifest(
     std::fs::create_dir_all(dir)?;
 
     let final_path = manifest_path(dir, &corrected.manifest_id);
+    let backup_path = dir.join(format!(".{}.flagged.bak", corrected.manifest_id));
+    recover_stale_backup(&final_path, &backup_path)?;
     if !final_path.exists() {
         return write_manifest(dir, corrected);
     }
@@ -185,9 +192,6 @@ pub fn replace_flagged_manifest(
 
     let corrected_bytes = serde_json::to_vec_pretty(corrected)?;
     let tmp_path = temporary_path(dir, &corrected.manifest_id, "review");
-    let backup_path = dir.join(format!(".{}.flagged.bak", corrected.manifest_id));
-
-    recover_stale_backup(&final_path, &backup_path)?;
     write_synced_temp(&tmp_path, &corrected_bytes)?;
     std::fs::rename(&final_path, &backup_path)?;
 
@@ -202,7 +206,11 @@ pub fn replace_flagged_manifest(
         return Err(replace_error.into());
     }
 
-    std::fs::remove_file(&backup_path)?;
+    if let Err(error) = std::fs::remove_file(&backup_path) {
+        log::warn!(
+            "corrected manifest was committed, but stale backup cleanup failed: {error}"
+        );
+    }
     Ok(final_path)
 }
 
