@@ -1,0 +1,20 @@
+{
+  "schema": 2,
+  "manifest_id": "1111111111111111111111111111111111111111111111111111111111111111",
+  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "status": "ok",
+  "original_name": "Acme Agreement.pdf",
+  "original_relpath": "Clients/Acme/Acme Agreement.pdf",
+  "new_filename": "2024-05-31 Acme Services Agreement.pdf",
+  "description": "Services agreement between Acme Holdings and Example Services dated May 31, 2024.",
+  "date": "2024-05-31",
+  "date_source": "document",
+  "doc_type": "agreement",
+  "language": "en",
+  "soft_flags": [],
+  "model_versions": {
+    "convertd": "0.1.0",
+    "primary_slm": "qwen3-0.6b-q4_k_m"
+  },
+  "processed_at": "2026-07-21T19:30:00Z"
+}
