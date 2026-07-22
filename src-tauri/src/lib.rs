@@ -8,6 +8,7 @@ mod manifest;
 mod pipeline;
 mod preflight;
 mod recovery;
+mod review;
 mod routing;
 mod sidecar;
 mod slm;
@@ -29,6 +30,7 @@ use tauri::Manager;
 
 struct AppState {
     cfg_path: PathBuf,
+    db_path: PathBuf,
     cfg: Mutex<Config>,
     ledger: Arc<Ledger>,
     pipeline: Mutex<Option<Arc<Pipeline>>>,
@@ -142,11 +144,17 @@ fn list_jobs(
 }
 
 #[tauri::command]
-fn list_flagged(state: tauri::State<AppState>) -> Result<Vec<ledger::Job>, String> {
-    state
-        .ledger
-        .list_by_state(ledger::JobState::Flagged)
-        .map_err(|error| error.to_string())
+fn list_flagged(
+    state: tauri::State<AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<review::ReviewItem>, String> {
+    let cfg = state.cfg.lock().unwrap().clone();
+    review::list_review_items(
+        &state.db_path,
+        &cfg.manifests_dir(),
+        limit.unwrap_or(500),
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -164,7 +172,7 @@ fn get_evidence(state: tauri::State<AppState>, sha256: String) -> Result<String,
 #[tauri::command]
 async fn resubmit(
     state: tauri::State<'_, AppState>,
-    sha256: String,
+    instance_id: String,
     date: String,
     subject: String,
     description: String,
@@ -176,7 +184,7 @@ async fn resubmit(
         .clone()
         .ok_or_else(|| "pipeline not started".to_string())?;
     pipeline
-        .resubmit(&sha256, date, subject, description)
+        .resubmit_instance(&instance_id, date, subject, description)
         .await
         .map_err(|error| error.to_string())
 }
@@ -268,14 +276,16 @@ pub fn run() {
             let data_dir = app.path().app_data_dir().expect("app data dir");
             std::fs::create_dir_all(&data_dir).ok();
             let cfg_path = data_dir.join("backlog.config.json");
+            let db_path = data_dir.join("ledger.db");
             let mut cfg = Config::load(&cfg_path);
             resolve_runtime_config(app.handle(), &mut cfg);
             if cfg.cache_dir.as_os_str().is_empty() {
                 cfg.cache_dir = data_dir.join("cache");
             }
-            let ledger = Arc::new(Ledger::open(&data_dir.join("ledger.db"))?);
+            let ledger = Arc::new(Ledger::open(&db_path)?);
             app.manage(AppState {
                 cfg_path,
+                db_path,
                 cfg: Mutex::new(cfg),
                 ledger,
                 pipeline: Mutex::new(None),
