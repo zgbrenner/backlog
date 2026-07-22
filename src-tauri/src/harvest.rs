@@ -235,4 +235,22 @@ mod tests {
         assert!(h.subject_lines.iter().any(|s| s.contains("Termination")));
         assert!(!h.caption_lines.is_empty());
     }
+
+    #[test]
+    fn unicode_boundary_in_head_does_not_panic() {
+        let mut md = "a".repeat(5_999);
+        md.push('é');
+        md.push_str(" trailing text");
+        let h = harvest(&md);
+        assert!(!h.head_excerpt.is_empty());
+    }
+
+    #[test]
+    fn unicode_boundary_in_tail_does_not_panic() {
+        let mut md = "a".repeat(2_500);
+        md.push('ø');
+        md.push_str(&"b".repeat(2_499));
+        let h = harvest(&md);
+        assert!(!h.signature_block.is_empty());
+    }
 }

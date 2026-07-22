@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Type-check and build
+        run: |
+          set -o pipefail
+          npm run check 2>&1 | tee frontend-check.log
+
+      - name: Upload frontend diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-diagnostics-${{ github.sha }}
+          path: frontend-check.log
+          if-no-files-found: ignore
+          retention-days: 1
+
+  rust:
+    name: Rust trust core
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Stage nonfunctional sidecar placeholders for compile checks
+        run: |
+          mkdir -p src-tauri/binaries
+          touch src-tauri/binaries/convertd-x86_64-unknown-linux-gnu
+          touch src-tauri/binaries/llama-server-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/binaries/*
+
+      - name: Check formatting
+        run: |
+          set -o pipefail
+          cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check 2>&1 | tee rustfmt.log
+
+      - name: Run Rust tests
+        if: always()
+        run: |
+          set -o pipefail
+          cargo test --manifest-path src-tauri/Cargo.toml --all-targets 2>&1 | tee rust-tests.log
+
+      - name: Upload Rust diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-diagnostics-${{ github.sha }}
+          path: |
+            rustfmt.log
+            rust-tests.log
+          if-no-files-found: ignore
+          retention-days: 1
+
+  python:
+    name: Python utilities
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Run lightweight sidecar tests
+        run: python -m unittest discover -s sidecar/tests -v
+
+      - name: Compile Python sources
+        run: python -m compileall -q sidecar training models
+
+      - name: Validate Power Automate JSON files when present
+        shell: bash
+        run: |
+          shopt -s nullglob globstar
+          files=(power-automate/**/*.json)
+          for file in "${files[@]}"; do
+            echo "Validating ${file}"
+            python -m json.tool "${file}" >/dev/null
+          done
+
+  source-snapshot:
+    name: Source snapshot
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Create source snapshot
+        run: git archive --format=tar.gz --output="${RUNNER_TEMP}/backlog-source.tgz" HEAD
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v7
+        with:
+          name: backlog-source-${{ github.sha }}
+          path: ${{ runner.temp }}/backlog-source.tgz
+          if-no-files-found: error
+          retention-days: 1

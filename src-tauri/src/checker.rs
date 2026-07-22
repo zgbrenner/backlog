@@ -240,7 +240,7 @@ mod tests {
         let c = Checker::new(120);
         let h = harvest_with(&["2026-01-05"]);
         let e = c.check(&ok_out(), &h, &[], "2026-07-21", None).unwrap_err();
-        matches!(e, CheckError::DateNotInEvidence(_));
+        assert!(matches!(e, CheckError::DateNotInEvidence(_)));
     }
 
     #[test]
