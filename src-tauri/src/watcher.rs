@@ -3,14 +3,15 @@
 //! partial states; hashing a half-synced file wastes a job slot and creates
 //! a phantom duplicate when the full file lands.
 
+use crate::identity::ensure_delivery_path;
 use crate::pipeline::Pipeline;
 use notify_debouncer_full::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-// Flow 1 prefixes stable physical-delivery identifiers with `__bl_`, so a
-// blanket underscore exclusion would silently discard every automated intake.
+// Delivery identity lives in a parent `__bl_<id>` directory, so ordinary
+// underscore-prefixed filenames remain valid intake candidates.
 const IGNORED_PREFIXES: &[&str] = &["~$", "."];
 const STABILITY_PROBES: u32 = 3;
 const ZERO_BYTE_STABILITY_PROBES: u32 = 15;
@@ -36,8 +37,9 @@ pub fn spawn(pipeline: Arc<Pipeline>, dir: PathBuf) -> anyhow::Result<()> {
             }
             log::info!("watching {dir:?}");
 
-            // Sweep every existing file on startup. Stable instance identity
-            // makes this safe after a crash or a missed OneDrive event.
+            // Sweep every existing file on startup. Durable delivery directories
+            // and stable instance identity make this safe after a crash or a
+            // missed OneDrive event.
             for entry in walk(&dir) {
                 enqueue(&runtime, &pipeline, entry);
             }
@@ -70,7 +72,22 @@ fn enqueue(runtime: &tokio::runtime::Handle, pipeline: &Arc<Pipeline>, path: Pat
         if !wait_stable(&path).await {
             return;
         }
-        pipeline.process_file_recoverable(path).await;
+        let delivery_path = match ensure_delivery_path(&path) {
+            Ok(delivery_path) => delivery_path,
+            Err(error) => {
+                // A second watcher event can legitimately observe the old path
+                // after the first event already moved it into its delivery
+                // directory. Only surface errors while the source still exists.
+                if path.exists() {
+                    log::error!(
+                        "cannot assign durable delivery identity to {}: {error}",
+                        path.display()
+                    );
+                }
+                return;
+            }
+        };
+        pipeline.process_file_recoverable(delivery_path).await;
     });
 }
 
@@ -154,11 +171,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_flow_one_stable_delivery_prefix() {
+    fn accepts_underscore_prefixed_original_names() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .join("__bl_5f2b6a9c__Shareholder Register.pdf");
+        let path = dir.path().join("__Shareholder Register.pdf");
         std::fs::write(&path, b"fixture").unwrap();
 
         assert!(is_candidate(&path));
