@@ -67,16 +67,24 @@ impl Manifest {
             "missing original_relpath"
         );
         anyhow::ensure!(!self.processed_at.trim().is_empty(), "missing processed_at");
+        anyhow::ensure!(
+            self.model_versions.is_object(),
+            "model_versions must be an object"
+        );
 
         match self.status.as_str() {
             "ok" => {
                 anyhow::ensure!(self.new_filename.is_some(), "ok manifest missing new_filename");
                 anyhow::ensure!(self.description.is_some(), "ok manifest missing description");
                 anyhow::ensure!(self.date.is_some(), "ok manifest missing date");
+                anyhow::ensure!(self.date_source.is_some(), "ok manifest missing date_source");
                 anyhow::ensure!(self.flag_reason.is_none(), "ok manifest cannot have flag_reason");
                 if let Some(filename) = &self.new_filename {
                     anyhow::ensure!(
-                        !filename.contains(['/', '\\']) && filename != "." && filename != "..",
+                        !filename.contains('/')
+                            && !filename.contains('\\')
+                            && filename != "."
+                            && filename != "..",
                         "new_filename must be one safe path component"
                     );
                 }
@@ -106,7 +114,7 @@ pub fn write_manifest(dir: &Path, manifest: &Manifest) -> anyhow::Result<PathBuf
     manifest.validate()?;
     std::fs::create_dir_all(dir)?;
 
-    let final_path = dir.join(format!("{}.json", manifest.manifest_id));
+    let final_path = manifest_path(dir, &manifest.manifest_id);
     let bytes = serde_json::to_vec_pretty(manifest)?;
 
     if final_path.exists() {
@@ -119,24 +127,8 @@ pub fn write_manifest(dir: &Path, manifest: &Manifest) -> anyhow::Result<PathBuf
         return Ok(final_path);
     }
 
-    let tmp_path = dir.join(format!(
-        ".{}.{}.json.tmp",
-        manifest.manifest_id,
-        std::process::id()
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = match options.open(&tmp_path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(&tmp_path)?;
-            options.open(&tmp_path)?
-        }
-        Err(error) => return Err(error.into()),
-    };
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
+    let tmp_path = temporary_path(dir, &manifest.manifest_id, "write");
+    write_synced_temp(&tmp_path, &bytes)?;
 
     if let Err(rename_error) = std::fs::rename(&tmp_path, &final_path) {
         if final_path.exists() && same_delivery(&std::fs::read(&final_path)?, manifest)? {
@@ -148,6 +140,109 @@ pub fn write_manifest(dir: &Path, manifest: &Manifest) -> anyhow::Result<PathBuf
     }
 
     Ok(final_path)
+}
+
+/// Replace one still-pending flagged delivery after a human approves corrected
+/// metadata. This is intentionally narrower than `write_manifest`: the stable
+/// manifest ID, true content SHA, and physical source identity must all match,
+/// and the only permitted status transition is `flagged` to `ok`.
+pub fn replace_flagged_manifest(
+    dir: &Path,
+    corrected: &Manifest,
+) -> anyhow::Result<PathBuf> {
+    corrected.validate()?;
+    anyhow::ensure!(
+        corrected.status == "ok",
+        "replacement manifest must have status 'ok'"
+    );
+    std::fs::create_dir_all(dir)?;
+
+    let final_path = manifest_path(dir, &corrected.manifest_id);
+    if !final_path.exists() {
+        return write_manifest(dir, corrected);
+    }
+
+    let existing_bytes = std::fs::read(&final_path)?;
+    let existing: Manifest = serde_json::from_slice(&existing_bytes)?;
+    existing.validate()?;
+    anyhow::ensure!(
+        existing.status == "flagged",
+        "only a flagged manifest may be replaced"
+    );
+    anyhow::ensure!(
+        existing.manifest_id == corrected.manifest_id,
+        "replacement manifest ID mismatch"
+    );
+    anyhow::ensure!(
+        existing.sha256 == corrected.sha256,
+        "replacement content SHA-256 mismatch"
+    );
+    anyhow::ensure!(
+        existing.original_name == corrected.original_name
+            && existing.original_relpath == corrected.original_relpath,
+        "replacement source identity mismatch"
+    );
+
+    let corrected_bytes = serde_json::to_vec_pretty(corrected)?;
+    let tmp_path = temporary_path(dir, &corrected.manifest_id, "review");
+    let backup_path = dir.join(format!(".{}.flagged.bak", corrected.manifest_id));
+
+    recover_stale_backup(&final_path, &backup_path)?;
+    write_synced_temp(&tmp_path, &corrected_bytes)?;
+    std::fs::rename(&final_path, &backup_path)?;
+
+    if let Err(replace_error) = std::fs::rename(&tmp_path, &final_path) {
+        let restore_result = std::fs::rename(&backup_path, &final_path);
+        let _ = std::fs::remove_file(&tmp_path);
+        if let Err(restore_error) = restore_result {
+            anyhow::bail!(
+                "manifest replacement failed ({replace_error}) and backup restore failed ({restore_error})"
+            );
+        }
+        return Err(replace_error.into());
+    }
+
+    std::fs::remove_file(&backup_path)?;
+    Ok(final_path)
+}
+
+fn manifest_path(dir: &Path, manifest_id: &str) -> PathBuf {
+    dir.join(format!("{manifest_id}.json"))
+}
+
+fn temporary_path(dir: &Path, manifest_id: &str, purpose: &str) -> PathBuf {
+    dir.join(format!(
+        ".{manifest_id}.{}.{purpose}.json.tmp",
+        std::process::id()
+    ))
+}
+
+fn write_synced_temp(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn recover_stale_backup(final_path: &Path, backup_path: &Path) -> anyhow::Result<()> {
+    if !backup_path.exists() {
+        return Ok(());
+    }
+    if final_path.exists() {
+        std::fs::remove_file(backup_path)?;
+    } else {
+        std::fs::rename(backup_path, final_path)?;
+    }
+    Ok(())
 }
 
 fn same_delivery(existing_bytes: &[u8], proposed: &Manifest) -> anyhow::Result<bool> {
