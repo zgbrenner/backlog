@@ -1,7 +1,6 @@
 # Pins the Rust toolchain for reproducible local and CI builds.
-# rustup reads this automatically in this directory tree; no manual
-# `rustup override` is needed. Bump deliberately and re-run `cargo test` +
-# `cargo clippy` across all platforms before merging a version bump.
+# Bump deliberately and rerun fmt, clippy, tests, and Windows packaging.
 [toolchain]
-channel = "1.94.1"
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]
+profile = "minimal"
