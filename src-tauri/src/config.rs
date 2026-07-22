@@ -120,9 +120,9 @@ impl Config {
     }
 
     pub fn ready(&self) -> bool {
-        self.processing_dir.as_os_str().len() > 0
-            && self.outbox_dir.as_os_str().len() > 0
-            && self.quarantine_dir.as_os_str().len() > 0
+        !self.processing_dir.as_os_str().is_empty()
+            && !self.outbox_dir.as_os_str().is_empty()
+            && !self.quarantine_dir.as_os_str().is_empty()
     }
 
     /// Reject configurations that would corrupt processing: unset folders,

@@ -9,7 +9,7 @@
 
 use crate::checker::SlmOutput;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -61,7 +61,7 @@ impl SlmLane {
         }
     }
 
-    fn spawn_server(&self, gguf: &PathBuf, port: u16) -> anyhow::Result<Child> {
+    fn spawn_server(&self, gguf: &Path, port: u16) -> anyhow::Result<Child> {
         let mut cmd = Command::new(&self.llama_server_exe);
         cmd.args([
             "--model",

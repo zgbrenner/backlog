@@ -69,8 +69,11 @@ impl Pipeline {
 
     /// Entry point per discovered file. Spawned as a task; bounded by pools.
     pub async fn process_file(self: Arc<Self>, path: PathBuf) {
-        if self.paused.load(Ordering::Relaxed) {
-            return;
+        // Hold while paused rather than dropping the file — dropping would
+        // strand anything that arrived during a pause until the next restart's
+        // sweep re-discovered it.
+        while self.paused.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         let overall = tokio::time::timeout(
             std::time::Duration::from_secs(self.cfg.per_file_wall_clock_secs * 3),
@@ -118,6 +121,22 @@ impl Pipeline {
         // jobs row; don't duplicate the (PII) path into the audit log.
         let _ = self.ledger.log_event(&sha, "ingest", "ingested");
         self.emit_update(&sha);
+
+        // Crash-loop guard: a file that keeps taking the daemon down mid-flight
+        // is re-enqueued by the startup sweep on every restart. Bump a durable
+        // attempt counter and quarantine once it exceeds the ceiling, so one
+        // poison-pill document can't wedge the pipeline across restarts.
+        const CRASH_LOOP_LIMIT: u8 = 5;
+        let attempts = self.ledger.bump_attempts(&sha).unwrap_or(0);
+        if attempts > CRASH_LOOP_LIMIT {
+            self.flag(
+                &sha,
+                &path,
+                format!("CRASH_LOOP:exceeded {CRASH_LOOP_LIMIT} processing attempts"),
+            )
+            .await;
+            return;
+        }
 
         // ---- Route ---------------------------------------------------------
         let decision = routing::detect(&path);
@@ -374,13 +393,11 @@ impl Pipeline {
                     Ok(mut v) => {
                         // Ettin/SLM hard disagreement path: one re-prompt with
                         // spans pinned; after that it stays a soft flag.
-                        if v.soft_flags.iter().any(|f| f.starts_with("SPAN_MISMATCH"))
-                            && attempt == 1
-                            && ettin_date.is_some()
-                        {
+                        let span_mismatch =
+                            v.soft_flags.iter().any(|f| f.starts_with("SPAN_MISMATCH"));
+                        if let (true, Some(ed)) = (span_mismatch && attempt == 1, ettin_date) {
                             violation = Some(format!(
-                                "your date disagrees with a high-confidence extracted DATE span ({}); re-examine the evidence spans",
-                                ettin_date.unwrap()
+                                "your date disagrees with a high-confidence extracted DATE span ({ed}); re-examine the evidence spans"
                             ));
                             let _ = self.ledger.log_event(sha, "name", "span mismatch, re-prompting");
                             // keep v as a fallback if the retry also mismatches
@@ -543,12 +560,23 @@ impl Pipeline {
         let _ = self.ledger.set_state(sha, JobState::Flagged);
         let _ = self.ledger.log_event(sha, "flag", &reason);
 
-        // Move to local quarantine. Never delete; move-or-copy.
+        // Move to local quarantine. Never lose the file: move, or copy then
+        // remove the source (cross-volume rename fails). Surface a hard failure
+        // instead of silently leaving the file orphaned in Processing while the
+        // manifest claims it was quarantined.
         let _ = std::fs::create_dir_all(&self.cfg.quarantine_dir);
         if let Some(fname) = path.file_name() {
             let dest = self.cfg.quarantine_dir.join(fname);
             if std::fs::rename(path, &dest).is_err() {
-                let _ = std::fs::copy(path, &dest);
+                match std::fs::copy(path, &dest) {
+                    Ok(_) => {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    Err(e) => {
+                        log::error!("failed to quarantine a flagged file: {e}");
+                        let _ = self.ledger.log_event(sha, "flag", "QUARANTINE_FAILED");
+                    }
+                }
             }
         }
 

@@ -190,12 +190,6 @@ fn clean_line(s: &str) -> String {
     s.trim().trim_end_matches(['.', ',', ';']).replace('\t', " ").to_string()
 }
 
-/// Best deterministic date guess for the fallback path: the earliest-position
-/// date in the head that is not obviously a birthdate-style outlier.
-pub fn primary_date_guess(h: &Harvest) -> Option<String> {
-    h.dates.first().map(|d| d.iso.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

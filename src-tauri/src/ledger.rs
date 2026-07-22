@@ -228,12 +228,6 @@ impl Ledger {
         Ok(n as u8)
     }
 
-    pub fn reset_attempts(&self, sha256: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE jobs SET attempts=0 WHERE sha256=?1", params![sha256])?;
-        Ok(())
-    }
-
     pub fn log_event(&self, sha256: &str, stage: &str, detail: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -282,16 +276,6 @@ impl Ledger {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT * FROM jobs WHERE state=?1 ORDER BY updated_at DESC")?;
         let rows = stmt.query_map(params![state.as_str()], Self::row_to_job)?;
-        Ok(rows.filter_map(Result::ok).collect())
-    }
-
-    /// Jobs that were mid-flight when the app died: anything not terminal.
-    pub fn resumable(&self) -> anyhow::Result<Vec<Job>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT * FROM jobs WHERE state NOT IN ('emitted','flagged') ORDER BY created_at ASC",
-        )?;
-        let rows = stmt.query_map([], Self::row_to_job)?;
         Ok(rows.filter_map(Result::ok).collect())
     }
 

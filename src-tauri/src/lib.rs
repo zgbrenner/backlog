@@ -52,7 +52,7 @@ fn binary(app: &tauri::AppHandle, name: &str) -> PathBuf {
     let candidates = [
         exe_dir.join(name),
         exe_dir.join(format!("{name}.exe")),
-        resource(app, name).with_file_name(name.to_string()),
+        resource(app, name).with_file_name(name),
     ];
     for c in &candidates {
         if c.exists() {

@@ -7,8 +7,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[derive(Debug, Serialize)]
@@ -39,7 +41,17 @@ pub struct Sidecar {
 struct Proc {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    rx: Receiver<std::io::Result<String>>,
+    _reader: JoinHandle<()>,
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        // Never orphan a sidecar process — on replace, timeout, or app exit.
+        // Killing the child closes its stdout, which ends the reader thread.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Sidecar {
@@ -63,9 +75,34 @@ impl Sidecar {
         }
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no sidecar stdin"))?;
-        let stdout =
-            BufReader::new(child.stdout.take().ok_or_else(|| anyhow::anyhow!("no sidecar stdout"))?);
-        Ok(Proc { child, stdin, stdout })
+        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no sidecar stdout"))?;
+
+        // Drain stdout on a dedicated thread so `call` can enforce a per-request
+        // deadline with recv_timeout. A blocking read on the pipe is otherwise
+        // uncancellable, letting one pathological document wedge the sidecar
+        // (and every job queued behind it) indefinitely.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::Builder::new()
+            .name("convertd-reader".into())
+            .spawn(move || {
+                let mut r = BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    match r.read_line(&mut line) {
+                        Ok(0) => break, // EOF: the child closed stdout
+                        Ok(_) => {
+                            if tx.send(Ok(line)).is_err() {
+                                break; // receiver gone; nothing to do
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            })?;
+        Ok(Proc { child, stdin, rx, _reader: reader })
     }
 
     pub fn call(&self, op: &str, args: Value) -> anyhow::Result<Value> {
@@ -88,25 +125,53 @@ impl Sidecar {
         proc.stdin.write_all(line.as_bytes())?;
         proc.stdin.flush()?;
 
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            let n = proc.stdout.read_line(&mut buf)?;
-            if n == 0 {
-                *guard = None; // process died mid-call
+        enum Wake {
+            Resp(Response),
+            Timeout,
+            ReadErr(String),
+            Closed,
+        }
+
+        let deadline = std::time::Instant::now() + self.timeout;
+        let wake = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break Wake::Timeout;
+            }
+            match proc.rx.recv_timeout(remaining) {
+                Ok(Ok(buf)) => match serde_json::from_str::<Response>(buf.trim()) {
+                    Ok(resp) if resp.id == id => break Wake::Resp(resp),
+                    // Stray stderr-ish noise on stdout, or a stale response from
+                    // a replayed job — keep waiting for our id.
+                    _ => continue,
+                },
+                Ok(Err(e)) => break Wake::ReadErr(e.to_string()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Wake::Closed,
+            }
+        };
+
+        match wake {
+            Wake::Resp(resp) => {
+                if !resp.ok {
+                    anyhow::bail!("sidecar '{op}' failed: {}", resp.error.unwrap_or_default());
+                }
+                Ok(resp.data)
+            }
+            // Drop the wedged/broken process (its Drop kills it); the next call
+            // respawns a clean one.
+            Wake::Timeout => {
+                *guard = None;
+                anyhow::bail!("sidecar '{op}' timed out after {:?}", self.timeout);
+            }
+            Wake::ReadErr(e) => {
+                *guard = None;
+                anyhow::bail!("sidecar read error during '{op}': {e}");
+            }
+            Wake::Closed => {
+                *guard = None;
                 anyhow::bail!("sidecar closed stream during '{op}'");
             }
-            let resp: Response = match serde_json::from_str(buf.trim()) {
-                Ok(r) => r,
-                Err(_) => continue, // tolerate stray stderr-ish noise on stdout
-            };
-            if resp.id != id {
-                continue; // stale response from a replayed job
-            }
-            if !resp.ok {
-                anyhow::bail!("sidecar '{op}' failed: {}", resp.error.unwrap_or_default());
-            }
-            return Ok(resp.data);
         }
     }
 
@@ -185,8 +250,6 @@ pub struct ConvertResult {
     pub ocr_used: bool,
     #[serde(default)]
     pub ocr_mean_conf: f64,
-    #[serde(default)]
-    pub page_count: u64,
     #[serde(default)]
     pub encrypted: bool,
     #[serde(default)]
