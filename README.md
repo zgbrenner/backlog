@@ -10,9 +10,10 @@ SharePoint.
 No cloud inference. No terminals. Every model runs on-device; the only cloud
 surfaces are SharePoint and the two Power Automate flows.
 
-Design doc: `2026-07-21 Sortition Pipeline Design.md` (the naming predates the
-app name). Current dependency and release decisions are also recorded in
-`docs/DEPENDENCY_COMPATIBILITY.md` and `docs/RELEASE_CHECKLIST.md`.
+The original product design is in `2026-07-21 Sortition Pipeline Design.md`.
+Current implementation decisions that supersede parts of that prototype are in
+`docs/ARCHITECTURE_AMENDMENTS.md`, `docs/DEPENDENCY_COMPATIBILITY.md`, and
+`docs/RELEASE_CHECKLIST.md`.
 
 ## Architecture at a glance
 
@@ -23,7 +24,7 @@ Intake (SharePoint) --Flow 1--> Processing folder (OneDrive-synced)
                 Tauri shell, Rust core, SQLite ledger
                                       |
       convertd sidecar (Python): MarkItDown, pdfium, RapidOCR,
-                 Lingua, GLiClass, Granite, optional Ettin
+                 Lingua, GLiClass, Granite, optional trained Ettin
       llama-server sidecars: Qwen3-0.6B primary, Qwen3-1.7B escalation,
                  embedded chat templates + JSON Schema output
                                       |
@@ -42,11 +43,12 @@ Intake (SharePoint) --Flow 1--> Processing folder (OneDrive-synced)
 - 64-bit Python 3.11 for the frozen conversion sidecar and model staging.
 - A reviewed `llama-server` build from llama.cpp that supports Qwen3 chat
   templates, `/v1/chat/completions`, and JSON Schema response formats.
-- A complete BackLog model bundle whose files match `models/models.lock.json`.
+- A complete BackLog runtime model bundle whose files match
+  `models/models.lock.json`.
 
 ## Setup
 
-### 1. Stage and lock the models
+### 1. Stage and lock the runtime models
 
 On a connected staging machine:
 
@@ -57,17 +59,21 @@ python download_models.py
 python download_models.py --verify-only
 ```
 
-The core set is:
+The runtime set is:
 
 - `Qwen3-0.6B-Q8_0.gguf`, primary structured naming model;
 - `Qwen3-1.7B-Q8_0.gguf`, escalation model;
-- `gliclass-base-v3.0`, document-type classifier;
-- `granite-embedding-small-english-r2`, salience model; and
-- `ettin-encoder-32m`, training base only, not an enabled extractor.
+- `gliclass-base-v3.0`, document-type classifier; and
+- `granite-embedding-small-english-r2`, salience model.
 
 The downloader writes `models.lock.json` with SHA-256 hashes. Commit and review
-the lockfile, then create a ZIP containing the complete locked model directory
-for Windows packaging. The app never downloads models at runtime.
+the lockfile, then create a ZIP containing the complete locked runtime model
+directory for Windows packaging. The app never downloads models at runtime.
+
+The raw Ettin encoder is a separate training dependency. It is fetched by the
+training workflow when needed and is not recorded in the distributable runtime
+model lock. Only a fine-tuned Ettin output directory that passes the documented
+ship gates may be selected in Settings.
 
 ### 2. Build the conversion sidecar
 
@@ -102,7 +108,7 @@ The Settings tab exposes:
 - Cache folder: local, not synced;
 - Qwen3 primary and escalation GGUF paths, resolved automatically from bundled
   resources in an installed Windows build; and
-- optional fine-tuned Ettin model directory.
+- an optional fine-tuned Ettin model directory.
 
 Run preflight before Start. Preflight checks the folders, both executables,
 model files, grammar resource, and a bounded live ping to the conversion
@@ -139,7 +145,8 @@ python power-automate/validate_examples.py
        --cache "<AppData>/ai.sonomos.backlog/cache" --out data/
    ```
 
-3. Fine-tune:
+3. Fine-tune. The default training script fetches the public Ettin base model
+   independently from the runtime model bundle:
 
    ```bash
    python -m pip install transformers datasets torch
@@ -159,6 +166,8 @@ python power-automate/validate_examples.py
   `date_source: metadata`.
 - Every physical delivery has a stable `ManifestId`. Byte-identical files share
   one true SHA-256 but receive distinct reserved filenames and index rows.
+- The local review queue and human corrections are keyed by physical InstanceId,
+  so several flagged byte-identical files remain separate review items.
 - Replaying the same physical instance reuses its ManifestId and reservation.
 - A paused watcher does not consume the file's only event.
 - A timed-out sidecar is killed and lazily restarted, and a timeout becomes
@@ -173,6 +182,7 @@ src/                    frontend (TypeScript, Vite)
 src-tauri/src/          Rust trust core and orchestrator
   pipeline.rs             content pipeline and retry ladder
   recovery.rs             pause and wall-clock recovery boundary
+  review.rs               instance-aware review and corrected manifests
   checker.rs              deterministic final authority
   harvest.rs              deterministic evidence harvest
   filter.rs               evidence bundle assembly
@@ -200,6 +210,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 python -m unittest discover -s sidecar/tests -v
 python -m unittest discover -s models/tests -v
+python scripts/frontend_smoke.py
 python -m compileall -q sidecar training models power-automate scripts
 python power-automate/validate_examples.py
 ```
