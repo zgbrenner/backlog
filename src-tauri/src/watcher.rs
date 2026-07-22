@@ -9,9 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-const IGNORED_PREFIXES: &[&str] = &["~$", ".", "_"];
+// Flow 1 prefixes stable physical-delivery identifiers with `__bl_`, so a
+// blanket underscore exclusion would silently discard every automated intake.
+const IGNORED_PREFIXES: &[&str] = &["~$", "."];
 const STABILITY_PROBES: u32 = 3;
+const ZERO_BYTE_STABILITY_PROBES: u32 = 15;
 const STABILITY_INTERVAL_MS: u64 = 700;
+const MAX_STABILITY_PROBES: u32 = ZERO_BYTE_STABILITY_PROBES * 2;
 
 pub fn spawn(pipeline: Arc<Pipeline>, dir: PathBuf) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Handle::current();
@@ -83,21 +87,46 @@ fn is_candidate(path: &Path) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-/// A file is stable when its size stops changing across probes and it can be
-/// opened for read. Half-synced OneDrive files fail one of the two checks.
+fn required_stable_probes(size: u64) -> u32 {
+    if size == 0 {
+        // A transient zero-byte OneDrive placeholder receives a much longer
+        // grace period, but a genuinely empty file eventually reaches routing
+        // and is deterministically flagged as CORRUPT instead of disappearing.
+        ZERO_BYTE_STABILITY_PROBES
+    } else {
+        STABILITY_PROBES
+    }
+}
+
+/// A file is stable when its size remains unchanged across enough probes and
+/// it can be opened for reading. Half-synced OneDrive files fail one of those
+/// checks. Zero-byte files deliberately require a longer settling period.
 async fn wait_stable(path: &Path) -> bool {
-    let mut last = None;
-    for _ in 0..STABILITY_PROBES * 10 {
+    let mut last_size = None;
+    let mut unchanged_probes = 0u32;
+
+    for _ in 0..MAX_STABILITY_PROBES {
         let size = match std::fs::metadata(path) {
             Ok(metadata) => metadata.len(),
             Err(_) => return false, // Vanished or was moved by a completed run.
         };
-        if last == Some(size) && std::fs::File::open(path).is_ok() && size > 0 {
+
+        if last_size == Some(size) {
+            unchanged_probes += 1;
+        } else {
+            last_size = Some(size);
+            unchanged_probes = 1;
+        }
+
+        if unchanged_probes >= required_stable_probes(size)
+            && std::fs::File::open(path).is_ok()
+        {
             return true;
         }
-        last = Some(size);
+
         tokio::time::sleep(Duration::from_millis(STABILITY_INTERVAL_MS)).await;
     }
+
     log::warn!("file never stabilized: {path:?}");
     false
 }
@@ -118,4 +147,38 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_flow_one_stable_delivery_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("__bl_5f2b6a9c__Shareholder Register.pdf");
+        std::fs::write(&path, b"fixture").unwrap();
+
+        assert!(is_candidate(&path));
+    }
+
+    #[test]
+    fn ignores_hidden_and_office_lock_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = dir.path().join(".partial.pdf");
+        let office_lock = dir.path().join("~$Agreement.docx");
+        std::fs::write(&hidden, b"fixture").unwrap();
+        std::fs::write(&office_lock, b"fixture").unwrap();
+
+        assert!(!is_candidate(&hidden));
+        assert!(!is_candidate(&office_lock));
+    }
+
+    #[test]
+    fn zero_byte_files_receive_longer_settling_period() {
+        assert_eq!(required_stable_probes(0), ZERO_BYTE_STABILITY_PROBES);
+        assert_eq!(required_stable_probes(1), STABILITY_PROBES);
+    }
 }
