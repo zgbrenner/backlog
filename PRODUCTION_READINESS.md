@@ -14,7 +14,7 @@ minutes aren't available:
 | Check | Command | Result |
 |---|---|---|
 | Trust-core tests | `cargo test -p backlog-core` | 13 pass, ~10s, no sidecars/app build |
-| Full workspace tests | `cargo test` (in `src-tauri/`) | 19 pass (adds config + duplicate-key tests) |
+| Full workspace tests | `cargo test --workspace` (in `src-tauri/`) | 19 pass (13 core + 6 app: config + duplicate-key) |
 | Lints | `cargo clippy --workspace` | clean, 0 warnings |
 | Frontend build | `npm run build` | passes (`tsc && vite build`) |
 | Python | `python -m py_compile` on changed files | clean |

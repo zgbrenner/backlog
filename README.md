@@ -170,6 +170,6 @@ flags). Run it before touching either file; those two modules are the product.
 Because it builds without the sidecars, you can run it locally in seconds
 (useful when GitHub Actions minutes aren't available).
 
-`cargo test` over the whole workspace additionally builds the Tauri app crate,
-which needs the sidecar binaries and `icons/icon.ico` present (see Setup) — a
-release-time step, not required for iterating on the trust core.
+`cargo test --workspace` additionally builds the Tauri app crate, which needs
+the sidecar binaries and `icons/icon.ico` present (see Setup) — a release-time
+step, not required for iterating on the trust core.
