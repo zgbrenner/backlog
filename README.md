@@ -91,6 +91,19 @@ Build the two flows per `power-automate/FLOW1-intake.md` and
 and `_pa_errors` lists. For the initial multi-thousand backfill, skip Flow 1
 and drop the files into Processing directly.
 
+Flow 2 uses `ManifestId` as its idempotency key and keeps `Sha256` as the true
+content identity. Paste `power-automate/manifest.parse-json.schema.json` into
+the Power Automate Parse JSON action. Do not paste the stricter
+`power-automate/manifest.schema.json`; that file is the CI and source contract.
+Three valid examples live in `power-automate/examples/`.
+
+Validate both schemas and every example before editing the flow contract:
+
+```
+python -m pip install -r power-automate/requirements-dev.txt
+python power-automate/validate_examples.py
+```
+
 ## Ettin bootstrap (slice 4)
 
 1. Run a real batch (or shadow batch) of 2-5K files through the app.
@@ -112,16 +125,19 @@ and drop the files into Processing directly.
 
 ## Behavior guarantees
 
-- A file is never deleted. Failures move to quarantine with a
-  machine-readable reason and a `NeedsReview` row.
+- A source document is never silently deleted. Failures write a manifest and
+  move the local copy to quarantine with a machine-readable reason.
 - No date ships unless it appears verbatim in the document text or file
   metadata (anti-hallucination tripwire in `checker.rs`).
 - Undated documents fall back to file modified date with
   `date_source: metadata`, honestly labeled in the index.
-- Duplicate content (same SHA-256) is indexed once; later copies get
-  `" (2)"` names and a `duplicate_of` pointer.
-- Crash mid-batch: the ledger resumes unfinished jobs on next start.
-- Idempotent end-to-end: replaying any manifest cannot double-index.
+- Every physical file instance has a stable `ManifestId`. Byte-identical files
+  share one true SHA-256, but receive distinct reserved filenames and separate
+  index rows. Later copies carry a `duplicate_of` content pointer.
+- Replaying the same physical instance reuses its ManifestId and filename, so
+  it cannot create a second archive file or index row.
+- Crash mid-batch: the ledger and manifest handoff preserve enough state to
+  resume or safely replay unfinished work.
 
 ## Repo map
 
@@ -132,20 +148,33 @@ src-tauri/src/          Rust core
   checker.rs              deterministic validation (the trust core)
   harvest.rs              regex evidence harvest
   filter.rs               evidence bundle assembly
+  identity.rs             stable physical-file instance identity
   slm.rs                  llama-server lifecycle + grammar decoding
   sidecar.rs              convertd protocol client
-  ledger.rs               SQLite state machine
+  ledger.rs               content jobs, file instances, name reservations
   watcher.rs              debounced folder watcher w/ sync stability
-  manifest.rs             atomic manifest emission + pacing
+  manifest.rs             schema v2 validation + atomic handoff
 sidecar/                convertd (Python) + build instructions
 models/                 download script, lockfile, GBNF grammar copy
 training/               Ettin silver labeling + fine-tune
-power-automate/         Flow 1 and Flow 2 build sheets
+power-automate/         flows, strict schema, Parse JSON schema, examples
 ```
 
 ## Tests
 
-`cargo test` covers the harvest regexes and every checker rule (valid dates,
-hallucinated dates, range limits, metadata fallback, illegal characters,
-generic subjects, SSN patterns, sentence-shape rules, span-mismatch soft
-flags). Run it before touching either file; those two modules are the product.
+The Rust suite covers harvest regexes, deterministic checker rules, stable file
+instance IDs, transactional filename reservations, duplicate-three-file
+behavior, manifest replay, path safety, and guarded human-review transitions.
+The Python contract validator checks every manifest example against both the
+strict source schema and the Power Automate-compatible Parse JSON schema.
+
+Run the available checks before changing the trust core or handoff contract:
+
+```
+npm run check
+cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+cargo test --manifest-path src-tauri/Cargo.toml --all-targets
+python -m unittest discover -s sidecar/tests -v
+python -m compileall -q sidecar training models power-automate
+python power-automate/validate_examples.py
+```
