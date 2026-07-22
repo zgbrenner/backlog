@@ -1,7 +1,5 @@
-mod checker;
 mod config;
 mod filter;
-mod harvest;
 mod ledger;
 mod manifest;
 mod pipeline;
@@ -9,6 +7,11 @@ mod routing;
 mod sidecar;
 mod slm;
 mod watcher;
+
+// The deterministic trust core lives in its own dependency-light crate so it
+// tests without any Tauri build; re-export it under the crate paths the rest
+// of the code already uses (crate::checker, crate::harvest).
+pub use backlog_core::{checker, harvest};
 
 use config::Config;
 use ledger::Ledger;

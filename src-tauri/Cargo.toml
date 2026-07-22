@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Local document naming and indexing pipeline"
 
+[workspace]
+members = ["core"]
+
 [lib]
 name = "backlog_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -12,6 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+backlog-core = { path = "core" }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
@@ -24,10 +28,7 @@ infer = "0.16"
 notify = "7"
 notify-debouncer-full = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
-regex = "1"
-once_cell = "1"
 reqwest = { version = "0.12", features = ["json"] }
-thiserror = "2"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"

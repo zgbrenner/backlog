@@ -149,6 +149,7 @@ name = "backlog"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "backlog-core",
  "chrono",
  "env_logger",
  "hex",
@@ -156,8 +157,6 @@ dependencies = [
  "log",
  "notify",
  "notify-debouncer-full",
- "once_cell",
- "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -166,8 +165,18 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
- "thiserror 2.0.19",
  "tokio",
+]
+
+[[package]]
+name = "backlog-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "once_cell",
+ "regex",
+ "serde",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
