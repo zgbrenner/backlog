@@ -1,7 +1,9 @@
 import importlib.util
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -107,6 +109,46 @@ class LanguageIdentificationTests(unittest.TestCase):
             CONVERTD._language_code(SimpleNamespace(iso_code_639_1=None)),
             "en",
         )
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_configure_sets_child_local_model_paths_and_clears_model_cache(self):
+        original_models = CONVERTD.MODELS_DIR
+        original_ettin = os.environ.get("BACKLOG_ETTIN_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                models = Path(tmp) / "models"
+                ettin = Path(tmp) / "ettin"
+                models.mkdir()
+                ettin.mkdir()
+                CONVERTD._CACHE.update(
+                    {"gliclass": object(), "granite": object(), "ettin": object(), "rapidocr": object()}
+                )
+
+                result = CONVERTD.op_configure(
+                    {"models_dir": str(models), "ettin_dir": str(ettin)}
+                )
+
+                self.assertEqual(CONVERTD.MODELS_DIR, models.resolve())
+                self.assertEqual(os.environ["BACKLOG_ETTIN_DIR"], str(ettin.resolve()))
+                self.assertTrue(result["ettin_enabled"])
+                self.assertNotIn("gliclass", CONVERTD._CACHE)
+                self.assertNotIn("granite", CONVERTD._CACHE)
+                self.assertNotIn("ettin", CONVERTD._CACHE)
+                self.assertIn("rapidocr", CONVERTD._CACHE)
+        finally:
+            CONVERTD.MODELS_DIR = original_models
+            if original_ettin is None:
+                os.environ.pop("BACKLOG_ETTIN_DIR", None)
+            else:
+                os.environ["BACKLOG_ETTIN_DIR"] = original_ettin
+            CONVERTD._CACHE.clear()
+
+    def test_configure_rejects_a_missing_model_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing"
+            with self.assertRaisesRegex(ValueError, "models_dir"):
+                CONVERTD.op_configure({"models_dir": str(missing)})
 
 
 class ProtocolTests(unittest.TestCase):
