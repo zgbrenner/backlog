@@ -26,10 +26,10 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: "22"
-          package-manager-cache: false
+          cache: npm
 
-      - name: Install dependencies
-        run: npm install --ignore-scripts
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
 
       - name: Type-check and build
         run: |
@@ -62,10 +62,11 @@ jobs:
             librsvg2-dev \
             patchelf
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
-          components: rustfmt
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
 
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@v2
@@ -84,6 +85,12 @@ jobs:
           set -o pipefail
           cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check 2>&1 | tee rustfmt.log
 
+      - name: Run Clippy
+        if: always()
+        run: |
+          set -o pipefail
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings 2>&1 | tee clippy.log
+
       - name: Run Rust tests
         if: always()
         run: |
@@ -97,12 +104,13 @@ jobs:
           name: rust-diagnostics-${{ github.sha }}
           path: |
             rustfmt.log
+            clippy.log
             rust-tests.log
           if-no-files-found: ignore
           retention-days: 1
 
   python:
-    name: Python utilities
+    name: Python utilities and contracts
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
@@ -121,8 +129,11 @@ jobs:
       - name: Run lightweight sidecar tests
         run: python -m unittest discover -s sidecar/tests -v
 
+      - name: Run model bundle and lock tests
+        run: python -m unittest discover -s models/tests -v
+
       - name: Compile Python sources
-        run: python -m compileall -q sidecar training models power-automate
+        run: python -m compileall -q sidecar training models power-automate scripts
 
       - name: Validate Power Automate JSON syntax
         shell: bash
