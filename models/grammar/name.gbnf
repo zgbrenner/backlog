@@ -1,0 +1,24 @@
+# BackLog naming grammar. Locks LFM2.5 decoding to the fields JSON: the model
+# cannot emit prose, markdown, or apologies. Character classes deliberately
+# exclude JSON-breaking quotes/backslashes and filename-illegal characters,
+# so the checker validates semantics, not syntax.
+# Requires llama.cpp with bounded-repetition GBNF support (mid-2024 or later).
+
+root        ::= "{\"date\": \"" datev "\", \"date_source\": \"" source "\", \"subject\": \"" subject "\", \"description\": \"" desc "\"}"
+
+datev       ::= isodate | "none"
+isodate     ::= year "-" month "-" day
+year        ::= ("1" "9" [0-9] [0-9]) | ("2" "0" [0-9] [0-9])
+month       ::= ("0" [1-9]) | ("1" [0-2])
+day         ::= ("0" [1-9]) | ([1-2] [0-9]) | ("3" [0-1])
+
+source      ::= "document" | "metadata" | "none"
+
+# Subject: filename-safe characters only. Word-count (3-8) is enforced by the
+# deterministic checker; grammars count characters, checkers count words.
+subjchar    ::= [A-Za-z0-9 ,.'()&-]
+subject     ::= subjchar{8,80}
+
+# Description: one sentence; must end with terminal punctuation.
+descchar    ::= [A-Za-z0-9 ,.'()&:;$%-]
+desc        ::= descchar{14,198} [.!?]

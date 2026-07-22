@@ -1,0 +1,39 @@
+# Node / Vite
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Tauri sidecar & model binaries (built/downloaded, not committed)
+src-tauri/binaries/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Downloaded model weights (lockfile IS committed; weights are not)
+models/**/*.gguf
+models/**/*.safetensors
+models/**/*.bin
+models/**/*.onnx
+
+# Training artifacts
+training/data/
+training/ettin-backlog-*/
+
+# Logs / OS / editor
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
