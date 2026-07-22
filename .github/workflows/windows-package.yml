@@ -1,0 +1,92 @@
+name: Windows pilot package
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_server_url:
+        description: Direct HTTPS URL to a trusted llama-server.exe build
+        required: true
+        type: string
+      llama_server_sha256:
+        description: Expected lowercase SHA-256 for llama-server.exe
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2022
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm install --ignore-scripts
+
+      - name: Validate frontend
+        run: npm run check
+
+      - name: Build and smoke-test convertd
+        shell: pwsh
+        run: ./scripts/build-sidecar.ps1 -Python python -TargetTriple x86_64-pc-windows-msvc
+
+      - name: Stage and verify llama-server
+        shell: pwsh
+        env:
+          LLAMA_URL: ${{ inputs.llama_server_url }}
+          LLAMA_SHA256: ${{ inputs.llama_server_sha256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $destination = "src-tauri/binaries/llama-server-x86_64-pc-windows-msvc.exe"
+          Invoke-WebRequest -Uri $env:LLAMA_URL -OutFile $destination
+          $actual = (Get-FileHash -Algorithm SHA256 $destination).Hash.ToLowerInvariant()
+          if ($actual -ne $env:LLAMA_SHA256.ToLowerInvariant()) {
+            throw "llama-server hash mismatch. Expected $env:LLAMA_SHA256, got $actual"
+          }
+
+      - name: Verify committed model bundle when present
+        shell: pwsh
+        run: |
+          if (Test-Path "models/models.lock.json") {
+            python models/download_models.py --verify-only
+          } else {
+            Write-Host "No model lockfile is committed. Building an installer shell for pilot validation only."
+          }
+
+      - name: Build Tauri installer
+        run: npm run tauri build
+
+      - name: Write package checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse src-tauri/target/release/bundle -File |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $($_.Path)" } |
+            Set-Content -Encoding UTF8 package-checksums.txt
+
+      - name: Upload unsigned pilot installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: backlog-windows-pilot-${{ github.sha }}
+          path: |
+            src-tauri/target/release/bundle/**
+            package-checksums.txt
+            sidecar/sidecar-build-lock.txt
+          if-no-files-found: error
+          retention-days: 7
