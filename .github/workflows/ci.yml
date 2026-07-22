@@ -132,6 +132,9 @@ jobs:
       - name: Run model bundle and lock tests
         run: python -m unittest discover -s models/tests -v
 
+      - name: Validate frontend and Tauri command contract
+        run: python scripts/frontend_smoke.py
+
       - name: Compile Python sources
         run: python -m compileall -q sidecar training models power-automate scripts
 
