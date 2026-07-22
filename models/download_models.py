@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download and verify BackLog's fully local model bundle.
+"""Download and verify BackLog's fully local runtime model bundle.
 
 The application never downloads at runtime. Run this script once on a connected
 staging machine, commit ``models.lock.json``, and copy the verified ``models/``
@@ -9,7 +9,8 @@ Usage:
   python download_models.py
   python download_models.py --verify-only
 
-``--verify-only`` imports no Hub client and performs no network access.
+``--verify-only`` imports no Hub client and performs no network access. Ettin is
+a separate training input and is deliberately not part of this runtime bundle.
 """
 
 from __future__ import annotations
@@ -52,8 +53,6 @@ MODEL_SPECS = [
         None,
         "granite-embedding-small-english-r2",
     ),
-    # Base encoder. It remains disabled until locally fine-tuned for BackLog.
-    ModelSpec("jhu-clsp/ettin-encoder-32m", None, "ettin-encoder-32m"),
 ]
 
 _TOOL_FILES = {"download_models.py", "models.lock.json"}
