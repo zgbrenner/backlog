@@ -6,7 +6,7 @@
 //! A legacy jobs fallback keeps pre-migration ledgers readable until the watcher
 //! registers their physical deliveries.
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::path::Path;
 use std::time::Duration;
 
@@ -18,14 +18,14 @@ pub fn snapshot(db_path: &Path) -> anyhow::Result<serde_json::Value> {
         [],
         |row| row.get(0),
     )?;
-    let (table, state_column) = if instance_count > 0 {
-        ("file_instances", "state")
+    let table = if instance_count > 0 {
+        "file_instances"
     } else {
-        ("jobs", "state")
+        "jobs"
     };
 
     let mut statement = connection.prepare(&format!(
-        "SELECT {state_column}, COUNT(*) FROM {table} GROUP BY {state_column}"
+        "SELECT state, COUNT(*) FROM {table} GROUP BY state"
     ))?;
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
