@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["nsis"],
+    "resources": {
+      "resources/": "",
+      "../models/models.lock.json": "models/models.lock.json",
+      "../models/Qwen3-0.6B-Q8_0.gguf": "models/Qwen3-0.6B-Q8_0.gguf",
+      "../models/Qwen3-1.7B-Q8_0.gguf": "models/Qwen3-1.7B-Q8_0.gguf",
+      "../models/gliclass-base-v3.0/": "models/gliclass-base-v3.0/",
+      "../models/granite-embedding-small-english-r2/": "models/granite-embedding-small-english-r2/"
+    }
+  }
+}
