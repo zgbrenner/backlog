@@ -455,8 +455,8 @@ function renderSettings(root: HTMLElement): void {
     ["Conversion sidecar answers ping", runtime.sidecar_ok, "sidecar"],
     ["llama-server is installed", runtime.llama_server_found, "llama_server"],
     ["Naming grammar is installed", runtime.grammar_found, "grammar"],
-    ["Primary local model is present", runtime.primary_model_found, "slm_primary_gguf"],
-    ["Escalation local model is present", runtime.escalation_model_found, "slm_escalation_gguf"],
+    ["Primary Qwen3 0.6B model is present", runtime.primary_model_found, "slm_primary_gguf"],
+    ["Escalation Qwen3 1.7B model is present", runtime.escalation_model_found, "slm_escalation_gguf"],
     ["Runtime inference stays on this device", runtime.offline_runtime, "offline_runtime"],
   ];
 
@@ -518,8 +518,8 @@ function renderSettings(root: HTMLElement): void {
 
         <fieldset ${locked ? "disabled" : ""}>
           <legend>Models</legend>
-          ${pathField("Primary GGUF, LFM2.5-350M", "slm_primary_gguf", "file")}
-          ${pathField("Escalation GGUF, LFM2.5-1.2B-Instruct", "slm_escalation_gguf", "file")}
+          ${pathField("Primary GGUF, Qwen3 0.6B Q8_0", "slm_primary_gguf", "file")}
+          ${pathField("Escalation GGUF, Qwen3 1.7B Q8_0", "slm_escalation_gguf", "file")}
           ${pathField("Ettin model directory, optional", "ettin_model_dir", "directory")}
         </fieldset>
 
