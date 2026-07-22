@@ -86,8 +86,8 @@ impl Default for Config {
             quarantine_dir: PathBuf::new(),
             cache_dir: PathBuf::new(),
             llama_port: 8137,
-            slm_primary_gguf: PathBuf::from("models/LFM2.5-350M-Q8_0.gguf"),
-            slm_escalation_gguf: PathBuf::from("models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf"),
+            slm_primary_gguf: PathBuf::from("models/Qwen3-0.6B-Q8_0.gguf"),
+            slm_escalation_gguf: PathBuf::from("models/Qwen3-1.7B-Q8_0.gguf"),
             slm_parallel: 4,
             evidence_token_budget: 1500,
             ettin_model_dir: String::new(),
@@ -384,6 +384,19 @@ mod tests {
             slm_escalation_gguf: escalation,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn default_models_are_the_approved_qwen_pair() {
+        let config = Config::default();
+        assert_eq!(
+            config.slm_primary_gguf,
+            PathBuf::from("models/Qwen3-0.6B-Q8_0.gguf")
+        );
+        assert_eq!(
+            config.slm_escalation_gguf,
+            PathBuf::from("models/Qwen3-1.7B-Q8_0.gguf")
+        );
     }
 
     #[test]
