@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://backlog.local/schemas/manifest-v2.json",
+  "title": "BackLog Power Automate Manifest v2",
+  "description": "One replay-safe delivery record for one physical file instance.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "manifest_id",
+    "sha256",
+    "status",
+    "original_name",
+    "original_relpath",
+    "model_versions",
+    "processed_at"
+  ],
+  "properties": {
+    "schema": {
+      "type": "integer",
+      "const": 2
+    },
+    "manifest_id": {
+      "type": "string",
+      "description": "Stable idempotency key for this physical file instance.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sha256": {
+      "type": "string",
+      "description": "True SHA-256 of the file bytes. Identical content shares this value.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "flagged"]
+    },
+    "original_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "original_relpath": {
+      "type": "string",
+      "minLength": 1
+    },
+    "new_filename": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/\\\\]+$",
+      "not": {
+        "enum": [".", ".."]
+      }
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "date": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "date_source": {
+      "type": "string",
+      "enum": ["document", "metadata", "human"]
+    },
+    "doc_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "language": {
+      "type": "string",
+      "minLength": 1
+    },
+    "duplicate_of": {
+      "type": "string",
+      "description": "Original content SHA-256 for a duplicate-content delivery.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "soft_flags": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "flag_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_versions": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "processed_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": { "const": "ok" }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "required": ["new_filename", "description", "date", "date_source"],
+        "properties": {
+          "flag_reason": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": { "const": "flagged" }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "required": ["flag_reason"],
+        "properties": {
+          "new_filename": false
+        }
+      }
+    }
+  ]
+}
