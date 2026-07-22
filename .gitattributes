@@ -1,0 +1,12 @@
+# Normalize line endings so the repo stays consistent across Windows/Linux
+# build machines (avoids CRLF churn and cross-OS diffs).
+* text=auto eol=lf
+
+# Binary assets — never normalize.
+*.png binary
+*.ico binary
+*.gguf binary
+*.onnx binary
+*.safetensors binary
+*.bin binary
+*.exe binary

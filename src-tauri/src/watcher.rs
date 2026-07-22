@@ -14,7 +14,6 @@ const STABILITY_PROBES: u32 = 3;
 const STABILITY_INTERVAL_MS: u64 = 700;
 
 pub fn spawn(pipeline: Arc<Pipeline>, dir: PathBuf) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Handle::current();
     std::thread::Builder::new().name("backlog-watcher".into()).spawn(move || {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut debouncer = match new_debouncer(Duration::from_secs(2), None, tx) {
@@ -32,7 +31,7 @@ pub fn spawn(pipeline: Arc<Pipeline>, dir: PathBuf) -> anyhow::Result<()> {
 
         // Sweep pre-existing + resumable files on startup.
         for entry in walk(&dir) {
-            enqueue(&rt, &pipeline, entry);
+            enqueue(&pipeline, entry);
         }
 
         for result in rx {
@@ -41,7 +40,7 @@ pub fn spawn(pipeline: Arc<Pipeline>, dir: PathBuf) -> anyhow::Result<()> {
                     for ev in events {
                         for p in ev.paths.clone() {
                             if is_candidate(&p) {
-                                enqueue(&rt, &pipeline, p);
+                                enqueue(&pipeline, p);
                             }
                         }
                     }
@@ -57,9 +56,12 @@ pub fn spawn(pipeline: Arc<Pipeline>, dir: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn enqueue(rt: &tokio::runtime::Handle, pipeline: &Arc<Pipeline>, path: PathBuf) {
+fn enqueue(pipeline: &Arc<Pipeline>, path: PathBuf) {
     let pl = pipeline.clone();
-    rt.spawn(async move {
+    // tauri::async_runtime is reachable from any thread, so this can't panic
+    // the way tokio's Handle::current() would if the caller (the sync
+    // start_pipeline command) isn't running inside the runtime.
+    tauri::async_runtime::spawn(async move {
         // Global backpressure: bound how many files are stability-probed and
         // hashed at once. A 3,000-file backfill still enqueues 3,000 cheap
         // parked tasks, but only a bounded few do blocking work concurrently.
