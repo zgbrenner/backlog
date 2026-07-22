@@ -7,12 +7,38 @@ import copy
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
-from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema import Draft6Validator, Draft202012Validator, FormatChecker
 
 ROOT = Path(__file__).resolve().parent
-SCHEMA_PATH = ROOT / "manifest.schema.json"
+STRICT_SCHEMA_PATH = ROOT / "manifest.schema.json"
+PARSE_JSON_SCHEMA_PATH = ROOT / "manifest.parse-json.schema.json"
 EXAMPLES_DIR = ROOT / "examples"
+
+# Keep the Parse JSON schema deliberately conservative. The strict source
+# contract can use modern JSON Schema features, while this schema is limited to
+# constructs that the Power Automate action has historically handled reliably.
+PARSE_JSON_FORBIDDEN_KEYS = {
+    "$schema",
+    "$id",
+    "$ref",
+    "allOf",
+    "anyOf",
+    "const",
+    "contains",
+    "dependentSchemas",
+    "else",
+    "format",
+    "if",
+    "not",
+    "oneOf",
+    "pattern",
+    "patternProperties",
+    "propertyNames",
+    "then",
+    "unevaluatedProperties",
+}
 
 
 def load_json(path: Path) -> object:
@@ -26,12 +52,43 @@ def describe(error: object) -> str:
     return f"{path or '<root>'}: {message}"
 
 
-def main() -> int:
-    schema = load_json(SCHEMA_PATH)
-    Draft202012Validator.check_schema(schema)
-    validator = Draft202012Validator(schema, format_checker=FormatChecker())
+def find_parse_schema_compatibility_issues(
+    node: Any,
+    path: tuple[str, ...] = (),
+) -> list[str]:
+    issues: list[str] = []
+    if isinstance(node, bool):
+        issues.append(f"{'.'.join(path) or '<root>'}: boolean schemas are not allowed")
+        return issues
+    if isinstance(node, dict):
+        for key, value in node.items():
+            child_path = (*path, key)
+            if key in PARSE_JSON_FORBIDDEN_KEYS:
+                issues.append(
+                    f"{'.'.join(child_path)}: keyword is not allowed in the Parse JSON schema"
+                )
+            issues.extend(find_parse_schema_compatibility_issues(value, child_path))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            issues.extend(
+                find_parse_schema_compatibility_issues(value, (*path, str(index)))
+            )
+    return issues
 
-    failures: list[str] = []
+
+def main() -> int:
+    strict_schema = load_json(STRICT_SCHEMA_PATH)
+    parse_json_schema = load_json(PARSE_JSON_SCHEMA_PATH)
+    Draft202012Validator.check_schema(strict_schema)
+    Draft6Validator.check_schema(parse_json_schema)
+
+    strict_validator = Draft202012Validator(
+        strict_schema,
+        format_checker=FormatChecker(),
+    )
+    parse_json_validator = Draft6Validator(parse_json_schema)
+
+    failures = find_parse_schema_compatibility_issues(parse_json_schema)
     examples: dict[str, dict[str, object]] = {}
     for path in sorted(EXAMPLES_DIR.glob("manifest-*.json")):
         payload = load_json(path)
@@ -39,8 +96,16 @@ def main() -> int:
             failures.append(f"{path.name}: root must be an object")
             continue
         examples[path.name] = payload
-        for error in sorted(validator.iter_errors(payload), key=lambda item: list(item.path)):
-            failures.append(f"{path.name}: {describe(error)}")
+        for error in sorted(
+            strict_validator.iter_errors(payload),
+            key=lambda item: list(item.path),
+        ):
+            failures.append(f"{path.name} strict schema: {describe(error)}")
+        for error in sorted(
+            parse_json_validator.iter_errors(payload),
+            key=lambda item: list(item.path),
+        ):
+            failures.append(f"{path.name} Parse JSON schema: {describe(error)}")
 
     required_examples = {
         "manifest-ok.json",
@@ -81,10 +146,15 @@ def main() -> int:
         invalid = copy.deepcopy(ok)
         invalid["manifest_id"] = "../unsafe"
         negative_cases.append(("unsafe manifest_id", invalid))
+        invalid = copy.deepcopy(ok)
+        invalid["date"] = "2026-99-99"
+        negative_cases.append(("invalid ISO date", invalid))
 
         for label, payload in negative_cases:
-            if not list(validator.iter_errors(payload)):
-                failures.append(f"schema incorrectly accepted negative case: {label}")
+            if not list(strict_validator.iter_errors(payload)):
+                failures.append(
+                    f"strict schema incorrectly accepted negative case: {label}"
+                )
 
     if failures:
         print("Manifest contract validation failed:", file=sys.stderr)
@@ -92,7 +162,10 @@ def main() -> int:
             print(f"  - {failure}", file=sys.stderr)
         return 1
 
-    print(f"Validated {len(examples)} manifest examples and contract invariants.")
+    print(
+        f"Validated {len(examples)} manifest examples against the strict and "
+        "Power Automate Parse JSON schemas."
+    )
     return 0
 
 
