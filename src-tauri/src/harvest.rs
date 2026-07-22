@@ -130,9 +130,9 @@ pub fn extract_dates(text: &str) -> Vec<FoundDate> {
 /// `head_chars`/`tail_chars` bound the excerpt sizes.
 pub fn harvest(markdown: &str) -> Harvest {
     let mut h = Harvest::default();
-    let head_len = markdown.len().min(6000);
+    let head_len = floor_char_boundary(markdown, 6000);
     let head = &markdown[..head_len];
-    let tail_start = markdown.len().saturating_sub(2500);
+    let tail_start = floor_char_boundary(markdown, markdown.len().saturating_sub(2500));
     let tail = &markdown[tail_start..];
 
     // Dates: first pages + last page only (naming never needs page 247).
@@ -184,6 +184,18 @@ pub fn harvest(markdown: &str) -> Harvest {
     h.signature_block = tail_lines[sig_start..].join("\n");
 
     h
+}
+
+/// Largest index <= `i` on a UTF-8 char boundary. Head/tail budgets are byte
+/// counts; slicing mid-codepoint panics on multibyte text (é, ø, CJK).
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 fn clean_line(s: &str) -> String {

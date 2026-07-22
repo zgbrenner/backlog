@@ -79,12 +79,12 @@ fn get_runtime_status(state: tauri::State<AppState>) -> RuntimeStatus {
 async fn run_preflight(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-) -> RuntimeStatus {
+) -> Result<RuntimeStatus, String> {
     let cfg = state.cfg.lock().unwrap().clone();
     let (running, paused) = runtime_flags(&state);
     let status = preflight::run(&app, &cfg, running, paused).await;
     *state.last_preflight.lock().unwrap() = Some(status.clone());
-    status
+    Ok(status)
 }
 
 #[tauri::command]
