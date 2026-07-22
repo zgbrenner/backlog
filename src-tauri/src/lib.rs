@@ -22,7 +22,7 @@ use pipeline::Pipeline;
 use preflight::RuntimeStatus;
 use sidecar::Sidecar;
 use slm::SlmLane;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::Manager;
@@ -43,19 +43,62 @@ fn runtime_flags(state: &AppState) -> (bool, bool) {
     }
 }
 
+fn resolve_model_path(resource_dir: Option<&Path>, configured: &Path) -> PathBuf {
+    if configured.is_absolute() {
+        return configured.to_path_buf();
+    }
+    if let Some(root) = resource_dir {
+        let bundled = root.join(configured);
+        if bundled.exists() {
+            return bundled;
+        }
+    }
+    configured.to_path_buf()
+}
+
+fn resolve_runtime_config(app: &tauri::AppHandle, cfg: &mut Config) {
+    let resource_dir = app.path().resource_dir().ok();
+    cfg.slm_primary_gguf = resolve_model_path(resource_dir.as_deref(), &cfg.slm_primary_gguf);
+    cfg.slm_escalation_gguf =
+        resolve_model_path(resource_dir.as_deref(), &cfg.slm_escalation_gguf);
+    if !cfg.ettin_model_dir.trim().is_empty() {
+        let resolved = resolve_model_path(resource_dir.as_deref(), Path::new(&cfg.ettin_model_dir));
+        cfg.ettin_model_dir = resolved.to_string_lossy().into_owned();
+    }
+}
+
+fn configure_sidecar_environment(cfg: &Config) -> Result<(), String> {
+    let models_dir = cfg
+        .slm_primary_gguf
+        .parent()
+        .ok_or_else(|| "primary model path has no parent directory".to_string())?;
+    std::env::set_var("BACKLOG_MODELS_DIR", models_dir);
+    if cfg.ettin_model_dir.trim().is_empty() {
+        std::env::remove_var("BACKLOG_ETTIN_DIR");
+    } else {
+        std::env::set_var("BACKLOG_ETTIN_DIR", &cfg.ettin_model_dir);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn get_config(state: tauri::State<AppState>) -> Config {
     state.cfg.lock().unwrap().clone()
 }
 
 #[tauri::command]
-fn set_config(state: tauri::State<AppState>, cfg: Config) -> Result<(), String> {
+fn set_config(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    mut cfg: Config,
+) -> Result<(), String> {
     if state.pipeline.lock().unwrap().is_some() {
         return Err(
             "Settings cannot change while the pipeline is running. Restart BackLog before changing runtime paths or models."
                 .into(),
         );
     }
+    resolve_runtime_config(&app, &mut cfg);
     cfg.save(&state.cfg_path)
         .map_err(|error| error.to_string())?;
     *state.cfg.lock().unwrap() = cfg;
@@ -170,6 +213,7 @@ async fn start_pipeline(
     if !status.configured {
         return Err(status.summary());
     }
+    configure_sidecar_environment(&cfg)?;
 
     let grammar_path = preflight::resolve_resource(&app, "name.gbnf");
     let grammar = std::fs::read_to_string(&grammar_path)
@@ -225,6 +269,7 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir).ok();
             let cfg_path = data_dir.join("backlog.config.json");
             let mut cfg = Config::load(&cfg_path);
+            resolve_runtime_config(app.handle(), &mut cfg);
             if cfg.cache_dir.as_os_str().is_empty() {
                 cfg.cache_dir = data_dir.join("cache");
             }
@@ -253,4 +298,32 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running BackLog");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_model_path_prefers_existing_bundle_resource() {
+        let root = tempfile::tempdir().unwrap();
+        let bundled = root.path().join("models/Qwen3-0.6B-Q8_0.gguf");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, b"fixture").unwrap();
+
+        assert_eq!(
+            resolve_model_path(
+                Some(root.path()),
+                Path::new("models/Qwen3-0.6B-Q8_0.gguf")
+            ),
+            bundled
+        );
+    }
+
+    #[test]
+    fn missing_bundle_resource_preserves_development_relative_path() {
+        let root = tempfile::tempdir().unwrap();
+        let configured = Path::new("models/Qwen3-0.6B-Q8_0.gguf");
+        assert_eq!(resolve_model_path(Some(root.path()), configured), configured);
+    }
 }
