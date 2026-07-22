@@ -1,0 +1,274 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
+
+type Job = {
+  sha256: string;
+  original_name: string;
+  ext: string;
+  state: string;
+  flag_reason: string | null;
+  proposed_date: string | null;
+  date_source: string | null;
+  proposed_subject: string | null;
+  description: string | null;
+  final_filename: string | null;
+  doc_type: string | null;
+  soft_flags: string | null;
+  updated_at: string;
+};
+
+type Config = {
+  processing_dir: string;
+  outbox_dir: string;
+  quarantine_dir: string;
+  cache_dir: string;
+  llama_port: number;
+  slm_primary_gguf: string;
+  slm_escalation_gguf: string;
+  slm_parallel: number;
+  evidence_token_budget: number;
+  ettin_model_dir: string;
+  convert_workers: number;
+  manifest_emit_per_min: number;
+  max_head_pages: number;
+  max_tail_pages: number;
+  max_filename_len: number;
+  max_stage_attempts: number;
+  per_file_wall_clock_secs: number;
+};
+
+const app = document.getElementById("app")!;
+let cfg: Config | null = null;
+let running = false;
+let paused = false;
+let view: "queue" | "flagged" | "settings" = "queue";
+
+const STATE_BADGE: Record<string, string> = {
+  ingested: "b-wait", converted: "b-wait", filtered: "b-wait", named: "b-wait",
+  validated: "b-wait", emitted: "b-ok", flagged: "b-flag",
+};
+
+function el(html: string): HTMLElement {
+  const t = document.createElement("template");
+  t.innerHTML = html.trim();
+  return t.content.firstElementChild as HTMLElement;
+}
+
+function esc(s: string | null | undefined): string {
+  return (s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!)
+  );
+}
+
+async function render() {
+  const stats = await invoke<Record<string, number>>("get_stats").catch(() => ({}));
+  const total = Object.values(stats).reduce((a, b) => a + (b as number), 0);
+  app.innerHTML = "";
+  app.appendChild(el(`
+    <div class="shell">
+      <header>
+        <div class="brand">Back<span>Log</span></div>
+        <nav>
+          <button data-v="queue" class="${view === "queue" ? "on" : ""}">Queue</button>
+          <button data-v="flagged" class="${view === "flagged" ? "on" : ""}">Needs Review
+            ${stats["flagged"] ? `<span class="pill">${stats["flagged"]}</span>` : ""}</button>
+          <button data-v="settings" class="${view === "settings" ? "on" : ""}">Settings</button>
+        </nav>
+        <div class="run">
+          <span class="stats">${total} files · ${stats["emitted"] ?? 0} done · ${stats["flagged"] ?? 0} flagged</span>
+          <button id="runbtn" class="${running ? (paused ? "paused" : "live") : "start"}">
+            ${running ? (paused ? "Resume" : "Pause") : "Start"}
+          </button>
+        </div>
+      </header>
+      <main id="content"></main>
+    </div>
+  `));
+
+  app.querySelectorAll("nav button").forEach((b) =>
+    b.addEventListener("click", () => { view = (b as HTMLElement).dataset.v as typeof view; render(); })
+  );
+  document.getElementById("runbtn")!.addEventListener("click", onRunButton);
+
+  const content = document.getElementById("content")!;
+  if (view === "queue") await renderQueue(content);
+  else if (view === "flagged") await renderFlagged(content);
+  else renderSettings(content);
+}
+
+async function onRunButton() {
+  if (!running) {
+    try {
+      await invoke("start_pipeline");
+      running = true;
+    } catch (e) {
+      alert(String(e));
+      view = "settings";
+    }
+  } else {
+    paused = !paused;
+    await invoke("set_paused", { paused });
+  }
+  render();
+}
+
+async function renderQueue(root: HTMLElement) {
+  const jobs = await invoke<Job[]>("list_jobs", { limit: 500 }).catch(() => []);
+  if (!jobs.length) {
+    root.appendChild(el(`<div class="empty">No files yet. Configure folders in Settings, hit Start, and drop files into the Processing folder (or let Flow 1 do it).</div>`));
+    return;
+  }
+  const rows = jobs.map((j) => `
+    <tr>
+      <td class="mono" title="${esc(j.sha256)}">${esc(j.original_name)}</td>
+      <td>${esc(j.final_filename ?? "")}</td>
+      <td>${esc(j.doc_type ?? "")}</td>
+      <td><span class="badge ${STATE_BADGE[j.state] ?? "b-wait"}">${esc(j.state)}</span>
+          ${j.soft_flags ? `<span class="soft" title="${esc(j.soft_flags)}">!</span>` : ""}</td>
+    </tr>`).join("");
+  root.appendChild(el(`
+    <table>
+      <thead><tr><th>Original</th><th>New name</th><th>Type</th><th>State</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`));
+}
+
+async function renderFlagged(root: HTMLElement) {
+  const jobs = await invoke<Job[]>("list_flagged").catch(() => []);
+  if (!jobs.length) {
+    root.appendChild(el(`<div class="empty">Nothing needs review. As it should be.</div>`));
+    return;
+  }
+  for (const j of jobs) {
+    const card = el(`
+      <div class="card">
+        <div class="card-head">
+          <strong>${esc(j.original_name)}</strong>
+          <code class="reason">${esc(j.flag_reason ?? "unknown")}</code>
+        </div>
+        <div class="fields">
+          <label>Date <input type="date" name="date" value="${esc(j.proposed_date ?? "")}"></label>
+          <label>Subject <input name="subject" placeholder="3-8 words" value="${esc(j.proposed_subject ?? "")}"></label>
+          <label class="wide">Description <input name="description" placeholder="One sentence." value="${esc(j.description ?? "")}"></label>
+        </div>
+        <div class="card-actions">
+          <button class="ghost" data-act="evidence">View text</button>
+          <button data-act="resubmit">Approve and re-emit</button>
+          <span class="err"></span>
+        </div>
+        <pre class="evidence" hidden></pre>
+      </div>`);
+    card.querySelector('[data-act="evidence"]')!.addEventListener("click", async () => {
+      const pre = card.querySelector(".evidence") as HTMLElement;
+      if (pre.hidden) {
+        pre.textContent = await invoke<string>("get_evidence", { sha256: j.sha256 })
+          .catch(() => "(no cached text; file failed before conversion)");
+      }
+      pre.hidden = !pre.hidden;
+    });
+    card.querySelector('[data-act="resubmit"]')!.addEventListener("click", async () => {
+      const get = (n: string) => (card.querySelector(`[name="${n}"]`) as HTMLInputElement).value.trim();
+      const err = card.querySelector(".err") as HTMLElement;
+      err.textContent = "";
+      try {
+        await invoke("resubmit", {
+          sha256: j.sha256, date: get("date"), subject: get("subject"), description: get("description"),
+        });
+        card.remove();
+      } catch (e) {
+        err.textContent = String(e);
+      }
+    });
+    root.appendChild(card);
+  }
+}
+
+function renderSettings(root: HTMLElement) {
+  if (!cfg) return;
+  const c = cfg;
+  const folder = (label: string, key: keyof Config) => `
+    <label class="wide">${label}
+      <div class="pick"><input name="${key}" value="${esc(String(c[key] ?? ""))}">
+      <button class="ghost" data-pick="${key}">Browse</button></div>
+    </label>`;
+  const root2 = el(`
+    <form class="settings">
+      <h2>Folders</h2>
+      ${folder("Processing folder (OneDrive-synced; Flow 1 target)", "processing_dir")}
+      ${folder("Outbox folder (OneDrive-synced; manifests go to _manifests)", "outbox_dir")}
+      ${folder("Quarantine folder (local)", "quarantine_dir")}
+      <h2>Models</h2>
+      ${folder("Primary GGUF (LFM2.5-350M)", "slm_primary_gguf")}
+      ${folder("Escalation GGUF (LFM2.5-1.2B-Instruct)", "slm_escalation_gguf")}
+      ${folder("Ettin model dir (blank = disabled)", "ettin_model_dir")}
+      <h2>Tuning</h2>
+      <div class="grid3">
+        <label>Convert workers <input name="convert_workers" type="number" min="1" max="12" value="${c.convert_workers}"></label>
+        <label>SLM parallel <input name="slm_parallel" type="number" min="1" max="8" value="${c.slm_parallel}"></label>
+        <label>Evidence tokens <input name="evidence_token_budget" type="number" min="400" max="4000" value="${c.evidence_token_budget}"></label>
+        <label>Manifests/min (0 = unlimited) <input name="manifest_emit_per_min" type="number" min="0" value="${c.manifest_emit_per_min}"></label>
+        <label>Max attempts/stage <input name="max_stage_attempts" type="number" min="1" max="5" value="${c.max_stage_attempts}"></label>
+        <label>Wall clock/file (s) <input name="per_file_wall_clock_secs" type="number" min="30" value="${c.per_file_wall_clock_secs}"></label>
+      </div>
+      <div class="card-actions">
+        <button type="submit">Save settings</button>
+        <span class="err"></span>
+      </div>
+    </form>`);
+  root2.querySelectorAll("[data-pick]").forEach((b) =>
+    b.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      const key = (b as HTMLElement).dataset.pick!;
+      const isFile = key.includes("gguf");
+      const sel = await open({ directory: !isFile, multiple: false });
+      if (typeof sel === "string") {
+        (root2.querySelector(`[name="${key}"]`) as HTMLInputElement).value = sel;
+      }
+    })
+  );
+  root2.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const val = (n: string) => (root2.querySelector(`[name="${n}"]`) as HTMLInputElement).value;
+    const num = (n: string) => parseInt(val(n), 10) || 0;
+    const next: Config = {
+      ...c,
+      processing_dir: val("processing_dir"),
+      outbox_dir: val("outbox_dir"),
+      quarantine_dir: val("quarantine_dir"),
+      slm_primary_gguf: val("slm_primary_gguf"),
+      slm_escalation_gguf: val("slm_escalation_gguf"),
+      ettin_model_dir: val("ettin_model_dir"),
+      convert_workers: num("convert_workers"),
+      slm_parallel: num("slm_parallel"),
+      evidence_token_budget: num("evidence_token_budget"),
+      manifest_emit_per_min: num("manifest_emit_per_min"),
+      max_stage_attempts: num("max_stage_attempts"),
+      per_file_wall_clock_secs: num("per_file_wall_clock_secs"),
+    };
+    const err = root2.querySelector(".err") as HTMLElement;
+    try {
+      await invoke("set_config", { cfg: next });
+      cfg = next;
+      err.textContent = "Saved.";
+      setTimeout(() => (err.textContent = ""), 1500);
+    } catch (e) {
+      err.textContent = String(e);
+    }
+  });
+  root.appendChild(root2);
+}
+
+let renderQueued = false;
+listen("job-updated", () => {
+  // Coalesce bursts; a 4-worker pipeline can emit dozens of events a second.
+  if (renderQueued) return;
+  renderQueued = true;
+  setTimeout(() => { renderQueued = false; if (view !== "settings") render(); }, 400);
+});
+
+(async () => {
+  cfg = await invoke<Config>("get_config");
+  if (!cfg.processing_dir) view = "settings";
+  render();
+})();
