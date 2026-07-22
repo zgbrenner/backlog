@@ -113,13 +113,18 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install manifest contract validator
+        run: >-
+          python -m pip install --disable-pip-version-check
+          -r power-automate/requirements-dev.txt
+
       - name: Run lightweight sidecar tests
         run: python -m unittest discover -s sidecar/tests -v
 
       - name: Compile Python sources
-        run: python -m compileall -q sidecar training models
+        run: python -m compileall -q sidecar training models power-automate
 
-      - name: Validate Power Automate JSON files when present
+      - name: Validate Power Automate JSON syntax
         shell: bash
         run: |
           shopt -s nullglob globstar
@@ -128,6 +133,9 @@ jobs:
             echo "Validating ${file}"
             python -m json.tool "${file}" >/dev/null
           done
+
+      - name: Validate manifest schema and examples
+        run: python power-automate/validate_examples.py
 
   source-snapshot:
     name: Source snapshot
