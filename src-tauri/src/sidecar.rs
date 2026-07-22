@@ -100,24 +100,39 @@ impl Sidecar {
     }
 
     fn spawn(&self) -> Result<Proc, SidecarError> {
-        let mut cmd = Command::new(&self.exe);
-        cmd.stdin(Stdio::piped())
+        let mut command = Command::new(&self.exe);
+        command
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            command.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let mut child = cmd.spawn().map_err(|source| SidecarError::Spawn {
+        let mut child = command.spawn().map_err(|source| SidecarError::Spawn {
             path: self.exe.clone(),
             source,
         })?;
-        let stdin = child.stdin.take().ok_or(SidecarError::MissingStdin)?;
-        let stdout = child.stdout.take().ok_or(SidecarError::MissingStdout)?;
-        let (tx, responses) = mpsc::channel();
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SidecarError::MissingStdin);
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SidecarError::MissingStdout);
+            }
+        };
+        let (sender, responses) = mpsc::channel();
 
         if let Err(source) = std::thread::Builder::new()
             .name("backlog-sidecar-stdout".into())
@@ -128,17 +143,21 @@ impl Sidecar {
                     line.clear();
                     match reader.read_line(&mut line) {
                         Ok(0) => {
-                            let _ = tx.send(ReaderEvent::Closed);
+                            let _ = sender.send(ReaderEvent::Closed);
                             break;
                         }
                         Ok(_) => {
-                            let complete = line.trim_end_matches(['\r', '\n']).to_string();
-                            if tx.send(ReaderEvent::Line(complete)).is_err() {
+                            let complete = line
+                                .trim_end_matches(|character| {
+                                    character == '\r' || character == '\n'
+                                })
+                                .to_string();
+                            if sender.send(ReaderEvent::Line(complete)).is_err() {
                                 break;
                             }
                         }
                         Err(error) => {
-                            let _ = tx.send(ReaderEvent::Error(error.to_string()));
+                            let _ = sender.send(ReaderEvent::Error(error.to_string()));
                             break;
                         }
                     }
@@ -200,18 +219,15 @@ impl Sidecar {
         })?;
         line.push('\n');
 
-        let write_result = guard
-            .as_mut()
-            .expect("sidecar process exists after ensure_process")
-            .stdin
-            .write_all(line.as_bytes())
-            .and_then(|_| {
-                guard
-                    .as_mut()
-                    .expect("sidecar process exists after ensure_process")
-                    .stdin
-                    .flush()
-            });
+        let write_result = {
+            let process = guard
+                .as_mut()
+                .expect("sidecar process exists after ensure_process");
+            process
+                .stdin
+                .write_all(line.as_bytes())
+                .and_then(|_| process.stdin.flush())
+        };
         if let Err(source) = write_result {
             Self::stop_proc(&mut guard);
             return Err(SidecarError::Write {
@@ -388,6 +404,9 @@ impl Sidecar {
 
     pub fn ettin_spans(&self, text: &str) -> Result<Vec<EttinSpan>, SidecarError> {
         let value = self.call("ettin_spans", serde_json::json!({ "text": text }))?;
+        if value["spans"].is_null() {
+            return Ok(Vec::new());
+        }
         serde_json::from_value(value["spans"].clone()).map_err(|error| {
             SidecarError::Protocol {
                 op: "ettin_spans".into(),
@@ -466,6 +485,8 @@ mod tests {
             &executable,
             "#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' '{\"id\":2,\"ok\":true}'; done\n",
         );
-        sidecar.ping().expect("next request should spawn a clean process");
+        sidecar
+            .ping()
+            .expect("next request should spawn a clean process");
     }
 }
