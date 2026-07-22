@@ -115,8 +115,11 @@ class ConfigurationTests(unittest.TestCase):
     def test_configure_sets_child_local_model_paths_and_clears_model_cache(self):
         original_models = CONVERTD.MODELS_DIR
         original_ettin = os.environ.get("BACKLOG_ETTIN_DIR")
+        original_config = os.environ.get("BACKLOG_SIDECAR_CONFIG")
         try:
             with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "sidecar.config.json"
+                os.environ["BACKLOG_SIDECAR_CONFIG"] = str(config_path)
                 models = Path(tmp) / "models"
                 ettin = Path(tmp) / "ettin"
                 models.mkdir()
@@ -132,6 +135,10 @@ class ConfigurationTests(unittest.TestCase):
                 self.assertEqual(CONVERTD.MODELS_DIR, models.resolve())
                 self.assertEqual(os.environ["BACKLOG_ETTIN_DIR"], str(ettin.resolve()))
                 self.assertTrue(result["ettin_enabled"])
+                self.assertEqual(Path(result["config_path"]), config_path)
+                persisted_models, persisted_ettin = CONVERTD._load_persisted_configuration()
+                self.assertEqual(persisted_models, models.resolve())
+                self.assertEqual(persisted_ettin, ettin.resolve())
                 self.assertNotIn("gliclass", CONVERTD._CACHE)
                 self.assertNotIn("granite", CONVERTD._CACHE)
                 self.assertNotIn("ettin", CONVERTD._CACHE)
@@ -142,6 +149,10 @@ class ConfigurationTests(unittest.TestCase):
                 os.environ.pop("BACKLOG_ETTIN_DIR", None)
             else:
                 os.environ["BACKLOG_ETTIN_DIR"] = original_ettin
+            if original_config is None:
+                os.environ.pop("BACKLOG_SIDECAR_CONFIG", None)
+            else:
+                os.environ["BACKLOG_SIDECAR_CONFIG"] = original_config
             CONVERTD._CACHE.clear()
 
     def test_configure_rejects_a_missing_model_directory(self):
