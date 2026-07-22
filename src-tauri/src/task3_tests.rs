@@ -1,18 +1,25 @@
 use crate::identity::{instance_id, normalize_relpath};
 use crate::ledger::{InstanceState, Ledger};
-use crate::manifest::{write_manifest, Manifest, MANIFEST_SCHEMA_VERSION};
+use crate::manifest::{
+    replace_flagged_manifest, write_manifest, Manifest, MANIFEST_SCHEMA_VERSION,
+};
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::{Arc, Barrier};
 
 const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+fn final_component(path: &str) -> &str {
+    path.rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or("document.pdf")
+}
+
 fn register(ledger: &Ledger, relpath: &str) -> String {
     let normalized = normalize_relpath(relpath);
     let id = instance_id(SHA, &normalized);
-    let name = relpath.rsplit(['/', '\\']).next().unwrap_or("document.pdf");
     ledger
-        .register_instance(&id, SHA, relpath, name, "pdf")
+        .register_instance(&id, SHA, relpath, final_component(relpath), "pdf")
         .expect("register instance");
     id
 }
@@ -23,11 +30,7 @@ fn ok_manifest(manifest_id: String, original_relpath: &str, new_filename: &str) 
         manifest_id,
         sha256: SHA.into(),
         status: "ok".into(),
-        original_name: original_relpath
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or("document.pdf")
-            .into(),
+        original_name: final_component(original_relpath).into(),
         original_relpath: original_relpath.into(),
         new_filename: Some(new_filename.into()),
         description: Some("Synthetic agreement used to test deterministic handoff.".into()),
@@ -38,6 +41,28 @@ fn ok_manifest(manifest_id: String, original_relpath: &str, new_filename: &str) 
         duplicate_of: None,
         soft_flags: vec![],
         flag_reason: None,
+        model_versions: json!({"primary": "fixture"}),
+        processed_at: "2026-07-21T12:00:00Z".into(),
+    }
+}
+
+fn flagged_manifest(manifest_id: String, original_relpath: &str) -> Manifest {
+    Manifest {
+        schema: MANIFEST_SCHEMA_VERSION,
+        manifest_id,
+        sha256: SHA.into(),
+        status: "flagged".into(),
+        original_name: final_component(original_relpath).into(),
+        original_relpath: original_relpath.into(),
+        new_filename: None,
+        description: None,
+        date: None,
+        date_source: None,
+        doc_type: None,
+        language: None,
+        duplicate_of: None,
+        soft_flags: vec![],
+        flag_reason: Some("NEEDS_REVIEW:synthetic fixture".into()),
         model_versions: json!({"primary": "fixture"}),
         processed_at: "2026-07-21T12:00:00Z".into(),
     }
@@ -123,7 +148,7 @@ fn concurrent_reservations_cannot_receive_the_same_filename() {
         })
         .collect();
 
-    let names: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let names: Vec<String> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
     let unique: HashSet<&String> = names.iter().collect();
     assert_eq!(unique.len(), names.len());
 }
@@ -158,4 +183,29 @@ fn unsafe_manifest_identity_is_rejected_before_any_write() {
 
     assert!(write_manifest(dir.path(), &manifest).is_err());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn human_review_can_replace_only_the_matching_flagged_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_id = instance_id(SHA, &normalize_relpath("one/Agreement.pdf"));
+    let flagged = flagged_manifest(manifest_id.clone(), "one/Agreement.pdf");
+    write_manifest(dir.path(), &flagged).unwrap();
+
+    let mut corrected = ok_manifest(
+        manifest_id.clone(),
+        "one/Agreement.pdf",
+        "2026-07-21 Corrected Agreement.pdf",
+    );
+    corrected.processed_at = "2026-07-21T12:05:00Z".into();
+    replace_flagged_manifest(dir.path(), &corrected).unwrap();
+
+    let path = dir.path().join(format!("{manifest_id}.json"));
+    let written: Manifest = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(written.status, "ok");
+    assert_eq!(written.new_filename, corrected.new_filename);
+
+    let mut wrong_content = corrected;
+    wrong_content.sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into();
+    assert!(replace_flagged_manifest(dir.path(), &wrong_content).is_err());
 }
