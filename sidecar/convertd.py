@@ -319,7 +319,7 @@ def _rapidocr_lines(result) -> list[tuple[str, float]]:
         scores = getattr(result, "scores", None)
         if texts is None:
             return []
-        score_values = list(scores or [])
+        score_values = [] if scores is None else list(scores)
         return [
             (
                 str(text).strip(),
