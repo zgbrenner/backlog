@@ -1,21 +1,21 @@
-//! §6 SLM lane. One llama-server process (continuous batching, --parallel N)
-//! serving the primary LFM2.5-350M; the 1.2B escalation weights load lazily
-//! into a second server on first flagged retry and stay resident for the
-//! batch so a bad stretch of files doesn't thrash model loads.
+//! Local structured-output naming lane backed by llama.cpp.
 //!
-//! Decoding is locked with a GBNF grammar (resources/name.gbnf): the model
-//! cannot emit anything but the fields JSON. The app, never the model,
-//! composes the filename.
+//! The primary Qwen3-0.6B server starts on demand. The Qwen3-1.7B escalation
+//! server starts only after a rejected primary attempt and remains resident for
+//! the batch. Both bind to loopback and use the model's embedded chat template
+//! through llama.cpp's OpenAI-compatible chat-completions endpoint.
 
 use crate::checker::SlmOutput;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
 pub struct SlmLane {
-    grammar: String,
+    // Retained as a compatibility input while older installations still bundle
+    // the GBNF resource. Current chat requests use JSON Schema directly.
+    _fallback_grammar: String,
     llama_server_exe: PathBuf,
     primary_gguf: PathBuf,
     escalation_gguf: PathBuf,
@@ -43,7 +43,7 @@ impl SlmLane {
         parallel: u8,
     ) -> Self {
         Self {
-            grammar,
+            _fallback_grammar: grammar,
             llama_server_exe,
             primary_gguf,
             escalation_gguf,
@@ -54,37 +54,39 @@ impl SlmLane {
             escalation: Mutex::new(None),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
-                // Localhost only; the app makes zero outbound calls at runtime.
                 .no_proxy()
                 .build()
-                .expect("http client"),
+                .expect("localhost HTTP client"),
         }
     }
 
     fn spawn_server(&self, gguf: &PathBuf, port: u16) -> anyhow::Result<Child> {
-        let mut cmd = Command::new(&self.llama_server_exe);
-        cmd.args([
-            "--model",
-            gguf.to_str().unwrap_or_default(),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--parallel",
-            &self.parallel.to_string(),
-            "--ctx-size",
-            &(4096u32 * self.parallel as u32).to_string(),
-            "--no-webui",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        anyhow::ensure!(gguf.is_file(), "GGUF model not found: {}", gguf.display());
+        let mut command = Command::new(&self.llama_server_exe);
+        command
+            .args([
+                "--model",
+                gguf.to_str().unwrap_or_default(),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--parallel",
+                &self.parallel.to_string(),
+                "--ctx-size",
+                &(4096u32 * self.parallel as u32).to_string(),
+                "--jinja",
+                "--no-webui",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            command.creation_flags(CREATE_NO_WINDOW);
         }
-        Ok(cmd.spawn()?)
+        Ok(command.spawn()?)
     }
 
     async fn ensure_up(&self, tier: Tier) -> anyhow::Result<u16> {
@@ -94,19 +96,19 @@ impl SlmLane {
         };
         {
             let mut guard = slot.lock().unwrap();
-            let need = match guard.as_mut() {
+            let must_spawn = match guard.as_mut() {
                 None => true,
-                Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
+                Some(child) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
             };
-            if need {
+            if must_spawn {
                 *guard = Some(self.spawn_server(gguf, port)?);
             }
         }
-        // Poll /health until ready (model load can take a bit on first hit).
-        let url = format!("http://127.0.0.1:{port}/health");
+
+        let health_url = format!("http://127.0.0.1:{port}/health");
         for _ in 0..120 {
-            if let Ok(r) = self.http.get(&url).send().await {
-                if r.status().is_success() {
+            if let Ok(response) = self.http.get(&health_url).send().await {
+                if response.status().is_success() {
                     return Ok(port);
                 }
             }
@@ -115,11 +117,80 @@ impl SlmLane {
         anyhow::bail!("llama-server on port {port} never became healthy")
     }
 
-    /// LFM2.5 uses a ChatML-like template.
-    fn build_prompt(system: &str, user: &str) -> String {
-        format!(
-            "<|startoftext|><|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
-        )
+    fn response_schema() -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["date", "date_source", "subject", "description"],
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "pattern": "^(?:none|[12][0-9]{3}-[0-9]{2}-[0-9]{2})$"
+                },
+                "date_source": {
+                    "type": "string",
+                    "enum": ["document", "metadata", "none"]
+                },
+                "subject": {
+                    "type": "string",
+                    "minLength": 8,
+                    "maxLength": 80
+                },
+                "description": {
+                    "type": "string",
+                    "minLength": 15,
+                    "maxLength": 200
+                }
+            }
+        })
+    }
+
+    fn request_body(system: &str, evidence: &str) -> Value {
+        json!({
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": evidence}
+            ],
+            "temperature": 0.0,
+            "max_tokens": 220,
+            "stream": false,
+            "cache_prompt": false,
+            "chat_template_kwargs": {"enable_thinking": false},
+            "response_format": {
+                "type": "json_schema",
+                "schema": Self::response_schema()
+            }
+        })
+    }
+
+    fn chat_content(response: &Value) -> anyhow::Result<String> {
+        let content = &response["choices"][0]["message"]["content"];
+        if let Some(text) = content.as_str() {
+            return Ok(text.trim().to_string());
+        }
+        if let Some(parts) = content.as_array() {
+            let joined = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            if !joined.trim().is_empty() {
+                return Ok(joined.trim().to_string());
+            }
+        }
+        anyhow::bail!("llama-server chat response did not contain assistant content")
+    }
+
+    fn json_object(text: &str) -> anyhow::Result<&str> {
+        let trimmed = text.trim();
+        let start = trimmed
+            .find('{')
+            .ok_or_else(|| anyhow::anyhow!("assistant content contained no JSON object"))?;
+        let end = trimmed
+            .rfind('}')
+            .ok_or_else(|| anyhow::anyhow!("assistant content contained incomplete JSON"))?;
+        anyhow::ensure!(end >= start, "assistant JSON boundaries were invalid");
+        Ok(&trimmed[start..=end])
     }
 
     pub async fn name_document(
@@ -136,46 +207,45 @@ impl SlmLane {
         let mut system = format!(
             "You name business and legal documents from evidence excerpts.\n\
              Today's date: {today}. Document language: {language}. Classified type: {doc_type}.\n\
-             Respond with exactly one JSON object with keys date, date_source, subject, description.\n\
+             Do not reveal reasoning. Return only the requested JSON object.\n\
              Rules:\n\
-             - date: the document's own date in YYYY-MM-DD, chosen ONLY from dates visible in the evidence. If no date is visible, use \"none\".\n\
-             - date_source: \"document\" if the date appears in the document text, \"metadata\" if only in file metadata, \"none\" if no date.\n\
-             - subject: 3 to 8 words, specific, names the document type and key party or matter. Never generic words like Document or Scan. No slashes, colons, or special characters.\n\
-             - description: exactly one sentence, 15 to 200 characters, adding information beyond the subject.\n\
-             Do not invent dates, parties, or facts not present in the evidence."
+             - date: choose the document's own date in YYYY-MM-DD only from dates visible in the evidence. If no date is visible, use none.\n\
+             - date_source: document when visible in document text, metadata when visible only in file metadata, or none when there is no date.\n\
+             - subject: 3 to 8 specific words naming the document type and key party or matter. Never use generic names such as Document or Scan.\n\
+             - description: exactly one sentence, 15 to 200 characters, adding useful information beyond the subject.\n\
+             Never invent dates, parties, or facts."
         );
-        if let Some(v) = violation_note {
+        if let Some(violation) = violation_note {
             system.push_str(&format!(
-                "\nYour previous answer was rejected by a validator: {v}. Correct exactly that problem."
+                "\nA prior proposal was rejected by the deterministic validator: {violation}. Correct that exact problem."
             ));
         }
 
-        let prompt = Self::build_prompt(&system, evidence);
-        let body = json!({
-            "prompt": prompt,
-            "grammar": self.grammar,
-            "temperature": 0.0,
-            "n_predict": 220,
-            "stop": ["<|im_end|>"],
-            "cache_prompt": true
-        });
-
-        let url = format!("http://127.0.0.1:{port}/completion");
-        let resp: serde_json::Value =
-            self.http.post(&url).json(&body).send().await?.error_for_status()?.json().await?;
-        let content = resp["content"].as_str().unwrap_or_default().trim().to_string();
-        if content.is_empty() {
-            anyhow::bail!("SLM returned empty content");
-        }
-        let out: SlmOutput = serde_json::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("SLM output failed JSON parse despite grammar: {e}; raw: {content}"))?;
-        Ok(out)
+        let body = Self::request_body(&system, evidence);
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let response: Value = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let content = Self::chat_content(&response)?;
+        let object = Self::json_object(&content)?;
+        serde_json::from_str(object).map_err(|error| {
+            anyhow::anyhow!(
+                "SLM output failed JSON parsing despite schema constraint: {error}; raw: {content}"
+            )
+        })
     }
 
     pub fn shutdown(&self) {
         for slot in [&self.primary, &self.escalation] {
-            if let Some(mut c) = slot.lock().unwrap().take() {
-                let _ = c.kill();
+            if let Some(mut child) = slot.lock().unwrap().take() {
+                let _ = child.kill();
+                let _ = child.wait();
             }
         }
     }
@@ -184,5 +254,43 @@ impl SlmLane {
 impl Drop for SlmLane {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_uses_chat_template_and_schema_without_raw_prompt() {
+        let body = SlmLane::request_body("system", "evidence");
+        assert!(body.get("prompt").is_none());
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(
+            body["response_format"]["schema"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn extracts_content_from_openai_style_response() {
+        let response = json!({
+            "choices": [{"message": {"content": "{\"date\":\"none\"}"}}]
+        });
+        assert_eq!(
+            SlmLane::chat_content(&response).unwrap(),
+            "{\"date\":\"none\"}"
+        );
+    }
+
+    #[test]
+    fn isolates_json_from_template_noise() {
+        let value = "<think></think>\n```json\n{\"date\":\"none\"}\n```";
+        assert_eq!(
+            SlmLane::json_object(value).unwrap(),
+            "{\"date\":\"none\"}"
+        );
     }
 }
