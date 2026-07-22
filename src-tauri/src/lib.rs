@@ -5,6 +5,7 @@ mod harvest;
 mod identity;
 mod ledger;
 mod manifest;
+mod pause;
 mod pipeline;
 mod routing;
 mod sidecar;
@@ -21,6 +22,7 @@ use sidecar::Sidecar;
 use slm::SlmLane;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::Manager;
 
 struct AppState {
@@ -32,7 +34,10 @@ struct AppState {
 
 fn resource(app: &tauri::AppHandle, rel: &str) -> PathBuf {
     app.path()
-        .resolve(format!("resources/{rel}"), tauri::path::BaseDirectory::Resource)
+        .resolve(
+            format!("resources/{rel}"),
+            tauri::path::BaseDirectory::Resource,
+        )
         .unwrap_or_else(|_| PathBuf::from(format!("resources/{rel}")))
 }
 
@@ -41,19 +46,19 @@ fn binary(app: &tauri::AppHandle, name: &str) -> PathBuf {
     // triple suffix in dev; resolve both layouts.
     let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
         .unwrap_or_default();
     let candidates = [
         exe_dir.join(name),
         exe_dir.join(format!("{name}.exe")),
         resource(app, name).with_file_name(name.to_string()),
     ];
-    for c in &candidates {
-        if c.exists() {
-            return c.clone();
+    for candidate in &candidates {
+        if candidate.exists() {
+            return candidate.clone();
         }
     }
-    PathBuf::from(name) // PATH fallback for dev
+    PathBuf::from(name) // PATH fallback for development.
 }
 
 #[tauri::command]
@@ -63,31 +68,40 @@ fn get_config(state: tauri::State<AppState>) -> Config {
 
 #[tauri::command]
 fn set_config(state: tauri::State<AppState>, cfg: Config) -> Result<(), String> {
-    cfg.save(&state.cfg_path).map_err(|e| e.to_string())?;
+    cfg.save(&state.cfg_path).map_err(|error| error.to_string())?;
     *state.cfg.lock().unwrap() = cfg;
     Ok(())
 }
 
 #[tauri::command]
-fn list_jobs(state: tauri::State<AppState>, limit: Option<usize>) -> Result<Vec<ledger::Job>, String> {
-    state.ledger.list_jobs(limit.unwrap_or(500)).map_err(|e| e.to_string())
+fn list_jobs(
+    state: tauri::State<AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<ledger::Job>, String> {
+    state
+        .ledger
+        .list_jobs(limit.unwrap_or(500))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 fn list_flagged(state: tauri::State<AppState>) -> Result<Vec<ledger::Job>, String> {
-    state.ledger.list_by_state(ledger::JobState::Flagged).map_err(|e| e.to_string())
+    state
+        .ledger
+        .list_by_state(ledger::JobState::Flagged)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 fn get_stats(state: tauri::State<AppState>) -> Result<serde_json::Value, String> {
-    state.ledger.stats().map_err(|e| e.to_string())
+    state.ledger.stats().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 fn get_evidence(state: tauri::State<AppState>, sha256: String) -> Result<String, String> {
     let cfg = state.cfg.lock().unwrap().clone();
-    let p = cfg.cache_dir.join(format!("{sha256}.md"));
-    std::fs::read_to_string(p).map_err(|e| e.to_string())
+    let path = cfg.cache_dir.join(format!("{sha256}.md"));
+    std::fs::read_to_string(path).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -98,21 +112,22 @@ async fn resubmit(
     subject: String,
     description: String,
 ) -> Result<(), String> {
-    let pl = state
+    let pipeline = state
         .pipeline
         .lock()
         .unwrap()
         .clone()
         .ok_or_else(|| "pipeline not started".to_string())?;
-    pl.resubmit(&sha256, date, subject, description)
+    pipeline
+        .resubmit(&sha256, date, subject, description)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 fn set_paused(state: tauri::State<AppState>, paused: bool) -> Result<(), String> {
-    if let Some(pl) = state.pipeline.lock().unwrap().as_ref() {
-        pl.paused.store(paused, std::sync::atomic::Ordering::Relaxed);
+    if let Some(pipeline) = state.pipeline.lock().unwrap().as_ref() {
+        pipeline.set_paused(paused);
         Ok(())
     } else {
         Err("pipeline not started".into())
@@ -122,17 +137,19 @@ fn set_paused(state: tauri::State<AppState>, paused: bool) -> Result<(), String>
 #[tauri::command]
 fn start_pipeline(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
     let cfg = state.cfg.lock().unwrap().clone();
-    if !cfg.ready() {
-        return Err("Configure the Processing, Outbox, and Quarantine folders first.".into());
-    }
+    cfg.validate().map_err(|error| error.to_string())?;
+
     let mut slot = state.pipeline.lock().unwrap();
     if slot.is_some() {
-        return Ok(()); // already running
+        return Ok(()); // Already running.
     }
 
     let grammar = std::fs::read_to_string(resource(&app, "name.gbnf"))
-        .map_err(|e| format!("grammar load failed: {e}"))?;
-    let sidecar = Arc::new(Sidecar::new(binary(&app, "convertd")));
+        .map_err(|error| format!("grammar load failed: {error}"))?;
+    let sidecar = Arc::new(Sidecar::with_timeout(
+        binary(&app, "convertd"),
+        Duration::from_secs(cfg.sidecar_timeout_secs),
+    ));
     let slm = Arc::new(SlmLane::new(
         binary(&app, "llama-server"),
         grammar,
@@ -142,7 +159,8 @@ fn start_pipeline(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
         cfg.slm_parallel,
     ));
     let pipeline = Pipeline::new(cfg.clone(), state.ledger.clone(), sidecar, slm, app);
-    watcher::spawn(pipeline.clone(), cfg.processing_dir.clone()).map_err(|e| e.to_string())?;
+    watcher::spawn(pipeline.clone(), cfg.processing_dir.clone())
+        .map_err(|error| error.to_string())?;
     *slot = Some(pipeline);
     Ok(())
 }
