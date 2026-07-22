@@ -18,6 +18,19 @@ type Job = {
   updated_at: string;
 };
 
+type ReviewItem = {
+  instance_id: string;
+  sha256: string;
+  original_name: string;
+  flag_reason: string | null;
+  proposed_date: string | null;
+  proposed_subject: string | null;
+  description: string | null;
+  doc_type: string | null;
+  soft_flags: string | null;
+  updated_at: string;
+};
+
 type Config = {
   processing_dir: string;
   outbox_dir: string;
@@ -310,27 +323,30 @@ async function renderQueue(root: HTMLElement): Promise<void> {
 }
 
 async function renderFlagged(root: HTMLElement): Promise<void> {
-  const jobs = await invoke<Job[]>("list_flagged").catch(() => []);
-  if (!jobs.length) {
+  const items = await invoke<ReviewItem[]>("list_flagged", { limit: 500 }).catch(() => []);
+  if (!items.length) {
     root.appendChild(el(`<div class="empty">Nothing needs review.</div>`));
     return;
   }
 
-  jobs.forEach((job, index) => {
-    const id = `review-${index}-${job.sha256.slice(0, 8)}`;
+  items.forEach((item, index) => {
+    const id = `review-${index}-${item.instance_id.slice(0, 8)}`;
     const card = el(`
       <section class="card" aria-labelledby="${id}-title">
         <div class="card-head">
-          <strong id="${id}-title">${esc(job.original_name)}</strong>
-          <code class="reason">${esc(job.flag_reason ?? "unknown")}</code>
+          <div>
+            <strong id="${id}-title">${esc(item.original_name)}</strong>
+            <span class="instance-id" title="${esc(item.instance_id)}">Instance ${esc(item.instance_id.slice(0, 12))}</span>
+          </div>
+          <code class="reason">${esc(item.flag_reason ?? "unknown")}</code>
         </div>
         <div class="fields">
           <label for="${id}-date">Date</label>
-          <input id="${id}-date" type="date" name="date" value="${esc(job.proposed_date)}" required>
+          <input id="${id}-date" type="date" name="date" value="${esc(item.proposed_date)}" required>
           <label for="${id}-subject">Subject</label>
-          <input id="${id}-subject" name="subject" placeholder="3 to 8 words" value="${esc(job.proposed_subject)}" required>
+          <input id="${id}-subject" name="subject" placeholder="3 to 8 words" value="${esc(item.proposed_subject)}" required>
           <label for="${id}-description">Description</label>
-          <input id="${id}-description" name="description" placeholder="One sentence, 15 to 200 characters." value="${esc(job.description)}" required>
+          <input id="${id}-description" name="description" placeholder="One sentence, 15 to 200 characters." value="${esc(item.description)}" required>
         </div>
         <div class="card-actions">
           <button type="button" class="ghost" data-act="evidence">View text</button>
@@ -348,7 +364,7 @@ async function renderFlagged(root: HTMLElement): Promise<void> {
       if (evidence.hidden && !evidence.dataset.loaded) {
         evidenceButton.disabled = true;
         evidenceButton.textContent = "Loading text";
-        evidence.textContent = await invoke<string>("get_evidence", { sha256: job.sha256 }).catch(
+        evidence.textContent = await invoke<string>("get_evidence", { sha256: item.sha256 }).catch(
           () => "(No cached text. The file failed before conversion.)",
         );
         evidence.dataset.loaded = "true";
@@ -377,12 +393,12 @@ async function renderFlagged(root: HTMLElement): Promise<void> {
       card.setAttribute("aria-busy", "true");
       try {
         await invoke("resubmit", {
-          sha256: job.sha256,
+          instanceId: item.instance_id,
           date,
           subject,
           description,
         });
-        notice = { kind: "success", text: `${job.original_name} was approved and re-emitted.` };
+        notice = { kind: "success", text: `${item.original_name} was approved and re-emitted.` };
         card.remove();
       } catch (error) {
         if (errorElement) errorElement.textContent = errorText(error);
