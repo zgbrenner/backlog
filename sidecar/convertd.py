@@ -6,6 +6,7 @@ conversion components load lazily from local paths and remain resident.
 
 Operations:
   ping          -> {}
+  configure     {models_dir, ettin_dir?} -> {models_dir, ettin_enabled}
   versions      -> {convertd, models?}
   pdf_probe     {path} -> {median_chars_per_page, pages}
   convert       {path, head_pages, tail_pages} -> ConvertResult
@@ -28,16 +29,17 @@ import sys
 import traceback
 from pathlib import Path
 
+# Missing local assets must fail rather than silently reaching a model hub.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
-MODELS_DIR = Path(
-    os.environ.get(
-        "BACKLOG_MODELS_DIR",
-        Path(__file__).resolve().parent.parent / "models",
-    )
+_DEFAULT_MODELS_DIR = (
+    Path(sys.executable).resolve().parent / "models"
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent.parent / "models"
 )
+MODELS_DIR = Path(os.environ.get("BACKLOG_MODELS_DIR", _DEFAULT_MODELS_DIR))
 VERSION = "0.2.0"
 _CACHE: dict[str, object] = {}
 
@@ -79,6 +81,8 @@ def _language_detector():
     def create():
         from lingua import LanguageDetectorBuilder
 
+        # Evidence samples are normally hundreds of characters. Low-accuracy
+        # mode keeps memory near 100 MB and remains accurate on long text.
         return (
             LanguageDetectorBuilder.from_all_spoken_languages()
             .with_low_accuracy_mode()
@@ -135,6 +139,11 @@ def _ettin():
     return _get("ettin", create)
 
 
+# ---------------------------------------------------------------------------
+# PDF and metadata helpers
+# ---------------------------------------------------------------------------
+
+
 def _open_pdf(path: str):
     pdfium = _pdfium()
     try:
@@ -183,6 +192,7 @@ LETTERHEAD_RE = re.compile(
 
 
 def _doc_meta_dates(path: str) -> list[str]:
+    """Return real ISO dates found in DOCX core properties or PDF metadata."""
     import datetime
 
     values: list[str] = []
@@ -212,6 +222,8 @@ def _doc_meta_dates(path: str) -> list[str]:
             finally:
                 document.close()
     except Exception:
+        # Document metadata is optional, low-trust evidence. Conversion should
+        # continue when a producer wrote malformed properties.
         pass
 
     dates: list[str] = []
@@ -227,6 +239,11 @@ def _doc_meta_dates(path: str) -> list[str]:
 
 def _letterhead_resets(markdown: str) -> int:
     return max(0, len(LETTERHEAD_RE.findall(markdown)) - 1)
+
+
+# ---------------------------------------------------------------------------
+# Conversion and OCR
+# ---------------------------------------------------------------------------
 
 
 def _conversion_result(
@@ -307,10 +324,12 @@ def _render_pages(path: str, dpi: int, head: int, tail: int):
 
 
 def _ocr_profile(requested_dpi: int) -> tuple[int, bool]:
+    """Map the retry sentinel to a stronger fully local OCR pass."""
     return (600, True) if requested_dpi == 0 else (requested_dpi, False)
 
 
 def _rapidocr_lines(result) -> list[tuple[str, float]]:
+    """Normalize RapidOCR 3.x and legacy tuple results."""
     if result is None:
         return []
 
@@ -384,6 +403,11 @@ def op_ocr(args: dict) -> dict:
         ocr_mean_conf=confidence,
         page_count=page_count,
     )
+
+
+# ---------------------------------------------------------------------------
+# Language, classification, salience, and Ettin
+# ---------------------------------------------------------------------------
 
 
 def _language_code(language) -> str:
@@ -484,6 +508,36 @@ def op_ettin_spans(args: dict) -> dict:
     return {"spans": spans[:12]}
 
 
+def op_configure(args: dict) -> dict:
+    global MODELS_DIR
+
+    raw_models_dir = str(args.get("models_dir") or "").strip()
+    if not raw_models_dir:
+        raise ValueError("models_dir is required")
+    models_dir = Path(raw_models_dir).expanduser().resolve()
+    if not models_dir.is_dir():
+        raise ValueError(f"models_dir does not exist or is not a directory: {models_dir}")
+
+    raw_ettin_dir = str(args.get("ettin_dir") or "").strip()
+    if raw_ettin_dir:
+        ettin_dir = Path(raw_ettin_dir).expanduser().resolve()
+        if not ettin_dir.is_dir():
+            raise ValueError(f"ettin_dir does not exist or is not a directory: {ettin_dir}")
+        os.environ["BACKLOG_ETTIN_DIR"] = str(ettin_dir)
+        ettin_enabled = True
+    else:
+        os.environ.pop("BACKLOG_ETTIN_DIR", None)
+        ettin_enabled = False
+
+    MODELS_DIR = models_dir
+    for key in ("gliclass", "granite", "ettin"):
+        _CACHE.pop(key, None)
+    return {
+        "models_dir": str(MODELS_DIR),
+        "ettin_enabled": ettin_enabled,
+    }
+
+
 def op_versions(_args: dict) -> dict:
     versions = {"convertd": VERSION}
     lock = MODELS_DIR / "models.lock.json"
@@ -501,6 +555,7 @@ def op_ping(_args: dict) -> dict:
 
 OPS = {
     "ping": op_ping,
+    "configure": op_configure,
     "versions": op_versions,
     "pdf_probe": op_pdf_probe,
     "convert": op_convert,
