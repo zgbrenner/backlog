@@ -123,42 +123,27 @@ pub async fn run(app: &tauri::AppHandle, cfg: &Config, running: bool, paused: bo
             false
         }
     };
-    let outbox_writable = match writable_directory(&cfg.manifests_dir()) {
-        Ok(()) => true,
-        Err(message) => {
-            push_error(
-                &mut problems,
-                "outbox_dir",
-                "outbox_not_writable",
-                message,
-            );
-            false
-        }
-    };
-    let quarantine_writable = match writable_directory(&cfg.quarantine_dir) {
-        Ok(()) => true,
-        Err(message) => {
-            push_error(
-                &mut problems,
-                "quarantine_dir",
-                "quarantine_not_writable",
-                message,
-            );
-            false
-        }
-    };
-    let cache_writable = match writable_directory(&cfg.cache_dir) {
-        Ok(()) => true,
-        Err(message) => {
-            push_error(
-                &mut problems,
-                "cache_dir",
-                "cache_not_writable",
-                message,
-            );
-            false
-        }
-    };
+    let outbox_writable = check_writable_root(
+        &mut problems,
+        "outbox_dir",
+        "outbox_not_writable",
+        &cfg.outbox_dir,
+        &cfg.manifests_dir(),
+    );
+    let quarantine_writable = check_writable_root(
+        &mut problems,
+        "quarantine_dir",
+        "quarantine_not_writable",
+        &cfg.quarantine_dir,
+        &cfg.quarantine_dir,
+    );
+    let cache_writable = check_writable_root(
+        &mut problems,
+        "cache_dir",
+        "cache_not_writable",
+        &cfg.cache_dir,
+        &cfg.cache_dir,
+    );
 
     let primary_model_found = cfg.slm_primary_gguf.is_file();
     let escalation_model_found = cfg.slm_escalation_gguf.is_file();
@@ -323,6 +308,25 @@ fn readable_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("Folder cannot be read ({}): {error}", path.display()))
 }
 
+fn check_writable_root(
+    problems: &mut Vec<RuntimeProblem>,
+    field: &str,
+    code: &str,
+    configured_root: &Path,
+    probe_path: &Path,
+) -> bool {
+    if configured_root.as_os_str().is_empty() {
+        return false;
+    }
+    match writable_directory(probe_path) {
+        Ok(()) => true,
+        Err(message) => {
+            push_error(problems, field, code, message);
+            false
+        }
+    }
+}
+
 fn writable_directory(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("Select a non-empty folder.".into());
@@ -390,6 +394,21 @@ mod tests {
         let target = root.path().join("not-a-directory");
         std::fs::write(&target, b"fixture").unwrap();
         assert!(writable_directory(&target).is_err());
+    }
+
+    #[test]
+    fn blank_root_does_not_create_a_relative_probe_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let relative_probe = root.path().join("_manifests");
+        let mut problems = Vec::new();
+        assert!(!check_writable_root(
+            &mut problems,
+            "outbox_dir",
+            "outbox_not_writable",
+            Path::new(""),
+            &relative_probe,
+        ));
+        assert!(!relative_probe.exists());
     }
 
     #[test]
