@@ -69,20 +69,6 @@ fn resolve_runtime_config(app: &tauri::AppHandle, cfg: &mut Config) {
     }
 }
 
-fn configure_sidecar_environment(cfg: &Config) -> Result<(), String> {
-    let models_dir = cfg
-        .slm_primary_gguf
-        .parent()
-        .ok_or_else(|| "primary model path has no parent directory".to_string())?;
-    std::env::set_var("BACKLOG_MODELS_DIR", models_dir);
-    if cfg.ettin_model_dir.trim().is_empty() {
-        std::env::remove_var("BACKLOG_ETTIN_DIR");
-    } else {
-        std::env::set_var("BACKLOG_ETTIN_DIR", &cfg.ettin_model_dir);
-    }
-    Ok(())
-}
-
 #[tauri::command]
 fn get_config(state: tauri::State<AppState>) -> Config {
     state.cfg.lock().unwrap().clone()
@@ -221,7 +207,6 @@ async fn start_pipeline(
     if !status.configured {
         return Err(status.summary());
     }
-    configure_sidecar_environment(&cfg)?;
 
     let grammar_path = preflight::resolve_resource(&app, "name.gbnf");
     let grammar = std::fs::read_to_string(&grammar_path)
@@ -230,11 +215,28 @@ async fn start_pipeline(
         .ok_or_else(|| "convertd sidecar disappeared after preflight".to_string())?;
     let llama_executable = preflight::resolve_binary(&app, "llama-server")
         .ok_or_else(|| "llama-server disappeared after preflight".to_string())?;
+    let models_dir = cfg
+        .slm_primary_gguf
+        .parent()
+        .ok_or_else(|| "primary model path has no parent directory".to_string())?
+        .to_string_lossy()
+        .into_owned();
+    let ettin_dir = (!cfg.ettin_model_dir.trim().is_empty())
+        .then(|| cfg.ettin_model_dir.clone());
 
     let sidecar = Arc::new(Sidecar::with_timeout(
         sidecar_executable,
         Duration::from_secs(cfg.sidecar_timeout_secs),
     ));
+    sidecar
+        .call(
+            "configure",
+            serde_json::json!({
+                "models_dir": models_dir,
+                "ettin_dir": ettin_dir,
+            }),
+        )
+        .map_err(|error| format!("sidecar configuration failed: {error}"))?;
     let slm = Arc::new(SlmLane::new(
         llama_executable,
         grammar,
