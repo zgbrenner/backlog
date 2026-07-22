@@ -15,6 +15,17 @@ CONVERTD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CONVERTD)
 
 
+class ArrayLikeScores:
+    def __init__(self, values):
+        self.values = values
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def __bool__(self):
+        raise AssertionError("score arrays must not be coerced to bool")
+
+
 class PageSelectionTests(unittest.TestCase):
     def test_page_indices_keep_head_and_tail_without_duplicates(self):
         self.assertEqual(CONVERTD._page_indices(20, 3, 2), [0, 1, 2, 18, 19])
@@ -42,6 +53,16 @@ class PacketHeuristicTests(unittest.TestCase):
 class RapidOcrCompatibilityTests(unittest.TestCase):
     def test_extracts_lines_from_rapidocr_three_result_object(self):
         result = SimpleNamespace(txts=["First", "Second"], scores=[0.91, 0.82])
+        self.assertEqual(
+            CONVERTD._rapidocr_lines(result),
+            [("First", 0.91), ("Second", 0.82)],
+        )
+
+    def test_does_not_boolean_coerce_array_like_scores(self):
+        result = SimpleNamespace(
+            txts=["First", "Second"],
+            scores=ArrayLikeScores([0.91, 0.82]),
+        )
         self.assertEqual(
             CONVERTD._rapidocr_lines(result),
             [("First", 0.91), ("Second", 0.82)],
