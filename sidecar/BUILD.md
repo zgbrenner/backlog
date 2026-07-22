@@ -7,37 +7,54 @@ The Tauri app expects a single-file executable named `convertd` (or
 
 ## Steps (run on the target OS)
 
-```
+```powershell
 cd sidecar
 python -m venv .venv
-.venv\Scripts\activate            # Windows
-pip install -r requirements.txt pyinstaller
+.venv\Scripts\activate
+python -m pip install --require-virtualenv -r requirements.txt "pyinstaller>=6,<7"
 
-pyinstaller --onefile --name convertd \
-  --collect-all rapidocr_onnxruntime \
-  --collect-all gliclass \
-  --collect-all markitdown \
-  --hidden-import onnxruntime \
+pyinstaller --onefile --name convertd `
+  --collect-all rapidocr `
+  --collect-all lingua `
+  --collect-all gliclass `
+  --collect-all markitdown `
+  --hidden-import onnxruntime `
   convertd.py
 
-# Windows example:
-copy dist\convertd.exe ..\src-tauri\binaries\convertd-x86_64-pc-windows-msvc.exe
+Copy-Item dist\convertd.exe ..\src-tauri\binaries\convertd-x86_64-pc-windows-msvc.exe
 ```
 
 ## Runtime environment variables
 
-- `BACKLOG_MODELS_DIR`: path to the models directory (defaults to `../models`
-  relative to the executable during dev).
+- `BACKLOG_MODELS_DIR`: path to the models directory. During development it
+  defaults to `../models` relative to the sidecar source tree.
 - `BACKLOG_ETTIN_DIR`: path to the fine-tuned Ettin token classifier. Unset
-  disables the Ettin lane; the app degrades gracefully.
+  disables the Ettin lane and the app degrades gracefully.
 
 ## Notes
 
-- First PyInstaller build is slow; expect a 600 MB-1 GB binary because torch
-  ships inside. If that offends you (it should), build a second slim profile
-  without torch and set `BACKLOG_ETTIN_DIR` empty: gliclass also needs torch,
-  so the slim profile drops classify + ettin + VL fallback and keeps
-  convert/ocr/langid/salience via onnxruntime only. Slice 2-3 works fully on
-  the slim profile.
+- The full build is large because GLiClass and the optional trained Ettin lane
+  use PyTorch. A separately tested slim profile may omit those two lanes while
+  retaining MarkItDown conversion, RapidOCR, Lingua language detection,
+  Granite salience, and deterministic validation.
 - Smoke test before bundling:
-  `echo {"id":1,"op":"ping"} | dist/convertd` should print `{"id": 1, "ok": true}`.
+
+  ```powershell
+  '{"id":1,"op":"ping"}' | dist\convertd.exe
+  ```
+
+  The process must print a single response containing `{"id": 1, "ok": true}`.
+
+## Reproducible release input
+
+`requirements.in` is the reviewed dependency intent. On the Windows release
+machine, regenerate a hash-pinned lock with the approved Python 3.11 interpreter:
+
+```powershell
+python -m pip install "pip-tools>=7,<8"
+pip-compile --generate-hashes --resolver=backtracking --output-file requirements.lock requirements.in
+python -m pip install --require-hashes -r requirements.lock
+```
+
+Commit the generated lock only after the sidecar protocol tests and installer
+smoke test pass with that exact file.
