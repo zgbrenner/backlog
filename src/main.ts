@@ -78,8 +78,9 @@ type PathKey =
 
 type Notice = { kind: "error" | "success"; text: string };
 
-const app = document.getElementById("app");
-if (!app) throw new Error("BackLog application root is missing");
+const appRoot = document.getElementById("app");
+if (!(appRoot instanceof HTMLElement)) throw new Error("BackLog application root is missing");
+const app: HTMLElement = appRoot;
 
 let cfg: Config | null = null;
 let runtime: RuntimeStatus = uncheckedRuntime();
@@ -182,7 +183,9 @@ async function refreshRuntime(activeCheck: boolean): Promise<boolean> {
 
 async function render(): Promise<void> {
   const version = ++renderVersion;
-  const stats = await invoke<Record<string, number>>("get_stats").catch(() => ({}));
+  const stats: Record<string, number> = await invoke<Record<string, number>>("get_stats").catch(
+    (): Record<string, number> => ({}),
+  );
   if (version !== renderVersion) return;
 
   const total = Object.values(stats).reduce((sum, value) => sum + value, 0);
