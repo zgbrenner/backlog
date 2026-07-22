@@ -6,6 +6,7 @@ mod identity;
 mod ledger;
 mod manifest;
 mod pipeline;
+mod preflight;
 mod recovery;
 mod routing;
 mod sidecar;
@@ -18,47 +19,27 @@ mod task3_tests;
 use config::Config;
 use ledger::Ledger;
 use pipeline::Pipeline;
+use preflight::RuntimeStatus;
 use sidecar::Sidecar;
 use slm::SlmLane;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::Manager;
 
 struct AppState {
     cfg_path: PathBuf,
     cfg: Mutex<Config>,
     ledger: Arc<Ledger>,
     pipeline: Mutex<Option<Arc<Pipeline>>>,
+    last_preflight: Mutex<Option<RuntimeStatus>>,
 }
 
-fn resource(app: &tauri::AppHandle, rel: &str) -> PathBuf {
-    app.path()
-        .resolve(
-            format!("resources/{rel}"),
-            tauri::path::BaseDirectory::Resource,
-        )
-        .unwrap_or_else(|_| PathBuf::from(format!("resources/{rel}")))
-}
-
-fn binary(app: &tauri::AppHandle, name: &str) -> PathBuf {
-    // Tauri externalBin sidecars sit next to the app binary with a target
-    // triple suffix in dev; resolve both layouts.
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
-        .unwrap_or_default();
-    let candidates = [
-        exe_dir.join(name),
-        exe_dir.join(format!("{name}.exe")),
-        resource(app, name).with_file_name(name.to_string()),
-    ];
-    for candidate in &candidates {
-        if candidate.exists() {
-            return candidate.clone();
-        }
+fn runtime_flags(state: &AppState) -> (bool, bool) {
+    let pipeline = state.pipeline.lock().unwrap();
+    match pipeline.as_ref() {
+        Some(pipeline) => (true, pipeline.is_paused()),
+        None => (false, false),
     }
-    PathBuf::from(name) // PATH fallback for development.
 }
 
 #[tauri::command]
@@ -68,9 +49,41 @@ fn get_config(state: tauri::State<AppState>) -> Config {
 
 #[tauri::command]
 fn set_config(state: tauri::State<AppState>, cfg: Config) -> Result<(), String> {
-    cfg.save(&state.cfg_path).map_err(|error| error.to_string())?;
+    if state.pipeline.lock().unwrap().is_some() {
+        return Err(
+            "Settings cannot change while the pipeline is running. Restart BackLog before changing runtime paths or models."
+                .into(),
+        );
+    }
+    cfg.save(&state.cfg_path)
+        .map_err(|error| error.to_string())?;
     *state.cfg.lock().unwrap() = cfg;
+    *state.last_preflight.lock().unwrap() = None;
     Ok(())
+}
+
+#[tauri::command]
+fn get_runtime_status(state: tauri::State<AppState>) -> RuntimeStatus {
+    let (running, paused) = runtime_flags(&state);
+    state
+        .last_preflight
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| RuntimeStatus::unchecked(running, paused))
+        .with_runtime(running, paused)
+}
+
+#[tauri::command]
+async fn run_preflight(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> RuntimeStatus {
+    let cfg = state.cfg.lock().unwrap().clone();
+    let (running, paused) = runtime_flags(&state);
+    let status = preflight::run(&app, &cfg, running, paused).await;
+    *state.last_preflight.lock().unwrap() = Some(status.clone());
+    status
 }
 
 #[tauri::command]
@@ -126,42 +139,78 @@ async fn resubmit(
 
 #[tauri::command]
 fn set_paused(state: tauri::State<AppState>, paused: bool) -> Result<(), String> {
-    if let Some(pipeline) = state.pipeline.lock().unwrap().as_ref() {
-        pipeline.set_paused(paused);
-        Ok(())
-    } else {
-        Err("pipeline not started".into())
+    let pipeline = state
+        .pipeline
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "pipeline not started".to_string())?;
+    pipeline.set_paused(paused);
+
+    if let Some(status) = state.last_preflight.lock().unwrap().as_mut() {
+        status.running = true;
+        status.paused = paused;
     }
+    Ok(())
 }
 
 #[tauri::command]
-fn start_pipeline(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
-    let cfg = state.cfg.lock().unwrap().clone();
-    cfg.validate().map_err(|error| error.to_string())?;
-
-    let mut slot = state.pipeline.lock().unwrap();
-    if slot.is_some() {
-        return Ok(()); // Already running.
+async fn start_pipeline(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if state.pipeline.lock().unwrap().is_some() {
+        return Ok(());
     }
 
-    let grammar = std::fs::read_to_string(resource(&app, "name.gbnf"))
-        .map_err(|error| format!("grammar load failed: {error}"))?;
+    let cfg = state.cfg.lock().unwrap().clone();
+    let status = preflight::run(&app, &cfg, false, false).await;
+    *state.last_preflight.lock().unwrap() = Some(status.clone());
+    if !status.configured {
+        return Err(status.summary());
+    }
+
+    let grammar_path = preflight::resolve_resource(&app, "name.gbnf");
+    let grammar = std::fs::read_to_string(&grammar_path)
+        .map_err(|error| format!("grammar load failed at {}: {error}", grammar_path.display()))?;
+    let sidecar_executable = preflight::resolve_binary(&app, "convertd")
+        .ok_or_else(|| "convertd sidecar disappeared after preflight".to_string())?;
+    let llama_executable = preflight::resolve_binary(&app, "llama-server")
+        .ok_or_else(|| "llama-server disappeared after preflight".to_string())?;
+
     let sidecar = Arc::new(Sidecar::with_timeout(
-        binary(&app, "convertd"),
+        sidecar_executable,
         Duration::from_secs(cfg.sidecar_timeout_secs),
     ));
     let slm = Arc::new(SlmLane::new(
-        binary(&app, "llama-server"),
+        llama_executable,
         grammar,
         cfg.slm_primary_gguf.clone(),
         cfg.slm_escalation_gguf.clone(),
         cfg.llama_port,
         cfg.slm_parallel,
     ));
-    let pipeline = Pipeline::new(cfg.clone(), state.ledger.clone(), sidecar, slm, app);
+    let pipeline = Pipeline::new(
+        cfg.clone(),
+        state.ledger.clone(),
+        sidecar,
+        slm,
+        app,
+    );
+
+    let mut slot = state.pipeline.lock().unwrap();
+    if slot.is_some() {
+        return Ok(());
+    }
     watcher::spawn(pipeline.clone(), cfg.processing_dir.clone())
         .map_err(|error| error.to_string())?;
     *slot = Some(pipeline);
+    drop(slot);
+
+    if let Some(status) = state.last_preflight.lock().unwrap().as_mut() {
+        status.running = true;
+        status.paused = false;
+    }
     Ok(())
 }
 
@@ -186,12 +235,15 @@ pub fn run() {
                 cfg: Mutex::new(cfg),
                 ledger,
                 pipeline: Mutex::new(None),
+                last_preflight: Mutex::new(None),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
             set_config,
+            get_runtime_status,
+            run_preflight,
             list_jobs,
             list_flagged,
             get_stats,
