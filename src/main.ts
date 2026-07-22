@@ -61,8 +61,18 @@ function esc(s: string | null | undefined): string {
   );
 }
 
+// Non-blocking, CSP-safe error surface for user-initiated actions.
+function showError(msg: string): void {
+  const toast = el(`<div class="toast" role="alert"></div>`);
+  toast.textContent = msg;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 6000);
+}
+
 async function render() {
-  const stats = await invoke<Record<string, number>>("get_stats").catch(() => ({}));
+  const stats = await invoke<Record<string, number>>("get_stats").catch(
+    (): Record<string, number> => ({})
+  );
   const total = Object.values(stats).reduce((a, b) => a + (b as number), 0);
   app.innerHTML = "";
   app.appendChild(el(`
@@ -103,18 +113,33 @@ async function onRunButton() {
       await invoke("start_pipeline");
       running = true;
     } catch (e) {
-      alert(String(e));
+      showError(String(e));
       view = "settings";
     }
   } else {
-    paused = !paused;
-    await invoke("set_paused", { paused });
+    // Only flip local state once the backend confirms, so the button never
+    // desyncs from the pipeline on failure.
+    const next = !paused;
+    try {
+      await invoke("set_paused", { paused: next });
+      paused = next;
+    } catch (e) {
+      showError(String(e));
+    }
   }
   render();
 }
 
 async function renderQueue(root: HTMLElement) {
-  const jobs = await invoke<Job[]>("list_jobs", { limit: 500 }).catch(() => []);
+  let jobs: Job[];
+  try {
+    jobs = await invoke<Job[]>("list_jobs", { limit: 500 });
+  } catch (e) {
+    const err = el(`<div class="empty err-state"></div>`);
+    err.textContent = `Couldn't load the queue: ${String(e)}`;
+    root.appendChild(err);
+    return;
+  }
   if (!jobs.length) {
     root.appendChild(el(`<div class="empty">No files yet. Configure folders in Settings, hit Start, and drop files into the Processing folder (or let Flow 1 do it).</div>`));
     return;
@@ -135,7 +160,15 @@ async function renderQueue(root: HTMLElement) {
 }
 
 async function renderFlagged(root: HTMLElement) {
-  const jobs = await invoke<Job[]>("list_flagged").catch(() => []);
+  let jobs: Job[];
+  try {
+    jobs = await invoke<Job[]>("list_flagged");
+  } catch (e) {
+    const err = el(`<div class="empty err-state"></div>`);
+    err.textContent = `Couldn't load the review queue: ${String(e)}`;
+    root.appendChild(err);
+    return;
+  }
   if (!jobs.length) {
     root.appendChild(el(`<div class="empty">Nothing needs review. As it should be.</div>`));
     return;
@@ -230,7 +263,16 @@ function renderSettings(root: HTMLElement) {
   root2.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const val = (n: string) => (root2.querySelector(`[name="${n}"]`) as HTMLInputElement).value;
-    const num = (n: string) => parseInt(val(n), 10) || 0;
+    // Clamp numeric fields to the input's own min/max so a cleared or
+    // out-of-range field can't silently persist a pipeline-stalling 0.
+    const num = (n: string) => {
+      const input = root2.querySelector(`[name="${n}"]`) as HTMLInputElement;
+      const min = input.min !== "" ? parseInt(input.min, 10) : Number.NEGATIVE_INFINITY;
+      const max = input.max !== "" ? parseInt(input.max, 10) : Number.POSITIVE_INFINITY;
+      let x = parseInt(input.value, 10);
+      if (Number.isNaN(x)) x = Number.isFinite(min) ? min : 0;
+      return Math.min(max, Math.max(min, x));
+    };
     const next: Config = {
       ...c,
       processing_dir: val("processing_dir"),
@@ -268,7 +310,20 @@ listen("job-updated", () => {
 });
 
 (async () => {
-  cfg = await invoke<Config>("get_config");
+  try {
+    cfg = await invoke<Config>("get_config");
+  } catch (e) {
+    // Without config we can render nothing meaningful; show a recoverable
+    // fatal state instead of a blank white window.
+    app.innerHTML = "";
+    const fatal = el(
+      `<div class="fatal"><strong>BackLog failed to start.</strong><div class="msg"></div><button type="button">Reload</button></div>`
+    );
+    (fatal.querySelector(".msg") as HTMLElement).textContent = String(e);
+    fatal.querySelector("button")!.addEventListener("click", () => location.reload());
+    app.appendChild(fatal);
+    return;
+  }
   if (!cfg.processing_dir) view = "settings";
   render();
 })();

@@ -100,6 +100,27 @@ button.ghost:hover { color: var(--text); }
   white-space: pre-wrap;
 }
 
+.err-state { color: var(--bad); }
+
+.fatal {
+  max-width: 520px; margin: 90px auto 0; text-align: center;
+  background: var(--panel); border: 1px solid var(--panel2);
+  border-radius: 10px; padding: 26px; line-height: 1.7;
+}
+.fatal .msg { color: var(--bad); font-family: var(--mono); font-size: 12.5px; margin: 12px 0 18px; word-break: break-word; }
+.fatal button {
+  background: var(--accent); color: #08131f; border: none;
+  border-radius: 6px; padding: 8px 18px; font-weight: 600; cursor: pointer;
+}
+
+.toast {
+  position: fixed; right: 18px; bottom: 18px; z-index: 50; max-width: 380px;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--bad); border-left: 3px solid var(--bad);
+  border-radius: 8px; padding: 12px 14px; font-size: 13px; line-height: 1.5;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); word-break: break-word;
+}
+
 .settings { max-width: 760px; }
 .settings h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--dim); margin: 22px 0 10px; }
 .settings h2:first-child { margin-top: 0; }
