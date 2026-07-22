@@ -11,7 +11,8 @@ The Tauri app expects a single-file executable named `convertd` (or
 cd sidecar
 python -m venv .venv
 .venv\Scripts\activate            # Windows
-pip install -r requirements.txt pyinstaller
+pip install --require-hashes -r requirements.txt
+pip install "pyinstaller>=6.11,<7"   # separate: hash mode rejects unhashed args
 
 pyinstaller --onefile --name convertd \
   --collect-all rapidocr_onnxruntime \

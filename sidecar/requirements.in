@@ -2,6 +2,14 @@
 #
 # This is the human-edited intent file. Do not hand-edit requirements.txt;
 # regenerate it instead (see the header comment in requirements.txt).
+#
+# The committed requirements.txt was resolved with pip-compile on Linux /
+# CPython 3.11. Hashes cover every published wheel of each pinned version, so
+# installs work cross-platform, but a dependency that only appears under a
+# Windows environment marker would be missing from the lock. If a Windows
+# `pip install --require-hashes` reports an unpinned requirement, re-run the
+# pip-compile command from the requirements.txt header on Windows and commit
+# the result.
 markitdown[all]>=0.1.1
 pypdfium2>=4.30
 rapidocr-onnxruntime>=1.3.24

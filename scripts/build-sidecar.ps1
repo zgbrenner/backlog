@@ -27,7 +27,10 @@ if (-not (Test-Path $VenvPython)) {
 }
 
 & $VenvPython -m pip install --upgrade pip
-& $VenvPython -m pip install -r (Join-Path $SidecarDir "requirements.txt") "pyinstaller>=6.11,<7"
+# requirements.txt is hash-pinned; pip's hash-checking mode rejects any
+# requirement given without hashes, so PyInstaller installs separately.
+& $VenvPython -m pip install --require-hashes -r (Join-Path $SidecarDir "requirements.txt")
+& $VenvPython -m pip install "pyinstaller>=6.11,<7"
 
 Push-Location $SidecarDir
 try {
