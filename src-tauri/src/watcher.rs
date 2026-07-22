@@ -1,7 +1,7 @@
 //! Folder watcher over the OneDrive-synced processing dir. Debounced, and
 //! with a size-stability check because OneDrive writes files in visible
 //! partial states; hashing a half-synced file wastes a job slot and creates
-//! a phantom "duplicate" when the full file lands.
+//! a phantom duplicate when the full file lands.
 
 use crate::pipeline::Pipeline;
 use notify_debouncer_full::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
@@ -14,75 +14,83 @@ const STABILITY_PROBES: u32 = 3;
 const STABILITY_INTERVAL_MS: u64 = 700;
 
 pub fn spawn(pipeline: Arc<Pipeline>, dir: PathBuf) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Handle::current();
-    std::thread::Builder::new().name("backlog-watcher".into()).spawn(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut debouncer = match new_debouncer(Duration::from_secs(2), None, tx) {
-            Ok(d) => d,
-            Err(e) => {
-                log::error!("watcher init failed: {e}");
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::Builder::new()
+        .name("backlog-watcher".into())
+        .spawn(move || {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let mut debouncer = match new_debouncer(Duration::from_secs(2), None, sender) {
+                Ok(debouncer) => debouncer,
+                Err(error) => {
+                    log::error!("watcher init failed: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = debouncer.watch(&dir, RecursiveMode::Recursive) {
+                log::error!("cannot watch {dir:?}: {error}");
                 return;
             }
-        };
-        if let Err(e) = debouncer.watch(&dir, RecursiveMode::Recursive) {
-            log::error!("cannot watch {dir:?}: {e}");
-            return;
-        }
-        log::info!("watching {dir:?}");
+            log::info!("watching {dir:?}");
 
-        // Sweep pre-existing + resumable files on startup.
-        for entry in walk(&dir) {
-            enqueue(&rt, &pipeline, entry);
-        }
+            // Sweep every existing file on startup. Stable instance identity
+            // makes this safe after a crash or a missed OneDrive event.
+            for entry in walk(&dir) {
+                enqueue(&runtime, &pipeline, entry);
+            }
 
-        for result in rx {
-            match result {
-                DebounceEventResult::Ok(events) => {
-                    for ev in events {
-                        for p in ev.paths.clone() {
-                            if is_candidate(&p) {
-                                enqueue(&rt, &pipeline, p);
+            for result in receiver {
+                match result {
+                    DebounceEventResult::Ok(events) => {
+                        for event in events {
+                            for path in event.paths {
+                                if is_candidate(&path) {
+                                    enqueue(&runtime, &pipeline, path);
+                                }
                             }
                         }
                     }
-                }
-                DebounceEventResult::Err(errs) => {
-                    for e in errs {
-                        log::warn!("watch error: {e}");
+                    DebounceEventResult::Err(errors) => {
+                        for error in errors {
+                            log::warn!("watch error: {error}");
+                        }
                     }
                 }
             }
-        }
-    })?;
+        })?;
     Ok(())
 }
 
-fn enqueue(rt: &tokio::runtime::Handle, pipeline: &Arc<Pipeline>, path: PathBuf) {
-    let pl = pipeline.clone();
-    rt.spawn(async move {
+fn enqueue(runtime: &tokio::runtime::Handle, pipeline: &Arc<Pipeline>, path: PathBuf) {
+    let pipeline = pipeline.clone();
+    runtime.spawn(async move {
         if !wait_stable(&path).await {
             return;
         }
-        pl.process_file(path).await;
+        pipeline.process_file_recoverable(path).await;
     });
 }
 
-fn is_candidate(p: &Path) -> bool {
-    if !p.is_file() {
+fn is_candidate(path: &Path) -> bool {
+    if !path.is_file() {
         return false;
     }
-    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    !IGNORED_PREFIXES.iter().any(|pre| name.starts_with(pre))
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    !IGNORED_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
-/// A file is "stable" when its size stops changing across probes and it can
-/// be opened for read. Half-synced OneDrive files fail one of the two.
+/// A file is stable when its size stops changing across probes and it can be
+/// opened for read. Half-synced OneDrive files fail one of the two checks.
 async fn wait_stable(path: &Path) -> bool {
-    let mut last: Option<u64> = None;
+    let mut last = None;
     for _ in 0..STABILITY_PROBES * 10 {
         let size = match std::fs::metadata(path) {
-            Ok(m) => m.len(),
-            Err(_) => return false, // vanished (moved by us or by sync)
+            Ok(metadata) => metadata.len(),
+            Err(_) => return false, // Vanished or was moved by a completed run.
         };
         if last == Some(size) && std::fs::File::open(path).is_ok() && size > 0 {
             return true;
@@ -95,19 +103,19 @@ async fn wait_stable(path: &Path) -> bool {
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+    let mut files = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        if let Ok(entries) = std::fs::read_dir(&d) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if is_candidate(&p) {
-                    out.push(p);
+    while let Some(directory) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&directory) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if is_candidate(&path) {
+                    files.push(path);
                 }
             }
         }
     }
-    out
+    files
 }
