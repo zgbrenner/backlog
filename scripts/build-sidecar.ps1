@@ -2,7 +2,8 @@
 param(
     [string]$Python = "python",
     [string]$TargetTriple = "x86_64-pc-windows-msvc",
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$RequireLockedDependencies
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,22 +13,31 @@ $VenvDir = Join-Path $SidecarDir ".venv-build"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $BinariesDir = Join-Path $RepoRoot "src-tauri\binaries"
 $Destination = Join-Path $BinariesDir "convertd-$TargetTriple.exe"
+$RequirementsLock = Join-Path $SidecarDir "requirements.lock"
+$RequirementsIntent = Join-Path $SidecarDir "requirements.txt"
 
 if ($Clean -and (Test-Path $VenvDir)) {
     Remove-Item -Recurse -Force $VenvDir
 }
 
-$PythonVersion = & $Python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-if ($LASTEXITCODE -ne 0 -or $PythonVersion.Trim() -ne "3.11") {
-    throw "BackLog's reproducible Windows sidecar build requires 64-bit Python 3.11. Found: $PythonVersion"
+$PythonVersion = & $Python -c "import struct,sys; print(f'{sys.version_info.major}.{sys.version_info.minor}:{struct.calcsize(''P'') * 8}')"
+if ($LASTEXITCODE -ne 0 -or $PythonVersion.Trim() -ne "3.11:64") {
+    throw "BackLog's Windows sidecar build requires 64-bit Python 3.11. Found: $PythonVersion"
 }
 
 if (-not (Test-Path $VenvPython)) {
     & $Python -m venv $VenvDir
 }
 
-& $VenvPython -m pip install --upgrade pip
-& $VenvPython -m pip install -r (Join-Path $SidecarDir "requirements.txt") "pyinstaller>=6.11,<7"
+if (Test-Path $RequirementsLock) {
+    & $VenvPython -m pip install --require-hashes -r $RequirementsLock
+} elseif ($RequireLockedDependencies) {
+    throw "sidecar/requirements.lock is required for a release build. Regenerate it from requirements.in with pip-compile --generate-hashes."
+} else {
+    Write-Warning "Building an unsigned pilot sidecar from reviewed version ranges because requirements.lock is absent."
+    & $VenvPython -m pip install -r $RequirementsIntent
+}
+& $VenvPython -m pip install "pyinstaller>=6.11,<7"
 
 Push-Location $SidecarDir
 try {
@@ -37,11 +47,11 @@ try {
         --onefile `
         --name convertd `
         --collect-all rapidocr `
+        --collect-all lingua `
         --collect-all gliclass `
         --collect-all markitdown `
         --collect-all sentence_transformers `
         --hidden-import onnxruntime `
-        --hidden-import fasttext `
         convertd.py
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE"
