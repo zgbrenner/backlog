@@ -36,7 +36,7 @@ class ModelSpecTests(unittest.TestCase):
             files,
         )
 
-    def test_restricted_liquid_and_fasttext_assets_are_absent(self):
+    def test_restricted_and_training_only_assets_are_absent(self):
         serialized = json.dumps(
             [spec.__dict__ for spec in DOWNLOAD.MODEL_SPECS]
         ).lower()
@@ -44,6 +44,7 @@ class ModelSpecTests(unittest.TestCase):
         self.assertNotIn("lfm2", serialized)
         self.assertNotIn("fasttext", serialized)
         self.assertNotIn("lid.176", serialized)
+        self.assertNotIn("ettin", serialized)
 
 
 class LockVerificationTests(unittest.TestCase):
