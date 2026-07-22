@@ -238,15 +238,18 @@ impl Ledger {
 
     /// Filename collision resolution against everything the ledger has emitted.
     /// Returns the base name (no extension) with " (n)" appended as needed.
-    pub fn dedupe_name(&self, base: &str, ext: &str) -> anyhow::Result<String> {
+    /// `self_key` is the sha256 (or duplicate key) of the job being named; its
+    /// own prior `final_filename` is excluded so a resumed job doesn't collide
+    /// with itself and drift to " (2)".
+    pub fn dedupe_name(&self, base: &str, ext: &str, self_key: &str) -> anyhow::Result<String> {
         let conn = self.conn.lock().unwrap();
         let mut candidate = base.to_string();
         let mut n = 1u32;
         loop {
             let full = format!("{candidate}.{ext}");
             let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM jobs WHERE final_filename = ?1)",
-                params![full],
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE final_filename = ?1 AND sha256 <> ?2)",
+                params![full, self_key],
                 |r| r.get(0),
             )?;
             if !exists {

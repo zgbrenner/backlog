@@ -232,7 +232,7 @@ impl Pipeline {
         let _ = self.ledger.set_state(&sha, JobState::Validated);
 
         // ---- Compose final name, dedupe, emit ------------------------------
-        let base = match self.ledger.dedupe_name(&validated.base_name, &ext) {
+        let base = match self.ledger.dedupe_name(&validated.base_name, &ext, &sha) {
             Ok(b) => b,
             Err(e) => {
                 self.flag(&sha, &path, format!("RUNTIME_FAIL:dedupe {e}")).await;
@@ -427,19 +427,54 @@ impl Pipeline {
             return; // duplicate of a flagged file: nothing sane to emit
         }
         let Some(orig_final) = existing.final_filename.clone() else { return };
-        let stem = orig_final.rsplit_once('.').map(|(s, _)| s).unwrap_or(&orig_final);
-        let base = match self.ledger.dedupe_name(stem, ext) {
-            Ok(b) => b,
-            Err(_) => return,
+
+        // Identity for this *physical* copy: deterministic so replaying the
+        // same file is idempotent at Flow 2's SHA gate, and filesystem-safe
+        // (NTFS rejects ':' — the old `{sha}:{uuid}` id silently failed to
+        // write on Windows and minted a fresh key every run, double-indexing).
+        let rel = relpath(&self.cfg.processing_dir, path);
+        let dup_key = duplicate_key(sha, &rel);
+
+        // If this copy already produced a manifest, re-emit the identical one
+        // (same key, same name) instead of inventing a new " (n)".
+        let prior_name = match self.ledger.get(&dup_key) {
+            Ok(job) => job.and_then(|j| j.final_filename),
+            Err(e) => {
+                log::error!("duplicate ledger lookup failed: {e}");
+                return;
+            }
         };
+        let final_filename = match prior_name {
+            Some(n) => n,
+            None => {
+                let stem = orig_final.rsplit_once('.').map(|(s, _)| s).unwrap_or(&orig_final);
+                let base = match self.ledger.dedupe_name(stem, ext, &dup_key) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::error!("duplicate dedupe failed for {sha}: {e}");
+                        return;
+                    }
+                };
+                let fname = format!("{base}.{ext}");
+                // Persist the copy as a terminal row so later copies increment
+                // past it (otherwise every distinct copy resolves to " (2)"
+                // and collides in Flow 2's Archive copy).
+                if let Err(e) = self.record_duplicate(&dup_key, path, name, ext, &fname, &orig_final) {
+                    log::error!("duplicate ledger record failed for {sha}: {e}");
+                    return;
+                }
+                fname
+            }
+        };
+
         self.pacer.permit().await;
         let m = Manifest {
             schema: MANIFEST_SCHEMA_VERSION,
-            sha256: format!("{sha}:{}", uuid::Uuid::new_v4()), // unique manifest id for the dup instance
+            sha256: dup_key.clone(),
             status: "ok".into(),
             original_name: name.into(),
-            original_relpath: relpath(&self.cfg.processing_dir, path),
-            new_filename: Some(format!("{base}.{ext}")),
+            original_relpath: rel,
+            new_filename: Some(final_filename),
             description: existing.description.clone(),
             date: existing.proposed_date.clone(),
             date_source: existing.date_source.clone(),
@@ -451,7 +486,43 @@ impl Pipeline {
             model_versions: self.model_versions.clone(),
             processed_at: chrono::Utc::now().to_rfc3339(),
         };
-        let _ = write_manifest(&self.cfg.manifests_dir(), &m);
+        match write_manifest(&self.cfg.manifests_dir(), &m) {
+            Ok(_) => {
+                let _ = self.ledger.log_event(sha, "emit", "duplicate manifest written");
+            }
+            Err(e) => {
+                log::error!("duplicate manifest write failed for {dup_key}: {e}");
+                let _ = self
+                    .ledger
+                    .log_event(sha, "emit", &format!("duplicate manifest write FAILED: {e}"));
+            }
+        }
+    }
+
+    /// Durable, terminal ledger row for a physical duplicate copy so
+    /// `dedupe_name` sees its filename and later copies resolve to the next
+    /// " (n)". Keyed by the copy's deterministic duplicate id, not the shared
+    /// content hash.
+    fn record_duplicate(
+        &self,
+        dup_key: &str,
+        path: &Path,
+        name: &str,
+        ext: &str,
+        final_filename: &str,
+        orig_final: &str,
+    ) -> anyhow::Result<()> {
+        self.ledger.ingest(dup_key, &path.to_string_lossy(), name, ext)?;
+        self.ledger.update_fields(
+            dup_key,
+            &[
+                ("final_filename", Some(final_filename.to_string())),
+                ("duplicate_of", Some(orig_final.to_string())),
+                ("soft_flags", Some("DUPLICATE_CONTENT".into())),
+            ],
+        )?;
+        self.ledger.set_state(dup_key, JobState::Emitted)?;
+        Ok(())
     }
 
     async fn flag(&self, sha: &str, path: &Path, reason: String) {
@@ -517,7 +588,7 @@ impl Pipeline {
         let today = chrono::Utc::now().date_naive().format("%Y-%m-%d").to_string();
         let v = checker.check(&out, &h, &[date], &today, None)?;
 
-        let base = self.ledger.dedupe_name(&v.base_name, &job.ext)?;
+        let base = self.ledger.dedupe_name(&v.base_name, &job.ext, sha)?;
         let final_filename = format!("{base}.{}", job.ext);
         self.ledger.update_fields(
             sha,
@@ -581,4 +652,41 @@ fn relpath(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// Deterministic, filesystem-safe identity for a physical duplicate copy:
+/// the shared content hash plus a short digest of the copy's relative path.
+/// Same copy -> same key (idempotent replay); distinct copies -> distinct keys.
+fn duplicate_key(content_sha: &str, relpath: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(relpath.as_bytes());
+    let rp = hex::encode(h.finalize());
+    format!("{content_sha}-{}", &rp[..16])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_key_is_deterministic_and_fs_safe() {
+        let sha = "a".repeat(64);
+        let k1 = duplicate_key(&sha, "sub/dir/file.pdf");
+        let k2 = duplicate_key(&sha, "sub/dir/file.pdf");
+        assert_eq!(k1, k2, "same copy must yield the same key (idempotent)");
+        // No characters NTFS rejects in a filename.
+        assert!(!k1.contains([':', '\\', '/', '*', '?', '"', '<', '>', '|']));
+        assert!(k1.starts_with(&sha));
+    }
+
+    #[test]
+    fn duplicate_key_differs_per_copy() {
+        let sha = "b".repeat(64);
+        assert_ne!(
+            duplicate_key(&sha, "a/one.pdf"),
+            duplicate_key(&sha, "a/two.pdf"),
+            "distinct copies must get distinct keys so each gets its own row"
+        );
+    }
 }
