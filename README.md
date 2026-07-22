@@ -82,7 +82,15 @@ npm run tauri build    # production installer
 - GGUF paths for the two SLM tiers (defaults point into `models/`)
 - Ettin model dir: blank until slice 4 (see below)
 
+Cache retention: converted markdown is written to `<cache>` for the review
+pane, then purged the moment a file is emitted — raw document text is not kept
+on disk. Flagged files keep their cache until you resolve them. To retain the
+corpus for Ettin training, set `"retain_cache": true` in `backlog.config.json`;
+`cache_ttl_days` (default 7) sweeps orphaned entries on startup.
+
 Hit Start. The watcher sweeps existing files, then processes on arrival.
+BackLog runs as a system-tray appliance: closing the window hides it and the
+pipeline keeps running in the background — quit from the tray menu.
 
 ### 5. Power Automate
 
@@ -127,10 +135,11 @@ and drop the files into Processing directly.
 
 ```
 src/                    frontend (vanilla TS, Vite)
-src-tauri/src/          Rust core
-  pipeline.rs             orchestrator + retry ladder
+src-tauri/core/         backlog-core: deterministic trust core (no Tauri, no I/O)
   checker.rs              deterministic validation (the trust core)
   harvest.rs              regex evidence harvest
+src-tauri/src/          Rust app crate (Tauri shell + orchestration)
+  pipeline.rs             orchestrator + retry ladder
   filter.rs               evidence bundle assembly
   slm.rs                  llama-server lifecycle + grammar decoding
   sidecar.rs              convertd protocol client
@@ -145,7 +154,22 @@ power-automate/         Flow 1 and Flow 2 build sheets
 
 ## Tests
 
-`cargo test` covers the harvest regexes and every checker rule (valid dates,
+The deterministic trust core (`harvest` + `checker`) lives in its own
+`backlog-core` crate with no Tauri or sidecar dependency, so it tests on a bare
+checkout — no sidecar binaries, no icon, no app build:
+
+```
+cd src-tauri
+cargo test -p backlog-core     # trust core only, ~10s
+```
+
+That covers the harvest regexes and every checker rule (valid dates,
 hallucinated dates, range limits, metadata fallback, illegal characters,
-generic subjects, SSN patterns, sentence-shape rules, span-mismatch soft
+generic subjects, SSN/card patterns, sentence-shape rules, span-mismatch soft
 flags). Run it before touching either file; those two modules are the product.
+Because it builds without the sidecars, you can run it locally in seconds
+(useful when GitHub Actions minutes aren't available).
+
+`cargo test` over the whole workspace additionally builds the Tauri app crate,
+which needs the sidecar binaries and `icons/icon.ico` present (see Setup) — a
+release-time step, not required for iterating on the trust core.
