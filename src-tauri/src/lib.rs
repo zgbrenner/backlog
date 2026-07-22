@@ -12,6 +12,7 @@ mod review;
 mod routing;
 mod sidecar;
 mod slm;
+mod stats;
 mod watcher;
 
 #[cfg(test)]
@@ -145,7 +146,7 @@ fn list_flagged(
 
 #[tauri::command]
 fn get_stats(state: tauri::State<AppState>) -> Result<serde_json::Value, String> {
-    state.ledger.stats().map_err(|error| error.to_string())
+    stats::snapshot(&state.db_path).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
