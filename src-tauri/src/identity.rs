@@ -5,10 +5,12 @@
 //! without overloading the content hash or introducing replay-unsafe randomness.
 
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const DELIVERY_DIR_PREFIX: &str = "__bl_";
+pub const INCOMING_FILE_PREFIX: &str = "__incoming_";
 const DELIVERY_ID_HEX_LEN: usize = 32;
 const DELIVERY_MOVE_ATTEMPTS: usize = 5;
 
@@ -56,15 +58,17 @@ pub fn is_safe_identifier(value: &str) -> bool {
 pub fn has_delivery_identity(path: &Path) -> bool {
     path.ancestors()
         .skip(1)
-        .filter_map(Path::file_name)
+        .filter_map(|ancestor| ancestor.file_name())
         .filter_map(|name| name.to_str())
         .any(is_delivery_dir_name)
 }
 
-/// Move an unwrapped arrival into a unique sibling delivery directory while
-/// preserving its human filename. The move happens before hashing and ledger
-/// registration. A crash after the move is safe because the delivery directory
-/// persists and the startup sweep discovers it again.
+/// Move an arrival into a durable sibling delivery directory while preserving
+/// its human filename. Power Automate arrivals carry a stable source token in
+/// the temporary filename. Manual drops receive a random delivery token once.
+/// The move happens before hashing and ledger registration. A crash after the
+/// move is safe because the delivery directory persists and the startup sweep
+/// discovers it again.
 pub fn ensure_delivery_path(path: &Path) -> anyhow::Result<PathBuf> {
     if has_delivery_identity(path) {
         return Ok(path.to_path_buf());
@@ -76,24 +80,21 @@ pub fn ensure_delivery_path(path: &Path) -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("delivery source has no parent: {}", path.display()))?;
     let file_name = path
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("delivery source has no filename: {}", path.display()))?;
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("delivery source has no UTF-8 filename: {}", path.display()))?;
 
-    let mut last_error: Option<std::io::Error> = None;
+    if let Some((source_token, original_name)) = parse_incoming_file_name(file_name) {
+        let delivery_id = delivery_id_from_source_token(&source_token);
+        return move_to_delivery(path, parent, &delivery_id, &original_name, true);
+    }
+
+    let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..DELIVERY_MOVE_ATTEMPTS {
         let delivery_id = uuid::Uuid::new_v4().simple().to_string();
-        let delivery_dir = parent.join(format!("{DELIVERY_DIR_PREFIX}{delivery_id}"));
-        match std::fs::create_dir(&delivery_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-
-        let destination = delivery_dir.join(file_name);
-        match std::fs::rename(path, &destination) {
-            Ok(()) => return Ok(destination),
+        match move_to_delivery(path, parent, &delivery_id, file_name, false) {
+            Ok(destination) => return Ok(destination),
             Err(error) => {
                 last_error = Some(error);
-                let _ = std::fs::remove_dir(&delivery_dir);
                 if !path.exists() {
                     anyhow::bail!(
                         "delivery source disappeared while assigning identity: {}",
@@ -107,9 +108,107 @@ pub fn ensure_delivery_path(path: &Path) -> anyhow::Result<PathBuf> {
         }
     }
 
-    Err(last_error
-        .map(anyhow::Error::from)
-        .unwrap_or_else(|| anyhow::anyhow!("could not assign a delivery identity")))
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("could not assign a delivery identity")))
+}
+
+fn move_to_delivery(
+    source: &Path,
+    parent: &Path,
+    delivery_id: &str,
+    original_name: &str,
+    allow_idempotent_existing: bool,
+) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        is_delivery_dir_name(&format!("{DELIVERY_DIR_PREFIX}{delivery_id}")),
+        "invalid delivery identifier"
+    );
+    anyhow::ensure!(
+        !original_name.is_empty()
+            && !original_name.contains('/')
+            && !original_name.contains('\\')
+            && original_name != "."
+            && original_name != "..",
+        "invalid original filename in delivery envelope"
+    );
+
+    let delivery_dir = parent.join(format!("{DELIVERY_DIR_PREFIX}{delivery_id}"));
+    match std::fs::create_dir(&delivery_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::ensure!(delivery_dir.is_dir(), "delivery path is not a directory");
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let destination = delivery_dir.join(original_name);
+    if destination.exists() {
+        if allow_idempotent_existing && same_file_content(source, &destination)? {
+            std::fs::remove_file(source)?;
+            return Ok(destination);
+        }
+        anyhow::bail!(
+            "delivery {} already contains different content for {}",
+            delivery_id,
+            original_name
+        );
+    }
+
+    match std::fs::rename(source, &destination) {
+        Ok(()) => Ok(destination),
+        Err(error) => {
+            if delivery_dir.read_dir().is_ok_and(|mut entries| entries.next().is_none()) {
+                let _ = std::fs::remove_dir(&delivery_dir);
+            }
+            Err(error.into())
+        }
+    }
+}
+
+fn parse_incoming_file_name(name: &str) -> Option<(String, String)> {
+    let rest = name.strip_prefix(INCOMING_FILE_PREFIX)?;
+    let separator = rest.find("__")?;
+    let token = &rest[..separator];
+    let original_name = &rest[separator + 2..];
+    if token.is_empty()
+        || token.len() > 160
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        || original_name.is_empty()
+        || original_name.contains('/')
+        || original_name.contains('\\')
+    {
+        return None;
+    }
+    Some((token.to_string(), original_name.to_string()))
+}
+
+fn delivery_id_from_source_token(token: &str) -> String {
+    let digest = hex::encode(Sha256::digest(token.as_bytes()));
+    digest[..DELIVERY_ID_HEX_LEN].to_string()
+}
+
+fn same_file_content(left: &Path, right: &Path) -> anyhow::Result<bool> {
+    let left_metadata = std::fs::metadata(left)?;
+    let right_metadata = std::fs::metadata(right)?;
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
+    }
+    Ok(file_digest(left)? == file_digest(right)?)
+}
+
+fn file_digest(path: &Path) -> anyhow::Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn is_delivery_dir_name(name: &str) -> bool {
@@ -189,6 +288,50 @@ mod tests {
         let first_id = instance_id(SHA, &normalize_relpath(&first.to_string_lossy()));
         let second_id = instance_id(SHA, &normalize_relpath(&second.to_string_lossy()));
         assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn power_automate_envelope_is_stable_and_restores_original_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let incoming = directory
+            .path()
+            .join("__incoming_flow123-42__Agreement.pdf");
+        std::fs::write(&incoming, b"fixture").unwrap();
+
+        let delivery = ensure_delivery_path(&incoming).unwrap();
+
+        assert_eq!(delivery.file_name().unwrap(), "Agreement.pdf");
+        assert!(has_delivery_identity(&delivery));
+    }
+
+    #[test]
+    fn retried_power_automate_delivery_is_an_idempotent_no_op() {
+        let directory = tempfile::tempdir().unwrap();
+        let incoming = directory
+            .path()
+            .join("__incoming_flow123-42__Agreement.pdf");
+        std::fs::write(&incoming, b"same bytes").unwrap();
+        let first = ensure_delivery_path(&incoming).unwrap();
+
+        std::fs::write(&incoming, b"same bytes").unwrap();
+        let replay = ensure_delivery_path(&incoming).unwrap();
+
+        assert_eq!(first, replay);
+        assert!(!incoming.exists());
+    }
+
+    #[test]
+    fn conflicting_power_automate_replay_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let incoming = directory
+            .path()
+            .join("__incoming_flow123-42__Agreement.pdf");
+        std::fs::write(&incoming, b"first bytes").unwrap();
+        ensure_delivery_path(&incoming).unwrap();
+
+        std::fs::write(&incoming, b"different bytes").unwrap();
+        assert!(ensure_delivery_path(&incoming).is_err());
+        assert!(incoming.exists());
     }
 
     #[test]
