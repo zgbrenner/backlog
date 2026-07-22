@@ -25,6 +25,7 @@ use slm::SlmLane;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tauri::Manager;
 
 struct AppState {
     cfg_path: PathBuf,
