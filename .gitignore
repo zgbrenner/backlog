@@ -30,6 +30,9 @@ models/**/*.onnx
 training/data/
 training/ettin-backlog-*/
 
+# Tooling / agent scratch
+.omc/
+
 # Logs / OS / editor
 *.log
 .DS_Store
