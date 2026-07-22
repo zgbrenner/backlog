@@ -2,8 +2,9 @@
 """Static smoke test for the Tauri command and critical DOM contracts.
 
 This intentionally avoids a browser dependency. It catches drift between the
-frontend command names and Rust's invoke handler, plus the accessibility and
-state-management regressions that previously made the UI misleading.
+frontend command names and Rust's invoke handler, plus the accessibility,
+instance-review, and state-management regressions that previously made the UI
+misleading.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN = (ROOT / "src" / "main.ts").read_text(encoding="utf-8")
 LIB = (ROOT / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
 PREFLIGHT = (ROOT / "src-tauri" / "src" / "preflight.rs").read_text(encoding="utf-8")
+REVIEW = (ROOT / "src-tauri" / "src" / "review.rs").read_text(encoding="utf-8")
 STYLES = (ROOT / "src" / "styles.css").read_text(encoding="utf-8")
 
 
@@ -117,12 +119,20 @@ def main() -> int:
         require(MAIN, field, f"frontend readiness field {field}")
         require(PREFLIGHT, field, f"backend readiness field {field}")
 
+    require(MAIN, "type ReviewItem = {", "physical review item type")
+    require(MAIN, "instanceId: item.instance_id", "instance-aware resubmit argument")
+    require(MAIN, "item.instance_id.slice(0, 12)", "visible review InstanceId")
+    require(LIB, "review::list_review_items", "instance-aware review query")
+    require(LIB, "resubmit_instance(&instance_id", "instance-aware correction command")
+    require(REVIEW, "WHERE fi.state = 'flagged'", "flagged instance SQL filter")
+    require(REVIEW, "manifest_id: instance.instance_id.clone()", "stable corrected ManifestId")
+
     for control in ("date", "subject", "description"):
         require(MAIN, f'for="${{id}}-{control}"', f"review label for {control}")
         require(MAIN, f'id="${{id}}-{control}"', f"review input id for {control}")
     require(MAIN, 'role="alert" aria-live="polite"', "accessible inline error region")
-    require(MAIN, 'submitButton.disabled = true;', "pending review lock")
-    require(MAIN, 'submitButton.disabled = false;', "review retry recovery")
+    require(MAIN, "submitButton.disabled = true;", "pending review lock")
+    require(MAIN, "submitButton.disabled = false;", "review retry recovery")
     require(MAIN, 'card.removeAttribute("aria-busy")', "review busy-state cleanup")
     if "window.alert(" in MAIN or "alert(" in MAIN:
         fail("blocking alert dialog reintroduced")
@@ -137,8 +147,8 @@ def main() -> int:
         require(STYLES, selector, f"critical UI style {selector}")
 
     print(
-        f"Frontend smoke passed: {len(invokes)} commands are wired, "
-        "runtime state is backend-owned, and critical review controls are accessible."
+        f"Frontend smoke passed: {len(invokes)} commands are wired, runtime state "
+        "is backend-owned, and flagged physical instances remain distinct."
     )
     return 0
 
