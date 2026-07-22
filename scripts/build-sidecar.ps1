@@ -20,7 +20,7 @@ if ($Clean -and (Test-Path $VenvDir)) {
     Remove-Item -Recurse -Force $VenvDir
 }
 
-$PythonVersion = & $Python -c "import struct,sys; print(f'{sys.version_info.major}.{sys.version_info.minor}:{struct.calcsize(''P'') * 8}')"
+$PythonVersion = & $Python -c "import struct,sys; print(str(sys.version_info.major)+'.'+str(sys.version_info.minor)+':'+str(struct.calcsize('P')*8))"
 if ($LASTEXITCODE -ne 0 -or $PythonVersion.Trim() -ne "3.11:64") {
     throw "BackLog's Windows sidecar build requires 64-bit Python 3.11. Found: $PythonVersion"
 }
