@@ -1,0 +1,15 @@
+{
+  "schema": 2,
+  "manifest_id": "3333333333333333333333333333333333333333333333333333333333333333",
+  "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "status": "flagged",
+  "original_name": "Scanned Packet.pdf",
+  "original_relpath": "Scans/Scanned Packet.pdf",
+  "soft_flags": ["POSSIBLE_MULTIDOC"],
+  "flag_reason": "UNREADABLE: OCR confidence remained below the acceptance floor",
+  "model_versions": {
+    "convertd": "0.1.0",
+    "ocr": "rapidocr-onnxruntime"
+  },
+  "processed_at": "2026-07-21T19:32:00Z"
+}

@@ -1,0 +1,71 @@
+{
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "integer"
+    },
+    "manifest_id": {
+      "type": "string"
+    },
+    "sha256": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "flagged"]
+    },
+    "original_name": {
+      "type": "string"
+    },
+    "original_relpath": {
+      "type": "string"
+    },
+    "new_filename": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "date": {
+      "type": "string"
+    },
+    "date_source": {
+      "type": "string",
+      "enum": ["document", "metadata", "human"]
+    },
+    "doc_type": {
+      "type": "string"
+    },
+    "language": {
+      "type": "string"
+    },
+    "duplicate_of": {
+      "type": "string"
+    },
+    "soft_flags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "flag_reason": {
+      "type": "string"
+    },
+    "model_versions": {
+      "type": "object"
+    },
+    "processed_at": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "manifest_id",
+    "sha256",
+    "status",
+    "original_name",
+    "original_relpath",
+    "model_versions",
+    "processed_at"
+  ]
+}

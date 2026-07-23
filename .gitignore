@@ -32,6 +32,7 @@ training/ettin-backlog-*/
 
 # Tooling / agent scratch
 .omc/
+.crux/
 
 # Logs / OS / editor
 *.log
