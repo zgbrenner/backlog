@@ -170,6 +170,9 @@ flags). Run it before touching either file; those two modules are the product.
 Because it builds without the sidecars, you can run it locally in seconds
 (useful when GitHub Actions minutes aren't available).
 
-`cargo test --workspace` additionally builds the Tauri app crate, which needs
-the sidecar binaries and `icons/icon.ico` present (see Setup) — a release-time
-step, not required for iterating on the trust core.
+`cargo test --workspace` additionally builds the Tauri app crate, whose build
+script needs the sidecar binaries present (externalBin + the bundled llama
+DLLs). On a fresh checkout that hasn't built them yet, run `scripts/dev-stubs.ps1`
+(or `scripts/dev-stubs.sh`) once to stage empty placeholders — a local
+convenience, not required for iterating on the trust core, and superseded by the
+real binaries at release time.
