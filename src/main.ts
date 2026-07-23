@@ -40,10 +40,75 @@ type Config = {
   cache_ttl_days: number;
 };
 
+type RuntimeProblem = {
+  field: string;
+  code: string;
+  message: string;
+  severity: "error" | "warning";
+};
+
+// Mirrors src-tauri/src/preflight.rs::RuntimeStatus.
+type RuntimeStatus = {
+  configured: boolean;
+  checked: boolean;
+  running: boolean;
+  paused: boolean;
+  processing_dir_ready: boolean;
+  outbox_writable: boolean;
+  quarantine_writable: boolean;
+  cache_writable: boolean;
+  sidecar_found: boolean;
+  sidecar_ok: boolean;
+  llama_server_found: boolean;
+  grammar_found: boolean;
+  primary_model_found: boolean;
+  escalation_model_found: boolean;
+  offline_runtime: boolean;
+  checked_at: string | null;
+  problems: RuntimeProblem[];
+};
+
+// Boolean pass/fail checks surfaced in the Readiness panel, in display order.
+const READINESS_CHECKS: Array<[label: string, key: keyof RuntimeStatus]> = [
+  ["Processing folder is readable", "processing_dir_ready"],
+  ["Outbox folder is writable", "outbox_writable"],
+  ["Quarantine folder is writable", "quarantine_writable"],
+  ["Cache folder is writable", "cache_writable"],
+  ["Conversion sidecar (convertd) is installed", "sidecar_found"],
+  ["Conversion sidecar answers ping", "sidecar_ok"],
+  ["llama-server is installed", "llama_server_found"],
+  ["Naming grammar is installed", "grammar_found"],
+  ["Primary SLM model file is present", "primary_model_found"],
+  ["Escalation SLM model file is present", "escalation_model_found"],
+];
+
+function uncheckedRuntime(): RuntimeStatus {
+  return {
+    configured: false,
+    checked: false,
+    running: false,
+    paused: false,
+    processing_dir_ready: false,
+    outbox_writable: false,
+    quarantine_writable: false,
+    cache_writable: false,
+    sidecar_found: false,
+    sidecar_ok: false,
+    llama_server_found: false,
+    grammar_found: false,
+    primary_model_found: false,
+    escalation_model_found: false,
+    offline_runtime: true,
+    checked_at: null,
+    problems: [],
+  };
+}
+
 const app = document.getElementById("app")!;
 let cfg: Config | null = null;
 let running = false;
 let paused = false;
+let runtime: RuntimeStatus = uncheckedRuntime();
 let view: "queue" | "flagged" | "settings" = "queue";
 
 const STATE_BADGE: Record<string, string> = {
@@ -71,6 +136,19 @@ function showError(msg: string): void {
   setTimeout(() => toast.remove(), 6000);
 }
 
+// Refreshes the in-memory runtime status from the backend. `live` runs the
+// full machine check (folders, binaries, models, a bounded sidecar ping);
+// otherwise this just re-reads whatever was last cached there. On failure
+// the previous in-memory status is kept rather than reset, so a transient
+// IPC hiccup can't make a Ready panel flash back to unchecked.
+async function refreshRuntime(live: boolean): Promise<void> {
+  try {
+    runtime = await invoke<RuntimeStatus>(live ? "run_preflight" : "get_runtime_status");
+  } catch (e) {
+    showError(String(e));
+  }
+}
+
 async function render() {
   const stats = await invoke<Record<string, number>>("get_stats").catch(
     (): Record<string, number> => ({})
@@ -88,8 +166,10 @@ async function render() {
           <button data-v="settings" class="${view === "settings" ? "on" : ""}">Settings</button>
         </nav>
         <div class="run">
+          <span class="readiness-chip ${runtime.configured ? "ready" : "blocked"}">${runtime.configured ? "Ready" : runtime.checked ? "Blocked" : "Unchecked"}</span>
           <span class="stats">${total} files · ${stats["emitted"] ?? 0} done · ${stats["flagged"] ?? 0} flagged</span>
-          <button id="runbtn" class="${running ? (paused ? "paused" : "live") : "start"}">
+          <button id="runbtn" class="${running ? (paused ? "paused" : "live") : "start"}"
+            ${!running && !runtime.configured ? 'disabled title="Run preflight in Settings before starting."' : ""}>
             ${running ? (paused ? "Resume" : "Pause") : "Start"}
           </button>
         </div>
@@ -118,6 +198,9 @@ async function onRunButton() {
       showError(String(e));
       view = "settings";
     }
+    // start_pipeline runs and caches its own preflight check even on
+    // failure, so pick up whatever it found for the Readiness panel.
+    await refreshRuntime(false);
   } else {
     // Only flip local state once the backend confirms, so the button never
     // desyncs from the pipeline on failure.
@@ -219,9 +302,59 @@ async function renderFlagged(root: HTMLElement) {
   }
 }
 
+function renderReadinessPanel(): HTMLElement {
+  const rows = READINESS_CHECKS.map(([label, key]) => {
+    const passed = Boolean(runtime[key]);
+    return `
+      <li class="check-row ${passed ? "check-pass" : "check-fail"}">
+        <span>${esc(label)}</span>
+        <strong>${passed ? "Ready" : "Blocked"}</strong>
+      </li>`;
+  }).join("");
+
+  const problemsHtml = runtime.problems.length
+    ? `<div class="problem-box">
+        <strong>Action needed</strong>
+        <ul>${runtime.problems
+          .map((p) => `<li><code>${esc(p.field)}</code><span>${esc(p.message)}</span></li>`)
+          .join("")}</ul>
+      </div>`
+    : runtime.checked
+      ? `<div class="ready-box">All checks passed. BackLog is ready to start.</div>`
+      : "";
+
+  const lastChecked = runtime.checked_at
+    ? `Last checked ${esc(new Date(runtime.checked_at).toLocaleString())}`
+    : "Not checked yet. Run preflight before starting BackLog.";
+
+  const panel = el(`
+    <section class="preflight-panel">
+      <div class="section-head">
+        <div>
+          <h2>Readiness</h2>
+          <p class="dim-note">${lastChecked}</p>
+        </div>
+        <button type="button" id="preflight-button" class="ghost">Run preflight</button>
+      </div>
+      <ul class="check-list">${rows}</ul>
+      ${problemsHtml}
+    </section>`);
+
+  panel.querySelector("#preflight-button")!.addEventListener("click", async (ev) => {
+    const button = ev.currentTarget as HTMLButtonElement;
+    button.disabled = true;
+    button.textContent = "Checking…";
+    await refreshRuntime(true);
+    render();
+  });
+
+  return panel;
+}
+
 function renderSettings(root: HTMLElement) {
   if (!cfg) return;
   const c = cfg;
+  root.appendChild(renderReadinessPanel());
   const folder = (label: string, key: keyof Config) => `
     <label class="wide">${label}
       <div class="pick"><input name="${key}" value="${esc(String(c[key] ?? ""))}">
@@ -294,8 +427,15 @@ function renderSettings(root: HTMLElement) {
     try {
       await invoke("set_config", { cfg: next });
       cfg = next;
-      err.textContent = "Saved.";
-      setTimeout(() => (err.textContent = ""), 1500);
+      // The backend drops its cached preflight result on every settings
+      // save (paths may have just changed underneath it); pick up that
+      // fail-closed "unchecked" state and swap the panel in without a full
+      // re-render, so the "Saved." message stays visible.
+      await refreshRuntime(false);
+      const oldPanel = root.querySelector(".preflight-panel");
+      if (oldPanel) oldPanel.replaceWith(renderReadinessPanel());
+      err.textContent = "Saved. Run preflight to verify this machine before starting.";
+      setTimeout(() => (err.textContent = ""), 4000);
     } catch (e) {
       err.textContent = String(e);
     }
@@ -326,6 +466,10 @@ listen("job-updated", () => {
     app.appendChild(fatal);
     return;
   }
-  if (!cfg.processing_dir) view = "settings";
+  // Cheap, cached read (never spawns the sidecar or touches disk) so
+  // startup stays fast; the fail-closed backend default keeps Start
+  // disabled until an explicit "Run preflight" passes.
+  await refreshRuntime(false);
+  if (!cfg.processing_dir || !runtime.configured) view = "settings";
   render();
 })();

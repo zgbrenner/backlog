@@ -4,6 +4,7 @@ mod identity;
 mod ledger;
 mod manifest;
 mod pipeline;
+mod preflight;
 mod routing;
 mod sidecar;
 mod slm;
@@ -17,6 +18,7 @@ pub use backlog_core::{checker, harvest};
 use config::Config;
 use ledger::Ledger;
 use pipeline::Pipeline;
+use preflight::RuntimeStatus;
 use sidecar::Sidecar;
 use slm::SlmLane;
 use std::path::PathBuf;
@@ -30,9 +32,21 @@ struct AppState {
     cfg: Mutex<Config>,
     ledger: Arc<Ledger>,
     pipeline: Mutex<Option<Arc<Pipeline>>>,
+    last_preflight: Mutex<Option<RuntimeStatus>>,
 }
 
-fn resource(app: &tauri::AppHandle, rel: &str) -> PathBuf {
+/// Current pipeline running/paused state, read fresh from `AppState` on every
+/// call so cached preflight results can be overlaid with it without going
+/// stale between an explicit `run_preflight` and a later `set_paused`.
+fn runtime_flags(state: &AppState) -> (bool, bool) {
+    let pipeline = state.pipeline.lock().unwrap();
+    match pipeline.as_ref() {
+        Some(pipeline) => (true, pipeline.paused.load(std::sync::atomic::Ordering::Relaxed)),
+        None => (false, false),
+    }
+}
+
+pub(crate) fn resource(app: &tauri::AppHandle, rel: &str) -> PathBuf {
     app.path()
         .resolve(format!("resources/{rel}"), tauri::path::BaseDirectory::Resource)
         .unwrap_or_else(|_| PathBuf::from(format!("resources/{rel}")))
@@ -46,7 +60,7 @@ fn reveal_main(app: &tauri::AppHandle) {
     }
 }
 
-fn binary(app: &tauri::AppHandle, name: &str) -> PathBuf {
+pub(crate) fn binary(app: &tauri::AppHandle, name: &str) -> PathBuf {
     // Tauri externalBin sidecars sit next to the app binary with a target
     // triple suffix in dev; resolve both layouts.
     let exe_dir = std::env::current_exe()
@@ -75,7 +89,32 @@ fn get_config(state: tauri::State<AppState>) -> Config {
 fn set_config(state: tauri::State<AppState>, cfg: Config) -> Result<(), String> {
     cfg.save(&state.cfg_path).map_err(|e| e.to_string())?;
     *state.cfg.lock().unwrap() = cfg;
+    // Settings changed underneath it; the last preflight result no longer
+    // describes the current configuration, so drop it back to fail-closed
+    // "unchecked" rather than let a stale pass linger in the UI.
+    *state.last_preflight.lock().unwrap() = None;
     Ok(())
+}
+
+#[tauri::command]
+fn get_runtime_status(state: tauri::State<AppState>) -> RuntimeStatus {
+    let (running, paused) = runtime_flags(&state);
+    state
+        .last_preflight
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| RuntimeStatus::unchecked(running, paused))
+        .with_runtime(running, paused)
+}
+
+#[tauri::command]
+async fn run_preflight(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<RuntimeStatus, String> {
+    let cfg = state.cfg.lock().unwrap().clone();
+    let (running, paused) = runtime_flags(&state);
+    let status = preflight::run(&app, &cfg, running, paused).await;
+    *state.last_preflight.lock().unwrap() = Some(status.clone());
+    Ok(status)
 }
 
 #[tauri::command]
@@ -139,16 +178,28 @@ fn set_paused(state: tauri::State<AppState>, paused: bool) -> Result<(), String>
 }
 
 #[tauri::command]
-fn start_pipeline(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+async fn start_pipeline(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let cfg = state.cfg.lock().unwrap().clone();
     cfg.validate()?;
+
+    if state.pipeline.lock().unwrap().is_some() {
+        return Ok(()); // already running
+    }
+
+    // Fail-closed gate: a machine that merely has a coherent config can
+    // still be missing binaries, models, or writable folders. Run the live
+    // check (and cache it for the Readiness panel) before ever spawning the
+    // sidecars.
+    let (running, paused) = runtime_flags(&state);
+    let status = preflight::run(&app, &cfg, running, paused).await;
+    *state.last_preflight.lock().unwrap() = Some(status.clone());
+    if !status.configured {
+        return Err(status.summary());
+    }
+
     // Sweep orphaned cached document text past its TTL before starting.
     if !cfg.retain_cache {
         pipeline::sweep_cache(&cfg.cache_dir, cfg.cache_ttl_days);
-    }
-    let mut slot = state.pipeline.lock().unwrap();
-    if slot.is_some() {
-        return Ok(()); // already running
     }
 
     let grammar = std::fs::read_to_string(resource(&app, "name.gbnf"))
@@ -166,8 +217,19 @@ fn start_pipeline(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
         cfg.slm_parallel,
     ));
     let pipeline = Pipeline::new(cfg.clone(), state.ledger.clone(), sidecar, slm, app);
+
+    let mut slot = state.pipeline.lock().unwrap();
+    if slot.is_some() {
+        return Ok(()); // a concurrent start_pipeline call won the race
+    }
     watcher::spawn(pipeline.clone(), cfg.processing_dir.clone()).map_err(|e| e.to_string())?;
     *slot = Some(pipeline);
+    drop(slot);
+
+    if let Some(cached) = state.last_preflight.lock().unwrap().as_mut() {
+        cached.running = true;
+        cached.paused = false;
+    }
     Ok(())
 }
 
@@ -194,6 +256,7 @@ pub fn run() {
                 cfg: Mutex::new(cfg),
                 ledger,
                 pipeline: Mutex::new(None),
+                last_preflight: Mutex::new(None),
             });
 
             // System-tray appliance: closing the window hides it so the
@@ -241,6 +304,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             set_config,
+            get_runtime_status,
+            run_preflight,
             list_jobs,
             list_flagged,
             get_stats,

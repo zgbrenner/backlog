@@ -46,6 +46,15 @@ nav button:hover { color: var(--text); }
 #runbtn.start { background: var(--accent); }
 #runbtn.live { background: var(--warn); }
 #runbtn.paused { background: var(--ok); }
+#runbtn:disabled { cursor: not-allowed; opacity: 0.5; }
+
+.readiness-chip {
+  display: inline-flex; align-items: center; white-space: nowrap;
+  padding: 3px 9px; border-radius: 999px; border: 1px solid currentColor;
+  font-size: 11px; font-weight: 700;
+}
+.readiness-chip.ready { color: var(--ok); background: rgba(62, 207, 142, 0.1); }
+.readiness-chip.blocked { color: var(--bad); background: rgba(255, 107, 107, 0.1); }
 
 main { flex: 1; overflow-y: auto; padding: 18px; }
 
@@ -128,3 +137,32 @@ button.ghost:hover { color: var(--text); }
 .pick input { flex: 1; }
 .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .settings label { margin-bottom: 8px; }
+
+.preflight-panel {
+  max-width: 760px; margin-bottom: 18px;
+  background: var(--panel); border: 1px solid var(--panel2);
+  border-radius: 10px; padding: 16px;
+}
+.section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.section-head h2 { margin: 0 0 4px; font-size: 15px; }
+.dim-note { margin: 0; color: var(--dim); font-size: 11.5px; }
+
+.check-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--panel2); border-radius: 8px; overflow: hidden; }
+.check-row {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 8px 10px; border-bottom: 1px solid var(--panel2); font-size: 12.5px;
+}
+.check-row:last-child { border-bottom: none; }
+.check-row strong { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.4px; }
+.check-pass strong { color: var(--ok); }
+.check-fail strong { color: var(--bad); }
+
+.problem-box, .ready-box { margin-top: 12px; border-radius: 8px; padding: 11px; font-size: 12.5px; line-height: 1.5; }
+.problem-box { background: rgba(255, 107, 107, 0.08); border: 1px solid rgba(255, 107, 107, 0.25); }
+.problem-box > strong { color: var(--bad); }
+.problem-box ul { list-style: none; margin: 8px 0 0; padding: 0; }
+.problem-box li { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
+.problem-box li:first-child { margin-top: 0; }
+.problem-box li code { color: var(--text); font-family: var(--mono); font-size: 11px; }
+.problem-box li span { color: #ffcaca; }
+.ready-box { color: #c9f8e2; background: rgba(62, 207, 142, 0.08); border: 1px solid rgba(62, 207, 142, 0.24); }

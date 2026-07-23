@@ -249,11 +249,9 @@ impl Sidecar {
         self.call("versions", serde_json::json!({}))
     }
 
-    /// Cheap liveness probe. Not called from this phase's pipeline yet; kept
-    /// as a documented, unit-tested building block for a later preflight
-    /// check that verifies the sidecar executable launches and answers
-    /// before a batch starts.
-    #[allow(dead_code)]
+    /// Cheap liveness probe used by `preflight::run` (via `spawn_blocking`)
+    /// to verify the sidecar executable launches and answers before a batch
+    /// starts.
     pub fn ping(&self) -> anyhow::Result<()> {
         self.call("ping", serde_json::json!({})).map(|_| ())
     }
