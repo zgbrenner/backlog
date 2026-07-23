@@ -3,9 +3,15 @@
 **Updated:** 2026-07-22
 
 This branch consolidates the original prototype, the reliability implementation,
-and the independent reproducibility contribution. The original completion plan
-remains in `docs/superpowers/plans/2026-07-21-finish-backlog.md`; current
-architecture changes are recorded in `docs/ARCHITECTURE_AMENDMENTS.md`.
+and the independent reproducibility contribution.
+
+> **Status (this branch).** Built on the CI-free `backlog-core` foundation. Some
+> items below reflect the licensing-clean target stack (Qwen3 / Lingua) and the
+> preflight/review features, which are **not yet ported to this branch** — the
+> current pilot build uses LFM2.5 + fastText + rapidocr-onnxruntime and has no
+> preflight/review UI yet. Those are tracked follow-ups. (Historical planning
+> docs from the prior effort, including `ARCHITECTURE_AMENDMENTS.md`, were not
+> carried over here.)
 
 ## Implemented in source
 

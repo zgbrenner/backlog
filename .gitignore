@@ -16,6 +16,7 @@ src-tauri/binaries/
 __pycache__/
 *.py[cod]
 .venv/
+.venv-build/
 venv/
 env/
 *.egg-info/
