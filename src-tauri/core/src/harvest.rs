@@ -128,11 +128,25 @@ pub fn extract_dates(text: &str) -> Vec<FoundDate> {
 
 /// Full 5a harvest over converted markdown.
 /// `head_chars`/`tail_chars` bound the excerpt sizes.
+/// Largest char-boundary offset `<= i`, so `&s[..floor]` / `&s[floor..]` can't
+/// split a multi-byte codepoint. Slicing at raw byte offsets (6000 / len-2500)
+/// panics on any document whose text straddles those cut points — trivially
+/// reachable with a single accented or CJK character.
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 pub fn harvest(markdown: &str) -> Harvest {
     let mut h = Harvest::default();
-    let head_len = markdown.len().min(6000);
+    let head_len = floor_char_boundary(markdown, 6000);
     let head = &markdown[..head_len];
-    let tail_start = markdown.len().saturating_sub(2500);
+    let tail_start = floor_char_boundary(markdown, markdown.len().saturating_sub(2500));
     let tail = &markdown[tail_start..];
 
     // Dates: first pages + last page only (naming never needs page 247).
@@ -228,5 +242,19 @@ mod tests {
         let h = harvest(md);
         assert!(h.subject_lines.iter().any(|s| s.contains("Termination")));
         assert!(!h.caption_lines.is_empty());
+    }
+
+    #[test]
+    fn unicode_boundary_in_head_does_not_panic() {
+        // '☃' occupies bytes 5999..6002, straddling the 6000-byte head cut.
+        let md = format!("{}☃ trailing text past the head boundary.", "a".repeat(5999));
+        let _ = harvest(&md); // must not panic
+    }
+
+    #[test]
+    fn unicode_boundary_in_tail_does_not_panic() {
+        // A tail of multi-byte chars must not panic at the tail-start cut.
+        let md = format!("{}{}", "a".repeat(1000), "☃".repeat(1000));
+        let _ = harvest(&md); // must not panic
     }
 }

@@ -280,12 +280,14 @@ impl Pipeline {
         );
 
         self.pacer.permit().await;
+        let original_relpath = relpath(&self.cfg.processing_dir, &path);
         let m = Manifest {
             schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: manifest_id(&sha, &original_relpath),
             sha256: sha.clone(),
             status: "ok".into(),
             original_name: name,
-            original_relpath: relpath(&self.cfg.processing_dir, &path),
+            original_relpath,
             new_filename: Some(final_filename),
             description: Some(validated.description),
             date: Some(validated.date_iso),
@@ -458,12 +460,12 @@ impl Pipeline {
         }
         let Some(orig_final) = existing.final_filename.clone() else { return };
 
-        // Identity for this *physical* copy: deterministic so replaying the
-        // same file is idempotent at Flow 2's SHA gate, and filesystem-safe
-        // (NTFS rejects ':' — the old `{sha}:{uuid}` id silently failed to
-        // write on Windows and minted a fresh key every run, double-indexing).
+        // Identity for this *physical* copy: the manifest_id, a 64-hex hash of
+        // content + this copy's path. Deterministic so replaying the same file
+        // is idempotent at Flow 2's manifest_id gate, and distinct per copy so
+        // each gets its own " (n)" row.
         let rel = relpath(&self.cfg.processing_dir, path);
-        let dup_key = duplicate_key(sha, &rel);
+        let dup_key = manifest_id(sha, &rel);
 
         // If this copy already produced a manifest, re-emit the identical one
         // (same key, same name) instead of inventing a new " (n)".
@@ -500,7 +502,8 @@ impl Pipeline {
         self.pacer.permit().await;
         let m = Manifest {
             schema: MANIFEST_SCHEMA_VERSION,
-            sha256: dup_key.clone(),
+            manifest_id: dup_key.clone(),
+            sha256: sha.to_string(),
             status: "ok".into(),
             original_name: name.into(),
             original_relpath: rel,
@@ -510,7 +513,7 @@ impl Pipeline {
             date_source: existing.date_source.clone(),
             doc_type: existing.doc_type.clone(),
             language: existing.language.clone(),
-            duplicate_of: Some(orig_final),
+            duplicate_of: Some(sha.to_string()),
             soft_flags: vec!["DUPLICATE_CONTENT".into()],
             flag_reason: None,
             model_versions: self.model_versions.clone(),
@@ -581,12 +584,14 @@ impl Pipeline {
         }
 
         self.pacer.permit().await;
+        let original_relpath = relpath(&self.cfg.processing_dir, path);
         let m = Manifest {
             schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: manifest_id(sha, &original_relpath),
             sha256: sha.to_string(),
             status: "flagged".into(),
             original_name: path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").into(),
-            original_relpath: relpath(&self.cfg.processing_dir, path),
+            original_relpath,
             new_filename: None,
             description: None,
             date: None,
@@ -655,8 +660,16 @@ impl Pipeline {
             job.original_name.clone()
         };
 
+        // Recompute the SAME manifest_id the flagged manifest used (identity is
+        // content + the file's original path), so this ok manifest replaces the
+        // pending flagged one through the guarded flagged->ok transition.
+        let mid = manifest_id(
+            sha,
+            &relpath(&self.cfg.processing_dir, std::path::Path::new(&job.original_path)),
+        );
         let m = Manifest {
             schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: mid,
             sha256: sha.to_string(),
             status: "ok".into(),
             original_name: job.original_name,
@@ -732,15 +745,11 @@ pub fn sweep_cache(cache_dir: &Path, ttl_days: u64) {
     }
 }
 
-/// Deterministic, filesystem-safe identity for a physical duplicate copy:
-/// the shared content hash plus a short digest of the copy's relative path.
-/// Same copy -> same key (idempotent replay); distinct copies -> distinct keys.
-fn duplicate_key(content_sha: &str, relpath: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(relpath.as_bytes());
-    let rp = hex::encode(h.finalize());
-    format!("{content_sha}-{}", &rp[..16])
+/// The manifest id / instance identity for a file at `relpath` with the given
+/// content hash: a filesystem-safe 64-hex value that is the manifest's
+/// idempotency key and filename. See `crate::identity`.
+fn manifest_id(content_sha: &str, relpath: &str) -> String {
+    crate::identity::instance_id(content_sha, &crate::identity::normalize_relpath(relpath))
 }
 
 #[cfg(test)]
@@ -748,23 +757,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn duplicate_key_is_deterministic_and_fs_safe() {
+    fn manifest_id_is_fs_safe_and_path_case_insensitive() {
         let sha = "a".repeat(64);
-        let k1 = duplicate_key(&sha, "sub/dir/file.pdf");
-        let k2 = duplicate_key(&sha, "sub/dir/file.pdf");
-        assert_eq!(k1, k2, "same copy must yield the same key (idempotent)");
-        // No characters NTFS rejects in a filename.
-        assert!(!k1.contains([':', '\\', '/', '*', '?', '"', '<', '>', '|']));
-        assert!(k1.starts_with(&sha));
-    }
-
-    #[test]
-    fn duplicate_key_differs_per_copy() {
-        let sha = "b".repeat(64);
-        assert_ne!(
-            duplicate_key(&sha, "a/one.pdf"),
-            duplicate_key(&sha, "a/two.pdf"),
-            "distinct copies must get distinct keys so each gets its own row"
-        );
+        let id = manifest_id(&sha, "Sub\\Dir\\File.PDF");
+        assert!(crate::identity::is_safe_identifier(&id));
+        // Separator/case-insensitive: the same physical file yields one id.
+        assert_eq!(id, manifest_id(&sha, "sub/dir/file.pdf"));
+        // Distinct copies get distinct ids so each gets its own " (n)" row.
+        assert_ne!(manifest_id(&sha, "a/one.pdf"), manifest_id(&sha, "a/two.pdf"));
     }
 }

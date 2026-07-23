@@ -1,5 +1,6 @@
 mod config;
 mod filter;
+mod identity;
 mod ledger;
 mod manifest;
 mod pipeline;
