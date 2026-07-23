@@ -33,6 +33,13 @@ pub struct Response {
 
 pub struct Sidecar {
     exe: std::path::PathBuf,
+    /// Injected into the spawned process's `BACKLOG_MODELS_DIR` (see
+    /// `with_models_dir`). `None` leaves convertd.py's own default in effect
+    /// (dev layout: `../models` beside the sidecar executable) — every
+    /// production call site sets this via `model_download::resolve_models_dir`
+    /// so an installed app's gliclass/granite files, which live under
+    /// app-data rather than beside the exe, are actually found.
+    models_dir: Option<std::path::PathBuf>,
     inner: Mutex<Option<Proc>>,
     counter: std::sync::atomic::AtomicU64,
     pub timeout: Duration,
@@ -67,15 +74,28 @@ impl Sidecar {
     pub fn with_timeout(exe: std::path::PathBuf, timeout: Duration) -> Self {
         Self {
             exe,
+            models_dir: None,
             inner: Mutex::new(None),
             counter: std::sync::atomic::AtomicU64::new(1),
             timeout,
         }
     }
 
+    /// Sets the models directory injected into every spawned process as
+    /// `BACKLOG_MODELS_DIR`. Builder-style so existing call sites (and the
+    /// unix-only tests below, which never load a real model) are unaffected
+    /// unless they opt in.
+    pub fn with_models_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.models_dir = Some(dir);
+        self
+    }
+
     fn spawn(&self) -> anyhow::Result<Proc> {
         let mut cmd = Command::new(&self.exe);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        if let Some(dir) = &self.models_dir {
+            cmd.env("BACKLOG_MODELS_DIR", dir);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

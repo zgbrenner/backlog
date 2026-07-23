@@ -47,6 +47,27 @@ type RuntimeProblem = {
   severity: "error" | "warning";
 };
 
+// Mirrors src-tauri/src/model_download.rs::DownloadProgress. `current_file`
+// is the spec's stable target key (e.g.
+// "granite-embedding-small-english-r2/model.safetensors"), not a bare
+// filename — several files share a bare name like "config.json" across the
+// gliclass/granite directories. `files_done` ranges 0..files_total while
+// `current_file` is in flight; show `files_done + 1` for a 1-based counter.
+type ModelDownloadProgress = {
+  current_file: string;
+  file_bytes_done: number;
+  file_bytes_total: number;
+  files_done: number;
+  files_total: number;
+  overall_percent: number;
+};
+
+// Mirrors src-tauri/src/model_download.rs::DownloadDone.
+type ModelDownloadDone = {
+  ok: boolean;
+  error?: string | null;
+};
+
 // Mirrors src-tauri/src/preflight.rs::RuntimeStatus.
 type RuntimeStatus = {
   configured: boolean;
@@ -110,6 +131,8 @@ let running = false;
 let paused = false;
 let runtime: RuntimeStatus = uncheckedRuntime();
 let view: "queue" | "flagged" | "settings" = "queue";
+let modelsDownloading = false;
+let modelDownloadProgress: ModelDownloadProgress | null = null;
 
 const STATE_BADGE: Record<string, string> = {
   ingested: "b-wait", converted: "b-wait", filtered: "b-wait", named: "b-wait",
@@ -134,6 +157,18 @@ function showError(msg: string): void {
   toast.textContent = msg;
   document.body.appendChild(toast);
   setTimeout(() => toast.remove(), 6000);
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
 // Refreshes the in-memory runtime status from the backend. `live` runs the
@@ -302,6 +337,57 @@ async function renderFlagged(root: HTMLElement) {
   }
 }
 
+// One-time setup egress: fetches the Qwen/GLiClass/Granite model files from
+// Hugging Face so a non-technical user never runs models/download_models.py
+// in a terminal. Driven by the model-download-progress / model-download-done
+// events (listened globally below) rather than the invoke() promise alone,
+// so the panel stays in sync even if the user switches views mid-download
+// and comes back.
+async function onDownloadModelsClick(): Promise<void> {
+  if (modelsDownloading) return;
+  modelsDownloading = true;
+  modelDownloadProgress = null;
+  render();
+  try {
+    await invoke("download_models");
+  } catch (e) {
+    // The model-download-done listener normally already surfaced this via
+    // showError and reset modelsDownloading; this only fires for an
+    // IPC-level failure the event itself missed.
+    if (modelsDownloading) {
+      modelsDownloading = false;
+      showError(String(e));
+      render();
+    }
+  }
+}
+
+function renderModelDownloadSection(): string {
+  const needsDownload = !runtime.primary_model_found || !runtime.escalation_model_found;
+  if (!needsDownload && !modelsDownloading) return "";
+
+  const p = modelDownloadProgress;
+  const pct = p ? Math.round(p.overall_percent) : 0;
+  const progress = modelsDownloading
+    ? `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+       <p class="dim-note">${
+         p
+           ? `File ${p.files_done + 1} of ${p.files_total}: ${esc(p.current_file)} (${pct}%)` +
+             (p.file_bytes_total > 0 ? ` &middot; ${formatBytes(p.file_bytes_done)} / ${formatBytes(p.file_bytes_total)}` : "")
+           : "Starting&hellip;"
+       }</p>`
+    : `<p class="dim-note">Fetches the Qwen, GLiClass, and Granite model files from Hugging Face once
+        (public repos, no account needed). BackLog stays fully offline for document processing afterward.</p>`;
+
+  return `
+    <div class="model-download">
+      <button type="button" id="download-models-button" ${modelsDownloading ? "disabled" : ""}>
+        ${modelsDownloading ? "Downloading models…" : "Download models (~2.4 GB)"}
+      </button>
+      ${progress}
+    </div>`;
+}
+
 function renderReadinessPanel(): HTMLElement {
   const rows = READINESS_CHECKS.map(([label, key]) => {
     const passed = Boolean(runtime[key]);
@@ -337,6 +423,7 @@ function renderReadinessPanel(): HTMLElement {
         <button type="button" id="preflight-button" class="ghost">Run preflight</button>
       </div>
       <ul class="check-list">${rows}</ul>
+      ${renderModelDownloadSection()}
       ${problemsHtml}
     </section>`);
 
@@ -347,6 +434,8 @@ function renderReadinessPanel(): HTMLElement {
     await refreshRuntime(true);
     render();
   });
+
+  panel.querySelector("#download-models-button")?.addEventListener("click", onDownloadModelsClick);
 
   return panel;
 }
@@ -449,6 +538,24 @@ listen("job-updated", () => {
   if (renderQueued) return;
   renderQueued = true;
   setTimeout(() => { renderQueued = false; if (view !== "settings") render(); }, 400);
+});
+
+// Backend already throttles these to ~200ms/file, so no extra debounce here.
+listen<ModelDownloadProgress>("model-download-progress", (event) => {
+  modelDownloadProgress = event.payload;
+  if (view === "settings") render();
+});
+
+listen<ModelDownloadDone>("model-download-done", async (event) => {
+  modelsDownloading = false;
+  modelDownloadProgress = null;
+  if (!event.payload.ok) {
+    showError(event.payload.error ?? "Model download failed.");
+  }
+  // Flip Readiness back to green (or show what's still missing) now that
+  // the model files may have just landed on disk.
+  await refreshRuntime(true);
+  render();
 });
 
 (async () => {

@@ -186,8 +186,9 @@ pub async fn run(app: &tauri::AppHandle, cfg: &Config, running: bool, paused: bo
         // configured.
         let timeout = Duration::from_secs(cfg.sidecar_timeout_secs.clamp(1, 5));
         let executable = sidecar_path.clone();
+        let models_dir = crate::model_download::resolve_models_dir(app);
         match tokio::task::spawn_blocking(move || {
-            let sidecar = Sidecar::with_timeout(executable, timeout);
+            let sidecar = Sidecar::with_timeout(executable, timeout).with_models_dir(models_dir);
             sidecar.ping()
         })
         .await

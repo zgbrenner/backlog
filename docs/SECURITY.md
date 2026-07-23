@@ -22,7 +22,15 @@ limited index metadata only through explicitly configured Power Automate flows.
   text or evidence bundles.
 - The desktop capability file grants only Tauri core, event, window, and dialog
   permissions. The application does not initialize shell or opener plugins.
-- Runtime model downloads are not implemented.
+- Model weights are the one deliberate exception to "no runtime network
+  access": `download_models` (`src-tauri/src/model_download.rs`), invoked
+  once from Settings when Readiness reports missing model files, streams the
+  pinned Hugging Face repos over HTTPS into `app_data/models` and SHA-256-
+  verifies every file against `models.lock.json` (trust-on-first-download,
+  then verify on every subsequent run — mirroring `models/download_models.py`).
+  This uses the `reqwest` crate directly from Rust, not a webview-exposed
+  plugin, so it added no capability grant. Document processing itself never
+  reaches the network.
 
 ## Required release controls
 

@@ -28,7 +28,11 @@ infer = "0.16"
 notify = "7"
 notify-debouncer-full = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", features = ["json"] }
+# "stream" backs model_download.rs's chunked GGUF/safetensors downloads
+# (Response::bytes_stream) so a multi-GB file is never buffered whole in
+# memory.
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"

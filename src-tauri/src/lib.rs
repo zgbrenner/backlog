@@ -3,6 +3,7 @@ mod filter;
 mod identity;
 mod ledger;
 mod manifest;
+mod model_download;
 mod pipeline;
 mod preflight;
 mod routing;
@@ -204,10 +205,10 @@ async fn start_pipeline(app: tauri::AppHandle, state: tauri::State<'_, AppState>
 
     let grammar = std::fs::read_to_string(resource(&app, "name.gbnf"))
         .map_err(|e| format!("grammar load failed: {e}"))?;
-    let sidecar = Arc::new(Sidecar::with_timeout(
-        binary(&app, "convertd"),
-        std::time::Duration::from_secs(cfg.sidecar_timeout_secs),
-    ));
+    let sidecar = Arc::new(
+        Sidecar::with_timeout(binary(&app, "convertd"), std::time::Duration::from_secs(cfg.sidecar_timeout_secs))
+            .with_models_dir(model_download::resolve_models_dir(&app)),
+    );
     let slm = Arc::new(SlmLane::new(
         binary(&app, "llama-server"),
         grammar,
@@ -250,6 +251,28 @@ pub fn run() {
             if cfg.cache_dir.as_os_str().is_empty() {
                 cfg.cache_dir = data_dir.join("cache");
             }
+            // The shipped defaults (`Config::default()`) point at
+            // "models/<file>", relative to whatever the process's current
+            // directory happens to be — meaningless for an installed exe.
+            // Rehome them under the persistent app-data models dir, which is
+            // also where `download_models` (model_download.rs) writes and
+            // where `BACKLOG_MODELS_DIR` points the convertd sidecar (below,
+            // via `Sidecar::with_models_dir`). Absolute paths a user already
+            // set via Settings' Browse dialog pass through untouched; see
+            // `resolve_configured_model_path`'s doc comment.
+            let models_dir = model_download::resolve_models_dir(app.handle());
+            std::fs::create_dir_all(&models_dir).ok();
+            cfg.slm_primary_gguf = model_download::resolve_configured_model_path(
+                &models_dir,
+                &cfg.slm_primary_gguf,
+                model_download::PRIMARY_GGUF_NAME,
+            );
+            cfg.slm_escalation_gguf = model_download::resolve_configured_model_path(
+                &models_dir,
+                &cfg.slm_escalation_gguf,
+                model_download::ESCALATION_GGUF_NAME,
+            );
+            cfg.save(&cfg_path).ok();
             let ledger = Arc::new(Ledger::open(&data_dir.join("ledger.db"))?);
             app.manage(AppState {
                 cfg_path,
@@ -312,7 +335,8 @@ pub fn run() {
             get_evidence,
             resubmit,
             set_paused,
-            start_pipeline
+            start_pipeline,
+            model_download::download_models
         ])
         .run(tauri::generate_context!())
         .expect("error while running BackLog");

@@ -166,3 +166,15 @@ button.ghost:hover { color: var(--text); }
 .problem-box li code { color: var(--text); font-family: var(--mono); font-size: 11px; }
 .problem-box li span { color: #ffcaca; }
 .ready-box { color: #c9f8e2; background: rgba(62, 207, 142, 0.08); border: 1px solid rgba(62, 207, 142, 0.24); }
+
+.model-download { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--panel2); }
+.model-download button {
+  background: var(--accent); color: #08131f; border: none;
+  border-radius: 6px; padding: 8px 16px; font-weight: 600; cursor: pointer;
+}
+.model-download button:disabled { cursor: not-allowed; opacity: 0.6; }
+.progress-track {
+  margin-top: 10px; height: 8px; border-radius: 999px; overflow: hidden;
+  background: var(--panel2);
+}
+.progress-fill { height: 100%; background: var(--accent); transition: width 0.2s ease; }
