@@ -1,8 +1,8 @@
-# BackLog naming grammar. Locks LFM2.5 decoding to the fields JSON: the model
-# cannot emit prose, markdown, or apologies. Character classes deliberately
-# exclude JSON-breaking quotes/backslashes and filename-illegal characters,
-# so the checker validates semantics, not syntax.
-# Requires llama.cpp with bounded-repetition GBNF support (mid-2024 or later).
+# BackLog naming grammar. Locks fallback llama.cpp decoding to the fields JSON:
+# the model cannot emit prose, markdown, or apologies. Character classes
+# deliberately exclude JSON-breaking quotes/backslashes and filename-illegal
+# characters, so the checker validates semantics, not syntax.
+# Current Qwen chat requests use JSON Schema; this remains a compatibility asset.
 
 root        ::= "{\"date\": \"" datev "\", \"date_source\": \"" source "\", \"subject\": \"" subject "\", \"description\": \"" desc "\"}"
 

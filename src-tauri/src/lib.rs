@@ -153,7 +153,10 @@ fn start_pipeline(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resul
 
     let grammar = std::fs::read_to_string(resource(&app, "name.gbnf"))
         .map_err(|e| format!("grammar load failed: {e}"))?;
-    let sidecar = Arc::new(Sidecar::new(binary(&app, "convertd")));
+    let sidecar = Arc::new(Sidecar::with_timeout(
+        binary(&app, "convertd"),
+        std::time::Duration::from_secs(cfg.sidecar_timeout_secs),
+    ));
     let slm = Arc::new(SlmLane::new(
         binary(&app, "llama-server"),
         grammar,

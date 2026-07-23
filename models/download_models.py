@@ -1,148 +1,273 @@
 #!/usr/bin/env python3
-"""
-One-time model fetch for BackLog. Run this ON A MACHINE WITH INTERNET, then
-copy the models/ directory to the deployment machine. The app itself never
-downloads anything at runtime.
+"""Download and verify BackLog's fully local runtime model bundle.
 
-Records SHA-256 of every file into models.lock.json on first download and
-VERIFIES against the lockfile on every subsequent run. Commit models.lock.json
-to the repo once generated (it MUST be committed for reproducible verification);
-do not hand-edit it.
-
-Windows: Developer Mode / admin is no longer required. HF downloads are forced
-to copy files instead of creating symlinks (local_dir_use_symlinks=False), which
-avoids the WinError 1314 "a required privilege is not held" failure on large
-model snapshots.
+The application never downloads at runtime. Run this script once on a connected
+staging machine, commit ``models.lock.json``, and copy the verified ``models/``
+directory to the deployment machine.
 
 Usage:
-  python download_models.py            # core models
-  python download_models.py --vl       # also fetch the VL-Extract fallback
+  python download_models.py
+  python download_models.py --verify-only
+
+``--verify-only`` imports no Hub client and performs no network access. Ettin is
+a separate training input and is deliberately not part of this runtime bundle.
 """
+
+from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import shutil
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LOCK = HERE / "models.lock.json"
 
-# repo_id, filename (None = whole snapshot into a directory), local target
-CORE = [
-    # SLM primary + escalation (GGUF, llama.cpp)
-    ("LiquidAI/LFM2.5-350M-GGUF", "LFM2.5-350M-Q8_0.gguf", "LFM2.5-350M-Q8_0.gguf"),
-    ("LiquidAI/LFM2.5-1.2B-Instruct-GGUF", "LFM2.5-1.2B-Instruct-Q4_K_M.gguf", "LFM2.5-1.2B-Instruct-Q4_K_M.gguf"),
-    # Zero-shot doc-type classifier
-    ("knowledgator/gliclass-base-v3.0", None, "gliclass-base-v3.0"),
-    # Salience embeddings
-    ("ibm-granite/granite-embedding-small-english-r2", None, "granite-embedding-small-english-r2"),
-    # Ettin base encoder (fine-tuned later by training/train_ettin.py)
-    ("jhu-clsp/ettin-encoder-32m", None, "ettin-encoder-32m"),
+
+class ModelSpec:
+    def __init__(self, repo_id: str, filename: str | None, target: str):
+        self.repo_id = repo_id
+        self.filename = filename
+        self.target = target
+
+
+MODEL_SPECS = [
+    # Apache-2.0 Qwen GGUFs served by llama.cpp.
+    ModelSpec(
+        "Qwen/Qwen3-0.6B-GGUF",
+        "Qwen3-0.6B-Q8_0.gguf",
+        "Qwen3-0.6B-Q8_0.gguf",
+    ),
+    ModelSpec(
+        "Qwen/Qwen3-1.7B-GGUF",
+        "Qwen3-1.7B-Q8_0.gguf",
+        "Qwen3-1.7B-Q8_0.gguf",
+    ),
+    # Zero-shot document classification.
+    ModelSpec("knowledgator/gliclass-base-v3.0", None, "gliclass-base-v3.0"),
+    # Salience embeddings.
+    ModelSpec(
+        "ibm-granite/granite-embedding-small-english-r2",
+        None,
+        "granite-embedding-small-english-r2",
+    ),
 ]
 
-VL = [
-    ("LiquidAI/LFM2.5-VL-450M-Extract", None, "LFM2.5-VL-450M-Extract"),
-]
-
-FASTTEXT_URL = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz"
+_TOOL_FILES = {"download_models.py", "models.lock.json"}
+_IGNORED_DIRS = {".cache", ".git", "__pycache__", "grammar", "tests"}
+_PAYLOAD_SUFFIXES = {
+    ".gguf",
+    ".safetensors",
+    ".bin",
+    ".onnx",
+    ".model",
+    ".pt",
+    ".pth",
+}
 
 
 def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def record(lock: dict, rel: str, path: Path):
-    digest = sha256_file(path)
-    prev = lock.get(rel)
-    if prev and prev != digest:
-        print(f"HASH MISMATCH for {rel}:\n  locked   {prev}\n  computed {digest}", file=sys.stderr)
-        print("Refusing to continue. Delete the file and re-run, or investigate.", file=sys.stderr)
-        sys.exit(2)
-    lock[rel] = digest
-    print(f"  {rel}  sha256={digest[:16]}...")
+def _safe_relative_path(value: str) -> Path | None:
+    path = Path(value)
+    if path.is_absolute() or not value or ".." in path.parts:
+        return None
+    return path
 
 
-def _locked_rels(lock: dict, target: str):
-    """Lockfile keys belonging to `target` (a single file key, or a dir prefix)."""
-    if target in lock:
-        return [target]
-    prefix = target + "/"
-    return [rel for rel in lock if rel.startswith(prefix)]
-
-
-def is_complete(lock: dict, target: str, dest: Path) -> bool:
-    """A download is complete only if `dest` exists AND every file the committed
-    lock records for it is present. A bare-directory existence check treats an
-    interrupted (partial) download as done and skips it forever; verifying
-    against the lock re-fetches when any locked file is missing. With no lock
-    entries yet (first run) we fall back to plain existence."""
-    if not dest.exists():
-        return False
-    rels = _locked_rels(lock, target)
-    if not rels:
+def _is_ignored(relative: Path) -> bool:
+    if relative.name in _TOOL_FILES or relative.suffix in {".py", ".pyc"}:
         return True
-    return all((HERE / rel).exists() for rel in rels)
+    return any(part in _IGNORED_DIRS or part.startswith(".") for part in relative.parts)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--vl", action="store_true", help="also fetch LFM2.5-VL-450M-Extract")
-    args = ap.parse_args()
+def iter_payload_files(root: Path):
+    """Yield model-like files while excluding repository tooling and caches."""
+    if not root.exists():
+        return
+    directory_targets = {spec.target for spec in MODEL_SPECS if spec.filename is None}
+    file_targets = {spec.target for spec in MODEL_SPECS if spec.filename is not None}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if _is_ignored(relative):
+            continue
+        first = relative.parts[0]
+        if (
+            first in directory_targets
+            or relative.as_posix() in file_targets
+            or relative.suffix.lower() in _PAYLOAD_SUFFIXES
+        ):
+            yield path
 
+
+def verify_lock(root: Path, lock: dict[str, str]) -> list[str]:
+    """Return every lock integrity problem without mutating the model bundle."""
+    errors: list[str] = []
+    normalized_lock: dict[str, str] = {}
+
+    if not isinstance(lock, dict) or not lock:
+        errors.append("model lock is empty or invalid")
+        lock = {}
+
+    for relative_text, expected in sorted(lock.items()):
+        relative = _safe_relative_path(relative_text)
+        if relative is None:
+            errors.append(f"unsafe lock path: {relative_text!r}")
+            continue
+        normalized = relative.as_posix()
+        normalized_lock[normalized] = str(expected).lower()
+        path = root / relative
+        if not path.is_file():
+            errors.append(f"missing locked file: {normalized}")
+            continue
+        actual = sha256_file(path)
+        if actual != str(expected).lower():
+            errors.append(
+                f"hash mismatch for {normalized}: locked {expected}, computed {actual}"
+            )
+
+    for path in iter_payload_files(root):
+        relative = path.relative_to(root).as_posix()
+        if relative not in normalized_lock:
+            errors.append(f"untracked model file: {relative}")
+
+    return errors
+
+
+def _expected_payload_files(root: Path):
+    for spec in MODEL_SPECS:
+        target = root / spec.target
+        if spec.filename is not None:
+            if target.is_file():
+                yield target
+            continue
+        if target.is_dir():
+            for path in sorted(target.rglob("*")):
+                if path.is_file() and not _is_ignored(path.relative_to(root)):
+                    yield path
+
+
+def _write_lock(root: Path) -> dict[str, str]:
+    lock = {
+        path.relative_to(root).as_posix(): sha256_file(path)
+        for path in _expected_payload_files(root)
+    }
+    if not lock:
+        raise RuntimeError("download completed without any model payload files")
+    LOCK.write_text(
+        json.dumps(lock, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return lock
+
+
+def _load_lock() -> dict[str, str]:
+    if not LOCK.exists():
+        return {}
+    value = json.loads(LOCK.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("models.lock.json must contain a JSON object")
+    return {str(key): str(digest).lower() for key, digest in value.items()}
+
+
+def _download_bundle() -> None:
     try:
         from huggingface_hub import hf_hub_download, snapshot_download
-    except ImportError:
-        print("pip install huggingface_hub", file=sys.stderr)
-        sys.exit(1)
-    import urllib.request
+    except ImportError as error:
+        raise RuntimeError(
+            "install the staging dependency: pip install huggingface_hub"
+        ) from error
 
-    lock = json.loads(LOCK.read_text(encoding="utf-8")) if LOCK.exists() else {}
-    items = CORE + (VL if args.vl else [])
+    existing_lock = _load_lock()
+    # A changed locked file is never overwritten. Missing files may be restored
+    # from the same declared source, then the complete bundle is re-verified.
+    for relative, expected in existing_lock.items():
+        safe = _safe_relative_path(relative)
+        if safe is None:
+            raise RuntimeError(f"unsafe path in existing lock: {relative!r}")
+        path = HERE / safe
+        if path.is_file() and sha256_file(path) != expected:
+            raise RuntimeError(
+                f"refusing to overwrite changed locked file {relative}; "
+                "delete it only after investigation"
+            )
 
-    for repo, filename, target in items:
-        dest = HERE / target
-        print(f"[{repo}]")
-        if filename:
-            if not is_complete(lock, target, dest):
-                # local_dir_use_symlinks=False -> copy, not symlink, so Windows
-                # downloads work without Developer Mode/admin (avoids WinError 1314).
-                got = hf_hub_download(repo_id=repo, filename=filename, local_dir=HERE,
-                                      local_dir_use_symlinks=False)
-                got = Path(got)
-                if got != dest:
-                    got.replace(dest)
-            record(lock, target, dest)
+    for spec in MODEL_SPECS:
+        destination = HERE / spec.target
+        print(f"[{spec.repo_id}]")
+        if spec.filename is not None:
+            if not destination.exists():
+                downloaded = Path(
+                    hf_hub_download(
+                        repo_id=spec.repo_id,
+                        filename=spec.filename,
+                        local_dir=HERE,
+                    )
+                )
+                if downloaded.resolve() != destination.resolve():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(downloaded, destination)
         else:
-            if not is_complete(lock, target, dest):
-                # local_dir_use_symlinks=False -> copy, not symlink, so Windows
-                # downloads work without Developer Mode/admin (avoids WinError 1314).
-                # snapshot_download resumes, completing a partial/interrupted dir.
-                snapshot_download(repo_id=repo, local_dir=dest,
-                                  local_dir_use_symlinks=False)
-            # lock every file in the snapshot. Use as_posix() so a lock generated
-            # on Windows (backslashes) still verifies on macOS/Linux and vice versa.
-            for f in sorted(dest.rglob("*")):
-                if f.is_file() and not f.name.startswith("."):
-                    record(lock, f.relative_to(HERE).as_posix(), f)
+            snapshot_download(repo_id=spec.repo_id, local_dir=destination)
 
-    ft = HERE / "lid.176.ftz"
-    print("[fasttext lid.176]")
-    if not ft.exists():
-        # timeout so a stalled connection fails fast instead of hanging forever
-        # (urlretrieve has no timeout).
-        with urllib.request.urlopen(FASTTEXT_URL, timeout=60) as resp:
-            ft.write_bytes(resp.read())
-    record(lock, "lid.176.ftz", ft)
+    allowed = {path.resolve() for path in _expected_payload_files(HERE)}
+    unexpected = [
+        path.relative_to(HERE).as_posix()
+        for path in iter_payload_files(HERE)
+        if path.resolve() not in allowed
+    ]
+    if unexpected:
+        joined = "\n  - ".join(unexpected)
+        raise RuntimeError(
+            "obsolete or untracked model files remain; remove them before locking:\n  - "
+            + joined
+        )
 
-    LOCK.write_text(json.dumps(lock, indent=2, sort_keys=True), encoding="utf-8")
-    print(f"\nWrote {LOCK} ({len(lock)} entries). Commit this file.")
-    print("Copy the whole models/ directory to the deployment machine.")
+    lock = _write_lock(HERE)
+    errors = verify_lock(HERE, lock)
+    if errors:
+        raise RuntimeError(
+            "post-download verification failed:\n  - " + "\n  - ".join(errors)
+        )
+    print(f"\nWrote {LOCK} ({len(lock)} entries). Commit this lockfile.")
+    print("Copy the complete models/ directory to the deployment machine.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="verify models.lock.json without importing Hub clients or using the network",
+    )
+    args = parser.parse_args()
+
+    try:
+        if args.verify_only:
+            errors = verify_lock(HERE, _load_lock())
+            if errors:
+                print("Model verification failed:", file=sys.stderr)
+                for error in errors:
+                    print(f"  - {error}", file=sys.stderr)
+                return 2
+            print("Model bundle verified successfully.")
+            return 0
+        _download_bundle()
+        return 0
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

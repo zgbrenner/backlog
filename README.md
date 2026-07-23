@@ -21,9 +21,9 @@ Intake (SharePoint) --Flow 1--> Processing folder (OneDrive-synced)
                 systray Tauri shell, Rust core, SQLite ledger
                                       |
       convertd sidecar (Python): MarkItDown, pdfium, RapidOCR,
-                fastText, GLiClass, granite, Ettin
-      llama-server sidecar: LFM2.5-350M primary, 1.2B escalation,
-                GBNF grammar-locked decoding
+                Lingua, GLiClass, granite, Ettin
+      llama-server sidecar: Qwen3-0.6B primary, 1.7B escalation,
+                JSON-schema-constrained chat completions
                                       |
                        deterministic checker (Rust)
                                       |

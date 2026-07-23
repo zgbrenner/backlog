@@ -5,12 +5,12 @@
 This branch consolidates the original prototype, the reliability implementation,
 and the independent reproducibility contribution.
 
-> **Status (this branch).** Built on the CI-free `backlog-core` foundation. Some
-> items below reflect the licensing-clean target stack (Qwen3 / Lingua) and the
-> preflight/review features, which are **not yet ported to this branch** — the
-> current pilot build uses LFM2.5 + fastText + rapidocr-onnxruntime and has no
-> preflight/review UI yet. Those are tracked follow-ups. (Historical planning
-> docs from the prior effort, including `ARCHITECTURE_AMENDMENTS.md`, were not
+> **Status (this branch).** Built on the CI-free `backlog-core` foundation. The
+> licensing-clean model swap (Qwen3 / Lingua / RapidOCR, replacing LFM2.5 /
+> fastText / rapidocr-onnxruntime) described below **has landed on this
+> branch**. The preflight/review UI features from the prior effort are still
+> **not ported** — those remain a tracked follow-up. (Historical planning docs
+> from the prior effort, including `ARCHITECTURE_AMENDMENTS.md`, were not
 > carried over here.)
 
 ## Implemented in source

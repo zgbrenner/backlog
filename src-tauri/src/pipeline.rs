@@ -329,11 +329,12 @@ impl Pipeline {
                 // pdfium text dump / OCR inside the sidecar's fallback op.
                 (Route::Native, 1 | 2) => self.sidecar.convert(&p, hp, tp),
                 (Route::Native, _) => self.sidecar.ocr(&p, 300, hp, tp),
-                // Scanned path: 300 DPI, then 400 DPI, then VL-Extract
-                // (the sidecar switches engine on the vl flag via dpi=0).
+                // Scanned path: 300 DPI, then 400 DPI, then an enhanced
+                // 600 DPI + grayscale/autocontrast classical OCR pass (the
+                // sidecar selects it via the dpi=0 sentinel).
                 (Route::Scanned, 1) => self.sidecar.ocr(&p, 300, hp, tp),
                 (Route::Scanned, 2) => self.sidecar.ocr(&p, 400, hp, tp),
-                (Route::Scanned, _) => self.sidecar.ocr(&p, 0, hp, tp), // 0 = VL fallback
+                (Route::Scanned, _) => self.sidecar.ocr(&p, 0, hp, tp), // 0 = enhanced OCR
                 (Route::Flag, _) => unreachable!(),
             };
             match result {
