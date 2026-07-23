@@ -243,6 +243,13 @@ pub fn run() {
         // nor shell:allow-execute; the opener plugin is unused. Both removed to
         // shrink the IPC attack surface.
         .plugin(tauri_plugin_dialog::init())
+        // Self-update: checks the `latest.json` endpoint configured under
+        // `plugins.updater` in tauri.conf.json, verifies the release's
+        // signature against the embedded pubkey, and (if the user accepts)
+        // downloads + installs it. tauri-plugin-process supplies the
+        // `relaunch()` the frontend calls after a successful install.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir().expect("app data dir");
             std::fs::create_dir_all(&data_dir).ok();

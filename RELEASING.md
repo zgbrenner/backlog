@@ -114,9 +114,74 @@ verify it.
 ## Updating later
 1. Make the change; if it touches Rust / frontend / sidecar, it needs a rebuild.
 2. Re-run steps 1–4 on a Windows machine (step 1 only if the sidecar changed).
-3. `gh release create v0.1.1 <new installer> ...`.
+3. Follow "Cutting an updating release" below to build, sign, and publish.
 
-There is no auto-updater configured, so users install the new version manually.
-Adding a Tauri updater later is possible without CI (you'd build locally and
-upload the update artifacts + a `latest.json` to the release), but it requires
-signing-key management and is out of scope for the pilot.
+## Auto-updater: signing key
+
+BackLog self-updates via `tauri-plugin-updater`, checking a `latest.json` file
+published to each GitHub Release (`releases/latest/download/latest.json` —
+GitHub's "latest release" redirect resolves this with **zero Actions
+minutes**, since it's just release-asset hosting). Updates are verified with
+a minisign keypair before install: the public half is embedded in
+`src-tauri/tauri.conf.json` (`plugins.updater.pubkey`), and the private half
+signs each build.
+
+The keypair for this pilot was generated once with:
+```powershell
+npx tauri signer generate -w C:/Users/zgbre/.backlog-signing/backlog-updater.key --ci -p ""
+```
+It lives **outside the repo**, at `C:/Users/zgbre/.backlog-signing/` on the
+build machine (`backlog-updater.key` + `backlog-updater.key.pub`), was
+generated with an **empty password**, and must never be committed. Back it
+up somewhere durable (a password manager or encrypted archive) — if it's
+lost, no future release can be signed to match the pubkey already embedded in
+installed copies of the app, and users would need a fresh (unsigned-chain)
+manual install to move to a new keypair.
+
+## Cutting an updating release
+
+1. Bump `version` in `src-tauri/tauri.conf.json` (and `src-tauri/Cargo.toml`
+   if you keep them in lockstep).
+2. Build with the signing key available to the CLI via environment variables
+   (PowerShell):
+   ```powershell
+   $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content C:/Users/zgbre/.backlog-signing/backlog-updater.key -Raw
+   # Only needed if the key was generated with a password (this pilot's key has none):
+   # $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = "<password>"
+   npm run tauri build
+   ```
+   Because `bundle.createUpdaterArtifacts` is `true` in `tauri.conf.json`,
+   this run additionally emits, alongside the usual NSIS installer under
+   `src-tauri/target/release/bundle/nsis/`:
+   - a `.sig` detached signature for the installer, and
+   - a `latest.json` update manifest (version, notes, per-platform download
+     URL + signature) under the same `bundle/nsis/` (or `bundle/` root,
+     depending on Tauri version — check the build output for the exact
+     path).
+3. Upload the installer, its `.sig`, and `latest.json` to the GitHub Release:
+   ```powershell
+   git tag vX.Y.Z
+   git push origin vX.Y.Z
+   gh release create vX.Y.Z `
+     "src-tauri\target\release\bundle\nsis\BackLog_X.Y.Z_x64-setup.exe" `
+     "src-tauri\target\release\bundle\nsis\BackLog_X.Y.Z_x64-setup.exe.sig" `
+     "src-tauri\target\release\bundle\nsis\latest.json" `
+     --title "BackLog vX.Y.Z" `
+     --notes "See CHANGELOG or commit log."
+   ```
+   The `latest.json` filename on the release **must** be exactly `latest.json`
+   so `releases/latest/download/latest.json` resolves to it.
+4. Installed copies of BackLog check that endpoint at startup (see
+   `src/main.ts`'s `checkForUpdates`), compare the manifest's version against
+   their own, and — if newer — verify the manifest's signature against the
+   pubkey baked into their own `tauri.conf.json` at the time they were built.
+   Only a signature that validates against that pubkey is ever installed, so
+   a compromised or malformed release asset is rejected client-side rather
+   than silently applied. On accept, the app downloads the installer,
+   installs it passively (`plugins.updater.windows.installMode: "passive"`),
+   and relaunches into the new version via `@tauri-apps/plugin-process`.
+5. Every release published this way must be signed with the **same** private
+   key (`C:/Users/zgbre/.backlog-signing/backlog-updater.key`) so its
+   signature keeps validating against the pubkey already shipped in prior
+   installs. Rotating the key breaks the update chain for everyone on an
+   older version until they reinstall manually.

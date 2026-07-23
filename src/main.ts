@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
 type Job = {
   sha256: string;
@@ -133,6 +135,16 @@ let view: "queue" | "flagged" | "settings" = "queue";
 let modelsDownloading = false;
 let modelDownloadProgress: ModelDownloadProgress | null = null;
 
+// Self-update (checked once at startup; see checkForUpdates below). Kept as
+// plain module state -- like the model-download flow above -- since it's
+// driven by a single long-lived operation the user can watch progress on.
+let pendingUpdate: Update | null = null;
+let updateDismissed = false;
+let updateStatus: "idle" | "downloading" | "installing" | "error" = "idle";
+let updateError: string | null = null;
+let updateDownloadedBytes = 0;
+let updateTotalBytes = 0;
+
 const STATE_BADGE: Record<string, string> = {
   ingested: "b-wait", converted: "b-wait", filtered: "b-wait", named: "b-wait",
   validated: "b-wait", emitted: "b-ok", flagged: "b-flag",
@@ -208,6 +220,7 @@ async function render() {
           </button>
         </div>
       </header>
+      ${renderUpdateBanner()}
       <main id="content"></main>
     </div>
   `));
@@ -216,11 +229,101 @@ async function render() {
     b.addEventListener("click", () => { view = (b as HTMLElement).dataset.v as typeof view; render(); })
   );
   document.getElementById("runbtn")!.addEventListener("click", onRunButton);
+  document.getElementById("update-now-button")?.addEventListener("click", onUpdateNowClick);
+  document.getElementById("update-dismiss-button")?.addEventListener("click", () => {
+    updateDismissed = true;
+    render();
+  });
 
   const content = document.getElementById("content")!;
   if (view === "queue") await renderQueue(content);
   else if (view === "flagged") await renderFlagged(content);
   else renderSettings(content);
+}
+
+// Fire-and-forget startup check against the `latest.json` endpoint
+// configured in tauri.conf.json's `plugins.updater`. Must never block or
+// break startup: no releases yet, no network, or a misbehaving endpoint all
+// just leave the app quiet (no banner, no toast, no console noise the user
+// would see). Only a genuinely available, signature-valid update surfaces
+// anything.
+async function checkForUpdates(): Promise<void> {
+  try {
+    const update = await check();
+    if (update) {
+      pendingUpdate = update;
+      render();
+    }
+  } catch {
+    // Swallowed on purpose -- see comment above.
+  }
+}
+
+function renderUpdateBanner(): string {
+  if (!pendingUpdate || updateDismissed) return "";
+  const busy = updateStatus === "downloading" || updateStatus === "installing";
+  const pct = updateTotalBytes > 0 ? Math.round((updateDownloadedBytes / updateTotalBytes) * 100) : null;
+  const statusText =
+    updateStatus === "installing"
+      ? "Installing update, BackLog will restart…"
+      : updateStatus === "downloading"
+        ? `Downloading update…${pct !== null ? ` ${pct}%` : ""}`
+        : `A new version (${esc(pendingUpdate.version)}) is available.`;
+  return `
+    <div class="update-banner" role="status">
+      <span>${statusText}</span>
+      <div class="update-actions">
+        ${busy
+          ? ""
+          : `<button type="button" id="update-now-button">Update now</button>
+             <button type="button" id="update-dismiss-button" class="ghost">Later</button>`}
+      </div>
+      ${updateError ? `<div class="update-error">${esc(updateError)}</div>` : ""}
+    </div>`;
+}
+
+let updateProgressRenderQueued = false;
+function queueUpdateProgressRender(): void {
+  // Chunk events can fire many times a second for a multi-MB installer;
+  // coalesce like the job-updated listener below rather than re-rendering
+  // the whole shell per chunk.
+  if (updateProgressRenderQueued) return;
+  updateProgressRenderQueued = true;
+  setTimeout(() => {
+    updateProgressRenderQueued = false;
+    render();
+  }, 200);
+}
+
+async function onUpdateNowClick(): Promise<void> {
+  if (!pendingUpdate || updateStatus === "downloading" || updateStatus === "installing") return;
+  updateStatus = "downloading";
+  updateError = null;
+  updateDownloadedBytes = 0;
+  updateTotalBytes = 0;
+  render();
+  try {
+    await pendingUpdate.downloadAndInstall((event) => {
+      if (event.event === "Started") {
+        updateTotalBytes = event.data.contentLength ?? 0;
+        render();
+      } else if (event.event === "Progress") {
+        updateDownloadedBytes += event.data.chunkLength;
+        queueUpdateProgressRender();
+      } else if (event.event === "Finished") {
+        updateStatus = "installing";
+        render();
+      }
+    });
+    // The installer already ran; relaunch into the new version. If this
+    // throws, the update is already installed on disk -- the user can just
+    // restart BackLog manually, so surface it without re-arming the banner.
+    await relaunch();
+  } catch (e) {
+    updateStatus = "error";
+    updateError = String(e);
+    render();
+  }
 }
 
 async function onRunButton() {
@@ -578,4 +681,7 @@ listen<ModelDownloadDone>("model-download-done", async (event) => {
   await refreshRuntime(false);
   if (!cfg.processing_dir || !runtime.configured) view = "settings";
   render();
+  // Non-blocking: fired after the first render so a slow/offline check
+  // can never delay startup, and errors are swallowed inside the function.
+  void checkForUpdates();
 })();
