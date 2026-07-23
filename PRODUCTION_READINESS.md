@@ -107,6 +107,19 @@ violated three guarantees; all three are fixed:
 
 Ordered roughly by priority.
 
+> **Update — reconciliation + build pass since this report.** Items 1–3 below are
+> now **done**, plus more. Landed: a real hi-res icon set; the real sidecars built
+> locally (`convertd` via PyInstaller on Python 3.11, `llama-server` b10091 staged
+> with its DLLs) and a validated NSIS installer; `sidecar/requirements.lock`; the
+> **licensing-clean model swap** (Qwen3 + Lingua + RapidOCR, dropping the
+> Liquid-licensed LFM2.5 and CC-BY-SA fastText); the **runtime preflight**
+> readiness check + UI; the Unicode `harvest()` crash fix; and the Power Automate
+> **manifest-v2 contract**. Still open: install-and-run validation on a clean
+> machine with the models; encryption at rest for the ledger; the async-hygiene
+> (`spawn_blocking`) refinement; an optional **slim sidecar** (drop torch → ~3×
+> smaller, trading away the gliclass/granite naming enhancements); an in-flight
+> claim; the dev-only Vite advisory; and an auto-updater.
+
 1. **Real app icon.** `icons/icon.{png,ico}` is a 32×32 placeholder. Supply a
    1024×1024 source and run `npm run tauri icon <source.png>` to generate the
    full platform set.
