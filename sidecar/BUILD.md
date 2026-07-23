@@ -14,7 +14,8 @@ python -m venv .venv
 pip install -r requirements.txt pyinstaller
 
 pyinstaller --onefile --name convertd \
-  --collect-all rapidocr_onnxruntime \
+  --collect-all rapidocr \
+  --collect-all lingua \
   --collect-all gliclass \
   --collect-all markitdown \
   --collect-all torch \

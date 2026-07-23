@@ -55,12 +55,21 @@ impl Drop for Proc {
 }
 
 impl Sidecar {
+    /// Default-timeout constructor. Not currently called internally (the app
+    /// always threads `Config::sidecar_timeout_secs` through `with_timeout`
+    /// below) but kept as stable, obvious-default API surface for tests and
+    /// other callers.
+    #[allow(dead_code)]
     pub fn new(exe: std::path::PathBuf) -> Self {
+        Self::with_timeout(exe, Duration::from_secs(120))
+    }
+
+    pub fn with_timeout(exe: std::path::PathBuf, timeout: Duration) -> Self {
         Self {
             exe,
             inner: Mutex::new(None),
             counter: std::sync::atomic::AtomicU64::new(1),
-            timeout: Duration::from_secs(120),
+            timeout,
         }
     }
 
@@ -239,6 +248,15 @@ impl Sidecar {
     pub fn versions(&self) -> anyhow::Result<Value> {
         self.call("versions", serde_json::json!({}))
     }
+
+    /// Cheap liveness probe. Not called from this phase's pipeline yet; kept
+    /// as a documented, unit-tested building block for a later preflight
+    /// check that verifies the sidecar executable launches and answers
+    /// before a batch starts.
+    #[allow(dead_code)]
+    pub fn ping(&self) -> anyhow::Result<()> {
+        self.call("ping", serde_json::json!({})).map(|_| ())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -263,4 +281,37 @@ pub struct EttinSpan {
     pub score: f64,
     #[serde(default)]
     pub iso: Option<String>, // normalized, DATE spans only
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_executable(path: &std::path::Path, source: &str) {
+        std::fs::write(path, source).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn timeout_kills_process_and_next_request_respawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("fake-sidecar.sh");
+        write_executable(
+            &executable,
+            "#!/bin/sh\nwhile IFS= read -r line; do sleep 5; done\n",
+        );
+
+        let sidecar = Sidecar::with_timeout(executable.clone(), Duration::from_millis(75));
+        let error = sidecar.call("ping", serde_json::json!({})).expect_err("silent sidecar must time out");
+        assert!(error.to_string().contains("timed out"));
+
+        write_executable(
+            &executable,
+            "#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' '{\"id\":2,\"ok\":true}'; done\n",
+        );
+        sidecar.ping().expect("next request should spawn a clean process");
+    }
 }

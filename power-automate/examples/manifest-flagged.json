@@ -8,8 +8,8 @@
   "soft_flags": ["POSSIBLE_MULTIDOC"],
   "flag_reason": "UNREADABLE: OCR confidence remained below the acceptance floor",
   "model_versions": {
-    "convertd": "0.1.0",
-    "ocr": "rapidocr-onnxruntime"
+    "convertd": "0.2.0",
+    "ocr": "rapidocr"
   },
   "processed_at": "2026-07-21T19:32:00Z"
 }

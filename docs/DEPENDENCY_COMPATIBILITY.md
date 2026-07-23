@@ -2,14 +2,14 @@
 
 **Reviewed:** 2026-07-22
 
-> **Status (this branch).** This document describes the *licensing-clean target*
-> stack (Qwen3 SLM, Lingua language ID, RapidOCR 3) chosen to drop the CC-BY-SA
-> fastText `lid.176` model and the Liquid-licensed LFM2.5. The **current pilot
-> build still uses LFM2.5 + fastText + `rapidocr-onnxruntime`** (see
-> `sidecar/requirements.txt`). The model-stack swap to the licensing-clean set is
-> a tracked follow-up — treat the "deliberately excluded" items below as the
-> target, not the shipped runtime, and do not publish a public model bundle
-> before that swap lands.
+> **Status (this branch).** This document describes the *licensing-clean* stack
+> (Qwen3 SLM, Lingua language ID, RapidOCR 3) chosen to drop the CC-BY-SA
+> fastText `lid.176` model and the Liquid-licensed LFM2.5. **The swap has
+> landed**: `sidecar/requirements.txt`, `sidecar/convertd.py`,
+> `models/download_models.py`, and `src-tauri/src/{slm,config}.rs` all reflect
+> the Qwen3 + Lingua + RapidOCR set described below. Do not publish a public
+> model bundle until the redistribution gate at the bottom of this document is
+> also complete.
 
 BackLog is an offline desktop application, but its installer and model bundle
 combine several independently licensed projects. Pin exact artifacts and hashes

@@ -1,4 +1,3 @@
-# convertd runtime dependencies. Freeze and hash-pin for release; see BUILD.md.
 # Human-maintained convertd dependency intent.
 # Regenerate a fully hash-pinned Windows lock with pip-compile on the release
 # machine before producing a signed installer.

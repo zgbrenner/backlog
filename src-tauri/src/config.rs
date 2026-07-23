@@ -33,6 +33,10 @@ pub struct Config {
     /// Worker pool sizes.
     pub convert_workers: usize,
 
+    /// Maximum wait for one convertd request. A timed-out process is killed
+    /// and lazily respawned on the next request.
+    pub sidecar_timeout_secs: u64,
+
     /// Pace manifest emission (per minute, 0 = unlimited) to stay under
     /// Power Automate connector throttling on huge batches.
     pub manifest_emit_per_min: u32,
@@ -66,12 +70,16 @@ impl Default for Config {
             quarantine_dir: PathBuf::new(),
             cache_dir: PathBuf::new(),
             llama_port: 8137,
-            slm_primary_gguf: PathBuf::from("models/LFM2.5-350M-Q8_0.gguf"),
-            slm_escalation_gguf: PathBuf::from("models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf"),
+            // Apache-2.0 Qwen3 GGUFs (llama.cpp) replace the Liquid-licensed
+            // LFM2.5 pair so the app can be redistributed without a
+            // non-standard model license.
+            slm_primary_gguf: PathBuf::from("models/Qwen3-0.6B-Q8_0.gguf"),
+            slm_escalation_gguf: PathBuf::from("models/Qwen3-1.7B-Q8_0.gguf"),
             slm_parallel: 4,
             evidence_token_budget: 1500,
             ettin_model_dir: String::new(),
             convert_workers: default_convert_workers(),
+            sidecar_timeout_secs: 45,
             manifest_emit_per_min: 0,
             max_head_pages: 10,
             max_tail_pages: 3,

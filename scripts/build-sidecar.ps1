@@ -83,7 +83,8 @@ try {
     #    otherwise misses (model loaders, native libs, version metadata).
     Write-Host "Running PyInstaller (this is slow; torch ships inside)..." -ForegroundColor Cyan
     & $VenvPy -m PyInstaller --clean --noconfirm --onefile --name convertd `
-        --collect-all rapidocr_onnxruntime `
+        --collect-all rapidocr `
+        --collect-all lingua `
         --collect-all gliclass `
         --collect-all markitdown `
         --collect-all torch `
