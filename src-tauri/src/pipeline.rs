@@ -87,7 +87,18 @@ impl Pipeline {
 
     async fn process_inner(self: Arc<Self>, path: PathBuf) {
         // ---- Ingest --------------------------------------------------------
-        let sha = match hash_file(&path) {
+        // Streams the whole file through SHA-256; off the async runtime so a
+        // large file can't starve other in-flight jobs' wakeups. A JoinError
+        // (blocking task panicked) is folded into the same anyhow::Result as
+        // a normal hash failure, so the existing error handling below covers
+        // both without unwrap-panicking the worker.
+        let hash_path = path.clone();
+        let hashed: anyhow::Result<String> =
+            match tokio::task::spawn_blocking(move || hash_file(&hash_path)).await {
+                Ok(r) => r,
+                Err(join_err) => Err(anyhow::anyhow!("hash task panicked: {join_err}")),
+            };
+        let sha = match hashed {
             Ok(h) => h,
             Err(e) => {
                 log::warn!("hash failed for {path:?}: {e} (sync race? will retry on next event)");
@@ -139,7 +150,18 @@ impl Pipeline {
         }
 
         // ---- Route ---------------------------------------------------------
-        let decision = routing::detect(&path);
+        // Reads header bytes + infers magic bytes; blocking file I/O, off the
+        // async runtime. sha is already known here, so a JoinError routes to
+        // flag/quarantine like any other routing failure would.
+        let route_path = path.clone();
+        let decision = match tokio::task::spawn_blocking(move || routing::detect(&route_path)).await {
+            Ok(d) => d,
+            Err(join_err) => {
+                self.flag(&sha, &path, format!("RUNTIME_FAIL:routing task panicked: {join_err}"))
+                    .await;
+                return;
+            }
+        };
         let _ = self.ledger.update_fields(
             &sha,
             &[("detected_type", Some(decision.detected_type.clone()))],
@@ -153,7 +175,19 @@ impl Pipeline {
         // PDF text-layer probe decides native vs scanned.
         let mut route = decision.route;
         if decision.detected_type == "application/pdf" {
-            match self.sidecar.pdf_probe(&path.to_string_lossy()) {
+            // Sidecar round-trip is blocking (stdin/stdout over a pipe with a
+            // recv_timeout inside); off the async runtime. A JoinError is
+            // folded into the anyhow::Result so it falls through the same
+            // "transient? one implicit retry via convert below" path as any
+            // other non-password pdf_probe error, unchanged from before.
+            let sidecar = self.sidecar.clone();
+            let p = path.to_string_lossy().to_string();
+            let probe: anyhow::Result<(u64, u64)> =
+                match tokio::task::spawn_blocking(move || sidecar.pdf_probe(&p)).await {
+                    Ok(r) => r,
+                    Err(join_err) => Err(anyhow::anyhow!("pdf_probe task panicked: {join_err}")),
+                };
+            match probe {
                 Ok((median, _pages)) => {
                     if median < PDF_TEXT_MEDIAN_CHARS {
                         route = Route::Scanned;
@@ -203,14 +237,26 @@ impl Pipeline {
         let _ = std::fs::write(&cache, &conv.markdown);
 
         // ---- Filter --------------------------------------------------------
+        // build_evidence itself makes several blocking sidecar round-trips
+        // (langid/classify/salience/ettin); run the whole thing off the async
+        // runtime. Clone the Arc<Sidecar> + an owned copy of the markdown and
+        // doc_meta_dates into the closure; a JoinError folds into the same
+        // anyhow::Result the fallible call already returns, so it flags like
+        // any other filter failure.
         let ettin_enabled = !self.cfg.ettin_model_dir.is_empty();
-        let filtered = match filter::build_evidence(
-            &self.sidecar,
-            &conv.markdown,
-            conv.doc_meta_dates.clone(),
-            ettin_enabled,
-            self.cfg.evidence_token_budget,
-        ) {
+        let sidecar = self.sidecar.clone();
+        let markdown = conv.markdown.clone();
+        let doc_meta_dates = conv.doc_meta_dates.clone();
+        let token_budget = self.cfg.evidence_token_budget;
+        let filtered: anyhow::Result<filter::FilterOutcome> = match tokio::task::spawn_blocking(move || {
+            filter::build_evidence(&sidecar, &markdown, doc_meta_dates, ettin_enabled, token_budget)
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(join_err) => Err(anyhow::anyhow!("build_evidence task panicked: {join_err}")),
+        };
+        let filtered = match filtered {
             Ok(f) => f,
             Err(e) => {
                 self.flag(&sha, &path, format!("RUNTIME_FAIL:filter {e}")).await;
@@ -324,18 +370,35 @@ impl Pipeline {
         let p = path.to_string_lossy().to_string();
         let (hp, tp) = (self.cfg.max_head_pages, self.cfg.max_tail_pages);
         for attempt in 1..=self.cfg.max_stage_attempts {
-            let result = match (route, attempt) {
-                // Native path: MarkItDown; attempt 3 falls through to raw
-                // pdfium text dump / OCR inside the sidecar's fallback op.
-                (Route::Native, 1 | 2) => self.sidecar.convert(&p, hp, tp),
-                (Route::Native, _) => self.sidecar.ocr(&p, 300, hp, tp),
-                // Scanned path: 300 DPI, then 400 DPI, then an enhanced
-                // 600 DPI + grayscale/autocontrast classical OCR pass (the
-                // sidecar selects it via the dpi=0 sentinel).
-                (Route::Scanned, 1) => self.sidecar.ocr(&p, 300, hp, tp),
-                (Route::Scanned, 2) => self.sidecar.ocr(&p, 400, hp, tp),
-                (Route::Scanned, _) => self.sidecar.ocr(&p, 0, hp, tp), // 0 = enhanced OCR
-                (Route::Flag, _) => unreachable!(),
+            // Clone the Arc<Sidecar> + an owned copy of the path per attempt
+            // so the blocking convert/OCR round-trip runs off the async
+            // runtime; convert_slots stays acquired around this whole loop in
+            // the async caller (process_inner), so the permit isn't held
+            // inside the blocking closure. A JoinError folds into the same
+            // anyhow::Result a normal convert/OCR failure returns, so it
+            // flows through the existing retry-then-flag logic below
+            // unchanged.
+            let sidecar = self.sidecar.clone();
+            let p2 = p.clone();
+            let result: anyhow::Result<ConvertResult> = match tokio::task::spawn_blocking(move || {
+                match (route, attempt) {
+                    // Native path: MarkItDown; attempt 3 falls through to raw
+                    // pdfium text dump / OCR inside the sidecar's fallback op.
+                    (Route::Native, 1 | 2) => sidecar.convert(&p2, hp, tp),
+                    (Route::Native, _) => sidecar.ocr(&p2, 300, hp, tp),
+                    // Scanned path: 300 DPI, then 400 DPI, then an enhanced
+                    // 600 DPI + grayscale/autocontrast classical OCR pass (the
+                    // sidecar selects it via the dpi=0 sentinel).
+                    (Route::Scanned, 1) => sidecar.ocr(&p2, 300, hp, tp),
+                    (Route::Scanned, 2) => sidecar.ocr(&p2, 400, hp, tp),
+                    (Route::Scanned, _) => sidecar.ocr(&p2, 0, hp, tp), // 0 = enhanced OCR
+                    (Route::Flag, _) => unreachable!(),
+                }
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(join_err) => Err(anyhow::anyhow!("convert/ocr task panicked: {join_err}")),
             };
             match result {
                 Ok(c) => {
@@ -766,5 +829,42 @@ mod tests {
         assert_eq!(id, manifest_id(&sha, "sub/dir/file.pdf"));
         // Distinct copies get distinct ids so each gets its own " (n)" row.
         assert_ne!(manifest_id(&sha, "a/one.pdf"), manifest_id(&sha, "a/two.pdf"));
+    }
+
+    // ---- async-hygiene regression coverage ---------------------------------
+    // process_inner no longer calls hash_file/routing::detect/sidecar ops
+    // directly; it moves owned args into tokio::task::spawn_blocking and
+    // folds a JoinError into the same anyhow::Result the direct call would
+    // have returned. These tests pin down that exact idiom.
+
+    #[tokio::test]
+    async fn hash_file_matches_when_run_via_spawn_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sample.txt");
+        std::fs::write(&file, b"backlog pipeline async hygiene").unwrap();
+
+        let direct = hash_file(&file).unwrap();
+
+        // Same call pattern process_inner now uses: an owned path clone moved
+        // into spawn_blocking, JoinError folded into an anyhow::Result.
+        let moved = file.clone();
+        let via_pool: anyhow::Result<String> =
+            match tokio::task::spawn_blocking(move || hash_file(&moved)).await {
+                Ok(r) => r,
+                Err(join_err) => Err(anyhow::anyhow!("hash task panicked: {join_err}")),
+            };
+        assert_eq!(direct, via_pool.unwrap());
+    }
+
+    #[tokio::test]
+    async fn spawn_blocking_panic_yields_joinerror_not_a_worker_panic() {
+        // Proves the JoinError-folding idiom used at every wrapped call site
+        // (hash_file, routing::detect, pdf_probe, convert/ocr, build_evidence)
+        // observes a panicking blocking task as a plain Err rather than the
+        // panic propagating into (and killing) the calling async task.
+        let handle: tokio::task::JoinHandle<()> =
+            tokio::task::spawn_blocking(|| panic!("simulated poison-pill blocking task"));
+        let outcome = handle.await;
+        assert!(outcome.is_err(), "a panicking spawn_blocking task must surface as Err(JoinError)");
     }
 }
