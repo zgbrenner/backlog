@@ -13,9 +13,9 @@ minutes aren't available:
 
 | Check | Command | Result |
 |---|---|---|
-| Trust-core tests | `cargo test -p backlog-core` | 13 pass, ~10s, no sidecars/app build |
-| Full workspace tests | `cargo test --workspace` (in `src-tauri/`) | 19 pass (13 core + 6 app: config + duplicate-key) |
-| Lints | `cargo clippy --workspace` | clean, 0 warnings |
+| Trust-core tests | `cargo test -p backlog-core` | 15 pass, ~10s, no sidecars/app build |
+| Full workspace tests | `cargo test --workspace` (in `src-tauri/`) | 52 pass (15 core + 37 app), incl. the ledger encryption-at-rest proof |
+| Lints | `cargo clippy --workspace --all-targets` | clean, 0 warnings |
 | Frontend build | `npm run build` | passes (`tsc && vite build`) |
 | Python | `python -m py_compile` on changed files | clean |
 
@@ -118,10 +118,13 @@ Ordered roughly by priority.
 > torch/transformers/sentence-transformers/gliclass, ~3x smaller Python
 > dependency footprint; `classify`/`salience`/`ettin_spans` degrade to
 > deterministic `ok=true` fallbacks instead of the gliclass/granite/Ettin
-> naming enhancements -- see `docs/DEPENDENCY_COMPATIBILITY.md`). Still open:
-> install-and-run validation on a clean machine with the models; encryption at
-> rest for the ledger; the async-hygiene (`spawn_blocking`) refinement; an
-> in-flight claim; the dev-only Vite advisory; and an auto-updater.
+> naming enhancements -- see `docs/DEPENDENCY_COMPATIBILITY.md`); and
+> **encryption at rest for the ledger** (item 5 below, now done: SQLCipher via
+> `rusqlite`'s `bundled-sqlcipher-vendored-openssl`, keyed by a random
+> 256-bit key DPAPI-protected at `<data_dir>/ledger.key`). Still open:
+> install-and-run validation on a clean machine with the models; the
+> async-hygiene (`spawn_blocking`) refinement; an in-flight claim; the
+> dev-only Vite advisory; and an auto-updater.
 
 1. **Real app icon.** `icons/icon.{png,ico}` is a 32×32 placeholder. Supply a
    1024×1024 source and run `npm run tauri icon <source.png>` to generate the
@@ -139,12 +142,23 @@ Ordered roughly by priority.
    bounds any single wedge, but wrapping those blocking calls in
    `tokio::task::spawn_blocking` would keep the async workers free during a large
    backfill. Worth doing, but validate with a real multi-thousand-file load test.
-5. **Encryption at rest (privacy product).** The SQLite ledger and manifests
-   hold *derived* PII (proposed subjects, filenames, local paths) unencrypted.
-   The cache no longer holds raw document bodies, but for a privacy-first product
-   consider SQLCipher / an OS-keystore-derived key for the ledger and a retention
-   policy for the `events` table. (Manifests intentionally carry names to Power
-   Automate — confirm the SharePoint side handles them appropriately.)
+5. **Encryption at rest (privacy product). DONE for the ledger.** `ledger.db`
+   (proposed subjects, descriptions, filenames, local paths, `events`) is now
+   whole-file encrypted via SQLCipher (`rusqlite`'s
+   `bundled-sqlcipher-vendored-openssl` feature — vendors + builds OpenSSL, no
+   system install needed). The key is a random 256-bit value generated on
+   first `Ledger::open`, DPAPI-protected (`CryptProtectData`, decryptable only
+   by the same Windows user/machine) and stored at `<data_dir>/ledger.key` —
+   never written to disk in plaintext (`src-tauri/src/dbkey.rs`). A
+   pre-encryption plaintext dev db is moved aside to `ledger.db.plaintext.bak`
+   (WAL checkpointed first) rather than migrated or destroyed, since this is a
+   pilot with no production data on it yet. Proven by
+   `ledger::tests::ledger_db_is_encrypted_at_rest_and_key_persists`, which
+   inspects the raw file bytes for the absent SQLite header and an absent
+   plaintext PII marker, plus a same-key round-trip read. Still open: a
+   retention policy for the `events` table, and manifests (which intentionally
+   carry names to Power Automate — confirm the SharePoint side handles them
+   appropriately) are unencrypted at rest on disk before pickup.
 6. **In-flight claim.** The same path enqueued twice (startup sweep + a
    filesystem event) can be driven concurrently. Debounce + the content-hash key
    make this rare and the Flow 2 gate is idempotent, but an in-memory in-flight

@@ -15,6 +15,17 @@ locally before the release is uploaded.
 
 - **Rust** stable + the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/)
   (MSVC build tools, WebView2 — preinstalled on Windows 11).
+- **A Windows-native Perl + NASM** for the vendored OpenSSL build that backs
+  `rusqlite`'s `bundled-sqlcipher-vendored-openssl` feature (the ledger is
+  SQLCipher-encrypted at rest — see `src-tauri/src/dbkey.rs`). MSYS/Git-Bash's
+  `perl` gets picked up first if it's earlier on `PATH` and the OpenSSL build
+  fails cryptically; put a native perl (e.g. [Strawberry
+  Perl](https://strawberryperl.com/)) and `nasm` ahead of it for the build:
+  ```bash
+  export PATH="/c/Strawberry/perl/bin:/c/Strawberry/c/bin:$PATH"
+  ```
+  This first build compiles OpenSSL from source and takes several minutes;
+  subsequent builds are incremental and fast.
 - **Node 18+**.
 - **Python 3.11** for the sidecar. The ML dependencies (onnxruntime, rapidocr)
   have **no 3.13/3.14 wheels**, so 3.11 is required even if your default
