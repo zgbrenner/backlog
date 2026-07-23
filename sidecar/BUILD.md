@@ -17,6 +17,7 @@ pyinstaller --onefile --name convertd \
   --collect-all rapidocr \
   --collect-all lingua \
   --collect-all markitdown \
+  --collect-all magika \
   --collect-all pypdfium2 \
   --hidden-import onnxruntime \
   convertd.py

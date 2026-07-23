@@ -163,9 +163,17 @@ impl SlmLane {
             "stream": false,
             "cache_prompt": false,
             "chat_template_kwargs": {"enable_thinking": false},
+            // llama.cpp (and OpenAI) require the schema nested under
+            // `json_schema`; a bare `schema` key is silently ignored, leaving
+            // the output unconstrained (it dropped required fields -> parse
+            // failure -> SLM_FAIL).
             "response_format": {
                 "type": "json_schema",
-                "schema": Self::response_schema()
+                "json_schema": {
+                    "name": "backlog_document_name",
+                    "strict": true,
+                    "schema": Self::response_schema()
+                }
             }
         })
     }
@@ -216,8 +224,8 @@ impl SlmLane {
              Today's date: {today}. Document language: {language}. Classified type: {doc_type}.\n\
              Do not reveal reasoning. Return only the requested JSON object.\n\
              Rules:\n\
-             - date: choose the document's own date in YYYY-MM-DD only from dates visible in the evidence. If no date is visible, use none.\n\
-             - date_source: document when visible in document text, metadata when visible only in file metadata, or none when there is no date.\n\
+             - date: extract the date written IN the document body (for example a letter date, filing date, or effective date), formatted YYYY-MM-DD. Do NOT use today's date. Use none only if the body contains no date at all.\n\
+             - date_source: use document when the date appears in the body text; use metadata only when the body has no date of its own; use none when no date exists.\n\
              - subject: 3 to 8 specific words naming the document type and key party or matter. Never use generic names such as Document or Scan.\n\
              - description: exactly one sentence, 15 to 200 characters, adding useful information beyond the subject.\n\
              Never invent dates, parties, or facts."
@@ -275,8 +283,9 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
         assert_eq!(
-            body["response_format"]["schema"]["additionalProperties"],
+            body["response_format"]["json_schema"]["schema"]["additionalProperties"],
             false
         );
     }
