@@ -24,9 +24,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
     "icon": ["icons/icon.png"],
     "externalBin": ["binaries/convertd", "binaries/llama-server"],
-    "resources": ["resources/*"]
+    "resources": {
+      "resources/*": "resources/",
+      "binaries/*.dll": "./"
+    }
   }
 }
