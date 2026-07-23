@@ -46,6 +46,18 @@ class ModelSpecTests(unittest.TestCase):
         self.assertNotIn("lid.176", serialized)
         self.assertNotIn("ettin", serialized)
 
+    def test_torch_only_naming_enhancements_are_absent_from_the_slim_bundle(self):
+        # gliclass (doc-type classification) and granite (salience
+        # embeddings) are torch-only naming enhancements that convertd.py
+        # degrades gracefully without; the slim sidecar bundle never fetches
+        # them. See docs/DEPENDENCY_COMPATIBILITY.md.
+        serialized = json.dumps(
+            [spec.__dict__ for spec in DOWNLOAD.MODEL_SPECS]
+        ).lower()
+        self.assertNotIn("gliclass", serialized)
+        self.assertNotIn("granite", serialized)
+        self.assertEqual(len(DOWNLOAD.MODEL_SPECS), 2)
+
 
 class LockVerificationTests(unittest.TestCase):
     def test_valid_lock_passes(self):

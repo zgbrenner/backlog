@@ -37,8 +37,10 @@ pub struct Sidecar {
     /// `with_models_dir`). `None` leaves convertd.py's own default in effect
     /// (dev layout: `../models` beside the sidecar executable) — every
     /// production call site sets this via `model_download::resolve_models_dir`
-    /// so an installed app's gliclass/granite files, which live under
-    /// app-data rather than beside the exe, are actually found.
+    /// so an installed app's `models.lock.json` and any optional local model
+    /// snapshots (the slim sidecar profile ships none by default -- see
+    /// `sidecar/convertd.py`'s `_gliclass`/`_granite` loaders), which live
+    /// under app-data rather than beside the exe, are actually found.
     models_dir: Option<std::path::PathBuf>,
     inner: Mutex<Option<Proc>>,
     counter: std::sync::atomic::AtomicU64,

@@ -9,9 +9,11 @@
 //! Layout on disk mirrors `models/download_models.py`'s targets one-to-one:
 //! the two Qwen GGUFs land wherever `Config::slm_primary_gguf` /
 //! `slm_escalation_gguf` point (normally `app_data/models/…`, see
-//! [`resolve_configured_model_path`]), and the gliclass/granite files land
-//! under `<models_dir>/<target>` where `<models_dir>` is exactly what
-//! `sidecar.rs` injects into the convertd sidecar's `BACKLOG_MODELS_DIR`.
+//! [`resolve_configured_model_path`]). That's the whole bundle: the slim,
+//! torch-free sidecar profile ships without the gliclass/granite naming
+//! enhancements (see `sidecar/convertd.py`'s `_gliclass`/`_granite` loaders
+//! and `docs/DEPENDENCY_COMPATIBILITY.md`), so there are no torch-only model
+//! snapshots left to fetch or verify here.
 
 use crate::AppState;
 use serde::Serialize;
@@ -37,14 +39,11 @@ const HF_HOST: &str = "https://huggingface.co";
 /// use, and doubles as this downloader's lock key so the two tools describe
 /// the same bundle in the same vocabulary.
 ///
-/// `download_models.py` fetches the gliclass/granite entries with
-/// `snapshot_download`, which mirrors the *entire* upstream repo (READMEs,
-/// `.gitattributes`, and — for granite — a `pytorch_model.bin` that
-/// duplicates `model.safetensors` in a different format). This list instead
-/// curates just the files `sidecar/convertd.py`'s `_gliclass`/`_granite`
-/// loaders actually open, which is what keeps a fresh install close to the
-/// size the UI quotes rather than paying for docs and a redundant weights
-/// copy. Verified against the live repo trees on 2026-07-22.
+/// The slim, torch-free sidecar profile has no gliclass/granite model
+/// snapshots to fetch (see `sidecar/convertd.py`'s `_gliclass`/`_granite`
+/// loaders, which degrade to deterministic fallbacks when those libraries or
+/// snapshots are absent), so this list is just the two Apache-2.0 Qwen3
+/// GGUFs. Verified against the live repo trees on 2026-07-22.
 pub struct ModelFile {
     pub repo: &'static str,
     pub hf_path: &'static str,
@@ -57,7 +56,9 @@ pub struct ModelFile {
 }
 
 pub const MODEL_FILES: &[ModelFile] = &[
-    // Apache-2.0 Qwen3 GGUFs served by llama.cpp.
+    // Apache-2.0 Qwen3 GGUFs served by llama.cpp. This is the whole bundle
+    // on the slim, torch-free sidecar profile -- no gliclass/granite
+    // snapshots to fetch (see the module doc comment above).
     ModelFile {
         repo: "Qwen/Qwen3-0.6B-GGUF",
         hf_path: PRIMARY_GGUF_NAME,
@@ -69,98 +70,6 @@ pub const MODEL_FILES: &[ModelFile] = &[
         hf_path: ESCALATION_GGUF_NAME,
         target: ESCALATION_GGUF_NAME,
         size_hint: 1_834_426_016,
-    },
-    // Zero-shot document classification (knowledgator/gliclass-base-v3.0).
-    ModelFile {
-        repo: "knowledgator/gliclass-base-v3.0",
-        hf_path: "config.json",
-        target: "gliclass-base-v3.0/config.json",
-        size_hint: 3_493,
-    },
-    ModelFile {
-        repo: "knowledgator/gliclass-base-v3.0",
-        hf_path: "added_tokens.json",
-        target: "gliclass-base-v3.0/added_tokens.json",
-        size_hint: 67,
-    },
-    ModelFile {
-        repo: "knowledgator/gliclass-base-v3.0",
-        hf_path: "special_tokens_map.json",
-        target: "gliclass-base-v3.0/special_tokens_map.json",
-        size_hint: 970,
-    },
-    ModelFile {
-        repo: "knowledgator/gliclass-base-v3.0",
-        hf_path: "tokenizer_config.json",
-        target: "gliclass-base-v3.0/tokenizer_config.json",
-        size_hint: 1_692,
-    },
-    ModelFile {
-        repo: "knowledgator/gliclass-base-v3.0",
-        hf_path: "spm.model",
-        target: "gliclass-base-v3.0/spm.model",
-        size_hint: 2_464_616,
-    },
-    ModelFile {
-        repo: "knowledgator/gliclass-base-v3.0",
-        hf_path: "tokenizer.json",
-        target: "gliclass-base-v3.0/tokenizer.json",
-        size_hint: 8_649_234,
-    },
-    ModelFile {
-        repo: "knowledgator/gliclass-base-v3.0",
-        hf_path: "model.safetensors",
-        target: "gliclass-base-v3.0/model.safetensors",
-        size_hint: 746_211_800,
-    },
-    // Salience embeddings (ibm-granite/granite-embedding-small-english-r2).
-    ModelFile {
-        repo: "ibm-granite/granite-embedding-small-english-r2",
-        hf_path: "config.json",
-        target: "granite-embedding-small-english-r2/config.json",
-        size_hint: 1_315,
-    },
-    ModelFile {
-        repo: "ibm-granite/granite-embedding-small-english-r2",
-        hf_path: "modules.json",
-        target: "granite-embedding-small-english-r2/modules.json",
-        size_hint: 230,
-    },
-    ModelFile {
-        repo: "ibm-granite/granite-embedding-small-english-r2",
-        hf_path: "sentence_bert_config.json",
-        target: "granite-embedding-small-english-r2/sentence_bert_config.json",
-        size_hint: 55,
-    },
-    ModelFile {
-        repo: "ibm-granite/granite-embedding-small-english-r2",
-        hf_path: "special_tokens_map.json",
-        target: "granite-embedding-small-english-r2/special_tokens_map.json",
-        size_hint: 694,
-    },
-    ModelFile {
-        repo: "ibm-granite/granite-embedding-small-english-r2",
-        hf_path: "tokenizer_config.json",
-        target: "granite-embedding-small-english-r2/tokenizer_config.json",
-        size_hint: 20_836,
-    },
-    ModelFile {
-        repo: "ibm-granite/granite-embedding-small-english-r2",
-        hf_path: "tokenizer.json",
-        target: "granite-embedding-small-english-r2/tokenizer.json",
-        size_hint: 3_583_228,
-    },
-    ModelFile {
-        repo: "ibm-granite/granite-embedding-small-english-r2",
-        hf_path: "1_Pooling/config.json",
-        target: "granite-embedding-small-english-r2/1_Pooling/config.json",
-        size_hint: 191,
-    },
-    ModelFile {
-        repo: "ibm-granite/granite-embedding-small-english-r2",
-        hf_path: "model.safetensors",
-        target: "granite-embedding-small-english-r2/model.safetensors",
-        size_hint: 95_332_048,
     },
 ];
 
@@ -622,19 +531,6 @@ mod tests {
     }
 
     #[test]
-    fn download_targets_routes_directory_files_under_models_dir() {
-        let models_dir = Path::new("/app-data/models");
-        let targets = download_targets(models_dir, Path::new("/x/p.gguf"), Path::new("/x/e.gguf"));
-        let gliclass_config = targets.iter().find(|t| t.key == "gliclass-base-v3.0/config.json").unwrap();
-        assert_eq!(gliclass_config.dest, models_dir.join("gliclass-base-v3.0/config.json"));
-        let pooling = targets
-            .iter()
-            .find(|t| t.key == "granite-embedding-small-english-r2/1_Pooling/config.json")
-            .unwrap();
-        assert_eq!(pooling.dest, models_dir.join("granite-embedding-small-english-r2/1_Pooling/config.json"));
-    }
-
-    #[test]
     fn download_targets_covers_every_spec_entry_exactly_once() {
         let targets = download_targets(Path::new("/m"), Path::new("/p.gguf"), Path::new("/e.gguf"));
         assert_eq!(targets.len(), MODEL_FILES.len());
@@ -642,8 +538,8 @@ mod tests {
 
     #[test]
     fn part_path_appends_suffix_without_losing_the_original_name() {
-        let dest = Path::new("/app-data/models/gliclass-base-v3.0/model.safetensors");
-        assert_eq!(part_path_for(dest), Path::new("/app-data/models/gliclass-base-v3.0/model.safetensors.part"));
+        let dest = Path::new("/app-data/models/Qwen3-1.7B-Q8_0.gguf");
+        assert_eq!(part_path_for(dest), Path::new("/app-data/models/Qwen3-1.7B-Q8_0.gguf.part"));
     }
 
     #[test]

@@ -12,9 +12,18 @@ Operations:
   ocr           {path, dpi, head_pages, tail_pages} -> ConvertResult
                 dpi=0 selects enhanced 600-DPI classical OCR
   langid        {text} -> {lang}
-  classify      {text, labels} -> {label, score}
-  salience      {sentences, probes, top_k} -> {indices}
+  classify      {text, labels} -> {label, score, available}
+  salience      {sentences, probes, top_k} -> {indices, available}
   ettin_spans   {text} -> {spans}
+
+classify, salience, and ettin_spans are naming ENHANCEMENTS layered on top of
+the deterministic harvest. This is the slim, torch-free sidecar profile:
+gliclass/transformers/sentence-transformers are not installed (and, even on a
+full install, the gliclass/granite model snapshots or BACKLOG_ETTIN_DIR may
+be absent). All three ops degrade to cheap deterministic fallbacks instead of
+failing -- ok=true always, with available:false on classify/salience when the
+real model wasn't used -- so a missing enhancement lane never flags a
+document as a processing failure upstream.
 """
 
 from __future__ import annotations
@@ -41,12 +50,36 @@ _DEFAULT_MODELS_DIR = (
 MODELS_DIR = Path(os.environ.get("BACKLOG_MODELS_DIR", _DEFAULT_MODELS_DIR))
 VERSION = "0.2.0"
 _CACHE: dict[str, object] = {}
+_UNAVAILABLE = object()  # sentinel: an optional loader's factory raised once
 
 
 def _get(name: str, factory):
     if name not in _CACHE:
         _CACHE[name] = factory()
     return _CACHE[name]
+
+
+def _get_optional(name: str, factory):
+    """Like `_get`, but for OPTIONAL naming-enhancement components only
+    (gliclass classify, granite salience, ettin spans) -- never for the core
+    pipeline (markitdown/pdfium/rapidocr/lingua), which must keep failing
+    loudly if genuinely broken.
+
+    A missing library (ImportError, when torch/transformers/gliclass/
+    sentence-transformers aren't installed -- the slim sidecar profile) or a
+    missing/corrupt local model snapshot (OSError and friends) is caught and
+    cached as unavailable, so the expensive import/load is attempted at most
+    once per process rather than retried on every request. Returns None when
+    unavailable; callers treat None as "fall back to the deterministic
+    default".
+    """
+    if name not in _CACHE:
+        try:
+            _CACHE[name] = factory()
+        except Exception:
+            _CACHE[name] = _UNAVAILABLE
+    value = _CACHE[name]
+    return None if value is _UNAVAILABLE else value
 
 
 def _markitdown():
@@ -92,6 +125,11 @@ def _language_detector():
 
 
 def _gliclass():
+    """Zero-shot doc-type classifier. Returns None (and op_classify falls
+    back to a deterministic default) when gliclass/transformers aren't
+    installed -- always true on the slim sidecar profile -- or the local
+    gliclass-base-v3.0 snapshot under MODELS_DIR is absent."""
+
     def create():
         from gliclass import GLiClassModel, ZeroShotClassificationPipeline
         from transformers import AutoTokenizer
@@ -106,10 +144,15 @@ def _gliclass():
             device="cpu",
         )
 
-    return _get("gliclass", create)
+    return _get_optional("gliclass", create)
 
 
 def _granite():
+    """Sentence-embedding model for salience ranking. Returns None (and
+    op_salience falls back to document order) when sentence-transformers
+    isn't installed -- always true on the slim sidecar profile -- or the
+    local granite-embedding-small-english-r2 snapshot is absent."""
+
     def create():
         from sentence_transformers import SentenceTransformer
 
@@ -118,10 +161,15 @@ def _granite():
             device="cpu",
         )
 
-    return _get("granite", create)
+    return _get_optional("granite", create)
 
 
 def _ettin():
+    """Fine-tuned span extractor. Returns None (and op_ettin_spans falls
+    back to no spans) when BACKLOG_ETTIN_DIR is unset/missing, or when
+    transformers isn't installed -- always true on the slim sidecar profile
+    -- even if a directory was configured."""
+
     def create():
         ettin_dir = os.environ.get("BACKLOG_ETTIN_DIR", "")
         if not ettin_dir or not Path(ettin_dir).is_dir():
@@ -135,7 +183,7 @@ def _ettin():
             device=-1,
         )
 
-    return _get("ettin", create)
+    return _get_optional("ettin", create)
 
 
 # ---------------------------------------------------------------------------
@@ -425,14 +473,38 @@ def op_langid(args: dict) -> dict:
     return {"lang": _language_code(language)}
 
 
+_CLASSIFY_FALLBACK_LABEL = "correspondence"
+
+
+def _classify_fallback(labels: list) -> dict:
+    """Neutral default when gliclass is unavailable or a live inference
+    call fails: pick "correspondence" if it's in the offered label set (it
+    always is for BackLog's own taxonomy, filter.rs::default_labels), else
+    the first offered label, so the caller's downstream logic always gets a
+    member of the set it asked about."""
+    label = _CLASSIFY_FALLBACK_LABEL if _CLASSIFY_FALLBACK_LABEL in labels else labels[0]
+    return {"label": label, "score": 0.0, "available": False}
+
+
 def op_classify(args: dict) -> dict:
     text = (args.get("text") or "")[:3000]
-    labels = args.get("labels") or ["correspondence"]
-    results = _gliclass()(text, labels, threshold=0.0)[0]
+    labels = args.get("labels") or [_CLASSIFY_FALLBACK_LABEL]
+    pipeline = _gliclass()
+    if pipeline is None:
+        return _classify_fallback(labels)
+
+    try:
+        results = pipeline(text, labels, threshold=0.0)[0]
+    except Exception:
+        # A live model that errors mid-inference (bad snapshot, OOM, etc.)
+        # degrades exactly like an absent one -- classify must never bubble
+        # an error up to the Rust pipeline and flag the document.
+        return _classify_fallback(labels)
+
     if not results:
-        return {"label": "correspondence", "score": 0.0}
+        return {"label": _CLASSIFY_FALLBACK_LABEL, "score": 0.0, "available": True}
     best = max(results, key=lambda result: result["score"])
-    return {"label": best["label"], "score": float(best["score"])}
+    return {"label": best["label"], "score": float(best["score"]), "available": True}
 
 
 def op_salience(args: dict) -> dict:
@@ -444,19 +516,29 @@ def op_salience(args: dict) -> dict:
     if not sentences:
         return {"indices": []}
 
+    def document_order_fallback() -> dict:
+        return {"indices": list(range(min(top_k, len(sentences)))), "available": False}
+
     model = _granite()
-    sentence_embeddings = model.encode(
-        sentences,
-        normalize_embeddings=True,
-    )
-    scores = np.zeros(len(sentences))
-    if probes:
-        probe_embeddings = model.encode(probes, normalize_embeddings=True)
-        scores += (sentence_embeddings @ probe_embeddings.T).max(axis=1)
-    centroid = sentence_embeddings.mean(axis=0)
-    centroid /= np.linalg.norm(centroid) + 1e-9
-    scores += 0.5 * (sentence_embeddings @ centroid)
-    return {"indices": np.argsort(-scores)[:top_k].tolist()}
+    if model is None:
+        return document_order_fallback()
+
+    try:
+        sentence_embeddings = model.encode(
+            sentences,
+            normalize_embeddings=True,
+        )
+        scores = np.zeros(len(sentences))
+        if probes:
+            probe_embeddings = model.encode(probes, normalize_embeddings=True)
+            scores += (sentence_embeddings @ probe_embeddings.T).max(axis=1)
+        centroid = sentence_embeddings.mean(axis=0)
+        centroid /= np.linalg.norm(centroid) + 1e-9
+        scores += 0.5 * (sentence_embeddings @ centroid)
+    except Exception:
+        return document_order_fallback()
+
+    return {"indices": np.argsort(-scores)[:top_k].tolist(), "available": True}
 
 
 def _normalize_span_date(text: str) -> str | None:
@@ -486,7 +568,12 @@ def op_ettin_spans(args: dict) -> dict:
     if extractor is None:
         return {"spans": []}
 
-    raw = extractor((args.get("text") or "")[:8000])
+    try:
+        raw = extractor((args.get("text") or "")[:8000])
+    except Exception:
+        # Mirrors classify/salience: a live extractor that errors mid-
+        # inference degrades to no spans rather than failing the op.
+        return {"spans": []}
     spans = []
     for item in raw:
         label = item.get("entity_group") or item.get("entity") or ""

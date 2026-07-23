@@ -14,6 +14,19 @@ and the independent reproducibility contribution.
 > fields -> resubmit). (Historical planning docs
 > from the prior effort, including `ARCHITECTURE_AMENDMENTS.md`, were not
 > carried over here.)
+>
+> **Slim, torch-free sidecar has also landed.** `torch`, `transformers`,
+> `sentence-transformers`, and `gliclass` are removed from
+> `sidecar/requirements.in`/`requirements.txt`/`requirements.lock`, cutting the
+> sidecar's Python dependency footprint roughly 3x (torch alone was ~500 MB
+> installed). This drops the GLiClass doc-type `classify` lane and the
+> Granite-embedding `salience` lane from the shipped bundle; both ops in
+> `sidecar/convertd.py` degrade to `ok=true` deterministic fallbacks
+> (`available: false`) rather than erroring, so the core pipeline (convert,
+> OCR, language ID, harvest, naming, checker) is unaffected and no document is
+> ever flagged over a missing naming enhancement. `models/download_models.py`
+> and `src-tauri/src/model_download.rs` now fetch only the two Qwen3 GGUFs.
+> See `docs/DEPENDENCY_COMPATIBILITY.md` for the full rationale.
 
 ## Implemented in source
 
@@ -39,8 +52,10 @@ and the independent reproducibility contribution.
   untracked, and unsafe paths;
 - locked npm inputs, pinned Rust 1.97.1 metadata, local build diagnostics, and a
   hash-pinned Windows NSIS packaging workflow;
-- Tauri Windows resource mapping for the verified Qwen, GLiClass, Granite, and
-  model-lock assets;
+- in-app, hash-verified downloader (and the equivalent `models/download_models.py`
+  staging script) for the two Qwen3 GGUFs and `models.lock.json`, landing under
+  the installed app's data directory (the slim, torch-free sidecar profile
+  fetches no GLiClass/Granite snapshots -- see `docs/DEPENDENCY_COMPATIBILITY.md`);
 - dependency, security, pilot, release, and architecture-amendment documents.
 
 ## Locally executed validation

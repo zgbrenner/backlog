@@ -81,15 +81,14 @@ try {
 
     # 3. Freeze convertd.py. --collect-all pulls the data files PyInstaller
     #    otherwise misses (model loaders, native libs, version metadata).
-    Write-Host "Running PyInstaller (this is slow; torch ships inside)..." -ForegroundColor Cyan
+    #    Slim, torch-free profile: no torch/transformers/sentence_transformers/
+    #    gliclass --collect-all entries. classify/salience/ettin_spans degrade
+    #    to deterministic fallbacks at runtime instead (see convertd.py).
+    Write-Host "Running PyInstaller (slim, torch-free profile)..." -ForegroundColor Cyan
     & $VenvPy -m PyInstaller --clean --noconfirm --onefile --name convertd `
         --collect-all rapidocr `
         --collect-all lingua `
-        --collect-all gliclass `
         --collect-all markitdown `
-        --collect-all torch `
-        --collect-all transformers `
-        --collect-all sentence_transformers `
         --collect-all pypdfium2 `
         --hidden-import onnxruntime `
         convertd.py

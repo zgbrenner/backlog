@@ -10,6 +10,26 @@
 > the Qwen3 + Lingua + RapidOCR set described below. Do not publish a public
 > model bundle until the redistribution gate at the bottom of this document is
 > also complete.
+>
+> **Slim, torch-free sidecar.** `torch`, `transformers`, `sentence-transformers`,
+> and `gliclass` have been **removed** from `sidecar/requirements.in`/
+> `requirements.txt` (previously ~1.1 GB of the sidecar's Python
+> dependencies, torch alone ~500 MB installed). This drops the GLiClass
+> doc-type `classify` lane and the Granite-embedding `salience` lane; the
+> Ettin span lane was already optional and disabled by default
+> (`BACKLOG_ETTIN_DIR` unset). `sidecar/convertd.py`'s `_gliclass`/`_granite`/
+> `_ettin` loaders catch the resulting `ImportError` (or a missing/corrupt
+> local model snapshot) and cache it as "unavailable"; `op_classify` returns
+> `ok=true` with a neutral default label (`"correspondence"`, `score: 0.0`,
+> `available: false`), `op_salience` returns `ok=true` with the first `top_k`
+> sentence indices in document order (`available: false`), and
+> `op_ettin_spans` returns `ok=true` with `{"spans": []}`. No op ever returns
+> `ok=false` over a missing enhancement, so `src-tauri/src/filter.rs`'s
+> `build_evidence` never flags a document over it: naming quality degrades
+> slightly (a generic doc-type hint, unranked evidence) but conversion, OCR,
+> language ID, and naming keep working. `models/download_models.py` and
+> `src-tauri/src/model_download.rs::MODEL_FILES` fetch only the two Qwen3
+> GGUFs now.
 
 BackLog is an offline desktop application, but its installer and model bundle
 combine several independently licensed projects. Pin exact artifacts and hashes
@@ -26,11 +46,11 @@ requirements for the intended audience have been reviewed.
 | Qwen3-1.7B GGUF | `Qwen3-1.7B-Q8_0.gguf`, escalation tier | Official Qwen repository, Apache-2.0. Same lock and notice rule. |
 | RapidOCR | Unified `rapidocr` 3.x result-object API with legacy tuple normalization | Supported. The deprecated `rapidocr-onnxruntime` distribution is not used. The final retry is enhanced 600-DPI classical OCR, not a separately licensed vision-language model. |
 | Lingua 2.1.1 | Offline language identification with ISO 639-1 output | Apache-2.0 and Python 3.11 compatible. Packaged inside `convertd`; no external language weight file is downloaded at runtime. |
-| GLiClass | `gliclass>=0.1.18,<0.2` with a complete local snapshot | Apache-2.0 model and library. Version floor includes the supported Transformers 5 API surface. |
-| Granite embedding small English R2 | Complete local sentence-transformers directory | Apache-2.0. Preserve the complete snapshot and lock every payload file. |
-| Ettin encoder 32M | Training base for a locally trained token-classification head | MIT. The raw encoder is not an extractor. Leave the runtime lane disabled until a trained directory passes the documented F1 gates. |
+| GLiClass | Not shipped in the slim sidecar profile | Removed from `sidecar/requirements.txt`. `sidecar/convertd.py::op_classify` degrades to `ok=true` with a neutral default label (`available: false`) when gliclass/transformers are absent, which they always are on this profile. See "Deliberately excluded" below. |
+| Granite embedding small English R2 | Not shipped in the slim sidecar profile | Removed from `sidecar/requirements.txt` (needs sentence-transformers, which needs torch). `sidecar/convertd.py::op_salience` degrades to `ok=true` with document-order sentence indices (`available: false`). See "Deliberately excluded" below. |
+| Ettin encoder 32M | Training base for a locally trained token-classification head | MIT. The raw encoder is not an extractor. Leave the runtime lane disabled until a trained directory passes the documented F1 gates. `sidecar/convertd.py::op_ettin_spans` returns `ok=true` with `{"spans": []}` whenever `BACKLOG_ETTIN_DIR` is unset (the default) or transformers is absent (always true on the slim profile). |
 | MarkItDown | `MarkItDown(enable_plugins=False).convert(...).text_content` | Supported by the reviewed 0.1.x range. Review transitive format-parser licenses in the frozen sidecar SBOM. |
-| Python sidecar | 64-bit Python 3.11, PyInstaller 6.x, offline Hugging Face/Transformers environment | Windows pilot contract. The app injects the installed model resource directory through `BACKLOG_MODELS_DIR`. |
+| Python sidecar | 64-bit Python 3.11, PyInstaller 6.x, offline Hugging Face Hub environment, **no torch/transformers/sentence-transformers/gliclass** (the slim, torch-free profile) | Windows pilot contract. The app injects the installed model resource directory through `BACKLOG_MODELS_DIR`. `huggingface_hub` stays a listed dependency (it's a lightweight pure-Python HTTP client with no torch pull-through) even though `convertd.py` doesn't import it directly today; `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`/`HF_DATASETS_OFFLINE` remain forced regardless. |
 
 ## Primary upstream references
 
@@ -41,9 +61,9 @@ requirements for the intended audience have been reviewed.
 - Qwen3 1.7B GGUF: <https://huggingface.co/Qwen/Qwen3-1.7B-GGUF>
 - RapidOCR: <https://github.com/RapidAI/RapidOCR>
 - Lingua Python: <https://github.com/pemistahl/lingua-py>
-- GLiClass: <https://github.com/Knowledgator/GLiClass>
-- Granite embeddings: <https://huggingface.co/ibm-granite/granite-embedding-small-english-r2>
-- Ettin: <https://huggingface.co/jhu-clsp/ettin-encoder-32m>
+- GLiClass (not shipped; naming enhancement only): <https://github.com/Knowledgator/GLiClass>
+- Granite embeddings (not shipped; naming enhancement only): <https://huggingface.co/ibm-granite/granite-embedding-small-english-r2>
+- Ettin (not shipped; optional trained lane only): <https://huggingface.co/jhu-clsp/ettin-encoder-32m>
 - MarkItDown: <https://github.com/microsoft/markitdown>
 
 ## Deliberately excluded from the distributable runtime
@@ -55,6 +75,14 @@ requirements for the intended audience have been reviewed.
   installer.
 - The old `rapidocr-onnxruntime` Python distribution, because current RapidOCR
   consolidates the runtime API in the `rapidocr` package.
+- `torch`, `transformers`, `sentence-transformers`, and `gliclass` (and, by
+  extension, the GLiClass doc-type classifier and Granite embedding model),
+  because dropping them cuts the sidecar's Python dependency footprint by
+  roughly 3x (torch alone was ~500 MB installed) and they are only used by
+  optional naming enhancements. `sidecar/convertd.py`'s `classify` and
+  `salience` ops degrade to deterministic, dependency-free fallbacks instead
+  of failing -- see the "Slim, torch-free sidecar" note at the top of this
+  document.
 
 ## Redistribution gate
 

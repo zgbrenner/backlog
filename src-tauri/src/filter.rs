@@ -1,9 +1,19 @@
 //! §5: evidence filter. Assembles the bundle the SLM actually reads:
 //!   5a deterministic harvest (always)
-//!   5b language gate (fastText, sidecar)
+//!   5b language gate (Lingua, sidecar)
 //!   5c doc-type classification (GLiClass, sidecar) -> subject template + probes
 //!   5d salience ranking (granite embeddings, sidecar) -> only when 5a is thin
 //!   5e Ettin span proposals (fine-tuned token classifier, sidecar, optional)
+//!
+//! 5c and 5d are naming ENHANCEMENTS, not requirements: the shipped sidecar
+//! is the slim, torch-free profile (no gliclass/transformers/
+//! sentence-transformers), so `sidecar.classify`/`sidecar.salience` normally
+//! return convertd.py's deterministic fallbacks (a neutral doc_type,
+//! document-order sentences) rather than erroring -- see
+//! `sidecar/convertd.py`'s `op_classify`/`op_salience`. The `unwrap_or_else`/
+//! `if let Ok` below are the second line of defense for the rarer case of a
+//! transport-level sidecar error (timeout, crash), so this function still
+//! never fails the pipeline over 5c/5d.
 //! Budget-bounded: chars/4 as the token approximation.
 
 use crate::harvest::{self, Harvest};

@@ -22,8 +22,9 @@ Before Stage 0, record:
 
 - PR commit SHA and unsigned installer SHA-256;
 - model-bundle ZIP SHA-256 and `models.lock.json` SHA-256;
-- Qwen3 primary and escalation GGUF hashes;
-- GLiClass and Granite snapshot hashes;
+- Qwen3 primary and escalation GGUF hashes (the slim, torch-free sidecar
+  profile's whole model bundle -- no GLiClass or Granite snapshot; see
+  `docs/DEPENDENCY_COMPATIBILITY.md`);
 - llama-server release provenance, version output, and SHA-256;
 - `convertd.exe` SHA-256 and `sidecar-build-lock.txt`;
 - BackLog configuration, Flow exports, list schemas, and indexed columns; and

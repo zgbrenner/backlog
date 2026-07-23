@@ -20,8 +20,9 @@ Intake (SharePoint) --Flow 1--> Processing folder (OneDrive-synced)
                                   [BackLog app]
                 systray Tauri shell, Rust core, SQLite ledger
                                       |
-      convertd sidecar (Python): MarkItDown, pdfium, RapidOCR,
-                Lingua, GLiClass, granite, Ettin
+      convertd sidecar (Python, slim/torch-free): MarkItDown, pdfium,
+                RapidOCR, Lingua (GLiClass/granite/Ettin naming enhancements
+                degrade to deterministic fallbacks; not shipped by default)
       llama-server sidecar: Qwen3-0.6B primary, 1.7B escalation,
                 JSON-schema-constrained chat completions
                                       |

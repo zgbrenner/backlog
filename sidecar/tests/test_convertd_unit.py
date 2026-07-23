@@ -5,6 +5,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -109,6 +110,122 @@ class LanguageIdentificationTests(unittest.TestCase):
         )
 
 
+class OptionalLoaderCacheTests(unittest.TestCase):
+    """`_get_optional` backs the slim-sidecar graceful-degradation contract:
+    a missing library or model must degrade the op, never crash the
+    process, and must not retry the expensive import on every request."""
+
+    def test_caches_a_failing_factory_as_unavailable_without_retrying(self):
+        CONVERTD._CACHE.clear()
+        calls = {"n": 0}
+
+        def flaky_factory():
+            calls["n"] += 1
+            raise ImportError("no module named gliclass")
+
+        self.assertIsNone(CONVERTD._get_optional("flaky", flaky_factory))
+        self.assertIsNone(CONVERTD._get_optional("flaky", flaky_factory))
+        self.assertEqual(calls["n"], 1)
+        CONVERTD._CACHE.clear()
+
+    def test_a_successful_factory_is_reused_and_returned(self):
+        CONVERTD._CACHE.clear()
+        sentinel = object()
+        self.assertIs(CONVERTD._get_optional("ok", lambda: sentinel), sentinel)
+        self.assertIs(CONVERTD._get_optional("ok", lambda: (_ for _ in ()).throw(AssertionError("must not re-call"))), sentinel)
+        CONVERTD._CACHE.clear()
+
+
+class ClassifyGracefulDegradationTests(unittest.TestCase):
+    """When gliclass/transformers are absent (the slim sidecar profile) or
+    the local snapshot fails to load, classify must return ok-shaped
+    output with a neutral default -- never raise -- so the Rust pipeline
+    never flags a document over a missing naming enhancement."""
+
+    def test_falls_back_to_correspondence_when_gliclass_unavailable(self):
+        with mock.patch.object(CONVERTD, "_gliclass", return_value=None):
+            result = CONVERTD.op_classify(
+                {"text": "some text", "labels": ["invoice", "correspondence"]}
+            )
+        self.assertEqual(result["label"], "correspondence")
+        self.assertEqual(result["score"], 0.0)
+        self.assertFalse(result["available"])
+
+    def test_falls_back_to_first_label_when_correspondence_not_offered(self):
+        with mock.patch.object(CONVERTD, "_gliclass", return_value=None):
+            result = CONVERTD.op_classify({"text": "x", "labels": ["invoice", "receipt"]})
+        self.assertEqual(result["label"], "invoice")
+        self.assertFalse(result["available"])
+
+    def test_falls_back_when_a_live_pipeline_raises_mid_inference(self):
+        def broken_pipeline(*_args, **_kwargs):
+            raise RuntimeError("corrupt snapshot")
+
+        with mock.patch.object(CONVERTD, "_gliclass", return_value=broken_pipeline):
+            result = CONVERTD.op_classify({"text": "x", "labels": ["correspondence"]})
+        self.assertEqual(result["label"], "correspondence")
+        self.assertFalse(result["available"])
+
+    def test_uses_the_live_pipeline_result_when_available(self):
+        def fake_pipeline(_text, _labels, threshold=0.0):
+            return [[{"label": "invoice", "score": 0.9}, {"label": "receipt", "score": 0.4}]]
+
+        with mock.patch.object(CONVERTD, "_gliclass", return_value=fake_pipeline):
+            result = CONVERTD.op_classify({"text": "x", "labels": ["invoice", "receipt"]})
+        self.assertEqual(result["label"], "invoice")
+        self.assertEqual(result["score"], 0.9)
+        self.assertTrue(result["available"])
+
+
+class SalienceGracefulDegradationTests(unittest.TestCase):
+    """When sentence-transformers/granite are absent or fail to load,
+    salience must return the first top_k sentence indices in document
+    order -- never raise."""
+
+    def test_falls_back_to_document_order_when_granite_unavailable(self):
+        sentences = [f"sentence {i}" for i in range(5)]
+        with mock.patch.object(CONVERTD, "_granite", return_value=None):
+            result = CONVERTD.op_salience({"sentences": sentences, "top_k": 3})
+        self.assertEqual(result["indices"], [0, 1, 2])
+        self.assertFalse(result["available"])
+
+    def test_empty_sentences_short_circuits_before_loading_a_model(self):
+        with mock.patch.object(
+            CONVERTD,
+            "_granite",
+            side_effect=AssertionError("must not load a model for no sentences"),
+        ):
+            result = CONVERTD.op_salience({"sentences": [], "top_k": 3})
+        self.assertEqual(result, {"indices": []})
+
+    def test_falls_back_when_a_live_model_raises_mid_inference(self):
+        class BrokenModel:
+            def encode(self, *_args, **_kwargs):
+                raise RuntimeError("corrupt snapshot")
+
+        sentences = ["a", "b", "c", "d"]
+        with mock.patch.object(CONVERTD, "_granite", return_value=BrokenModel()):
+            result = CONVERTD.op_salience({"sentences": sentences, "top_k": 2})
+        self.assertEqual(result["indices"], [0, 1])
+        self.assertFalse(result["available"])
+
+
+class EttinGracefulDegradationTests(unittest.TestCase):
+    """Already-blank BACKLOG_ETTIN_DIR degrades to no spans; a configured
+    but broken extractor must degrade the same way rather than raise."""
+
+    def test_no_spans_when_ettin_unavailable(self):
+        with mock.patch.object(CONVERTD, "_ettin", return_value=None):
+            self.assertEqual(CONVERTD.op_ettin_spans({"text": "some text"}), {"spans": []})
+
+    def test_no_spans_when_a_live_extractor_raises_mid_inference(self):
+        def broken_extractor(_text):
+            raise RuntimeError("corrupt snapshot")
+
+        with mock.patch.object(CONVERTD, "_ettin", return_value=broken_extractor):
+            self.assertEqual(CONVERTD.op_ettin_spans({"text": "some text"}), {"spans": []})
+
+
 class ProtocolTests(unittest.TestCase):
     def test_unknown_operation_returns_structured_error_without_loading_models(self):
         request = json.dumps({"id": 9, "op": "does_not_exist"}) + "\n"
@@ -137,6 +254,58 @@ class ProtocolTests(unittest.TestCase):
         )
         response = json.loads(completed.stdout.strip())
         self.assertEqual(response, {"id": 1, "ok": True})
+
+    def test_classify_is_ok_true_end_to_end_without_a_local_model_snapshot(self):
+        # No models/gliclass-base-v3.0 snapshot exists in this checkout (model
+        # weights are gitignored), so this exercises the real degrade path
+        # end-to-end through the NDJSON protocol regardless of whether the
+        # interpreter running this test happens to have gliclass installed.
+        request = json.dumps(
+            {"id": 2, "op": "classify", "text": "Dear Sir,", "labels": ["invoice", "correspondence"]}
+        ) + "\n"
+        completed = subprocess.run(
+            [sys.executable, str(MODULE_PATH)],
+            input=request,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        response = json.loads(completed.stdout.strip())
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["label"], "correspondence")
+        self.assertEqual(response["score"], 0.0)
+        self.assertFalse(response["available"])
+
+    def test_salience_is_ok_true_end_to_end_without_a_local_model_snapshot(self):
+        sentences = [f"sentence {i}" for i in range(5)]
+        request = json.dumps({"id": 3, "op": "salience", "sentences": sentences, "top_k": 3}) + "\n"
+        completed = subprocess.run(
+            [sys.executable, str(MODULE_PATH)],
+            input=request,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        response = json.loads(completed.stdout.strip())
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["indices"], [0, 1, 2])
+        self.assertFalse(response["available"])
+
+    def test_ettin_spans_is_ok_true_end_to_end_without_backlog_ettin_dir(self):
+        request = json.dumps({"id": 4, "op": "ettin_spans", "text": "some text"}) + "\n"
+        completed = subprocess.run(
+            [sys.executable, str(MODULE_PATH)],
+            input=request,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        response = json.loads(completed.stdout.strip())
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["spans"], [])
 
 
 if __name__ == "__main__":

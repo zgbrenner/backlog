@@ -26,8 +26,11 @@ item below has fresh evidence attached to the release record.
 - [ ] The bundle contains `models.lock.json` at its root or under `models/`.
 - [ ] `python models/download_models.py --verify-only` passes after extraction.
 - [ ] The model ZIP SHA-256 is recorded before the Windows workflow starts.
-- [ ] The bundle contains the locked Qwen3 0.6B and 1.7B Q8_0 GGUF files,
-      GLiClass snapshot, and Granite embedding snapshot.
+- [ ] The bundle contains the locked Qwen3 0.6B and 1.7B Q8_0 GGUF files. This
+      is the slim, torch-free sidecar profile: no GLiClass snapshot, Granite
+      embedding snapshot, torch, transformers, or sentence-transformers ship
+      with it (see `docs/DEPENDENCY_COMPATIBILITY.md`); `classify` and
+      `salience` answer `ok=true` with deterministic fallbacks instead.
 - [ ] No Liquid LFM, Liquid VL, fastText, `lid.176`, or untracked model payload
       remains in the model directory.
 - [ ] The optional trained Ettin directory is disabled, or held-out metrics meet

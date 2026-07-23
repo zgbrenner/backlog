@@ -48,10 +48,9 @@ type RuntimeProblem = {
 };
 
 // Mirrors src-tauri/src/model_download.rs::DownloadProgress. `current_file`
-// is the spec's stable target key (e.g.
-// "granite-embedding-small-english-r2/model.safetensors"), not a bare
-// filename — several files share a bare name like "config.json" across the
-// gliclass/granite directories. `files_done` ranges 0..files_total while
+// is the spec's stable target key (e.g. "Qwen3-1.7B-Q8_0.gguf") -- the slim,
+// torch-free sidecar's bundle is just the two Qwen GGUFs (see
+// model_download.rs::MODEL_FILES). `files_done` ranges 0..files_total while
 // `current_file` is in flight; show `files_done + 1` for a 1-based counter.
 type ModelDownloadProgress = {
   current_file: string;
@@ -337,9 +336,9 @@ async function renderFlagged(root: HTMLElement) {
   }
 }
 
-// One-time setup egress: fetches the Qwen/GLiClass/Granite model files from
-// Hugging Face so a non-technical user never runs models/download_models.py
-// in a terminal. Driven by the model-download-progress / model-download-done
+// One-time setup egress: fetches the two Qwen GGUF model files from Hugging
+// Face so a non-technical user never runs models/download_models.py in a
+// terminal. Driven by the model-download-progress / model-download-done
 // events (listened globally below) rather than the invoke() promise alone,
 // so the panel stays in sync even if the user switches views mid-download
 // and comes back.
@@ -376,7 +375,7 @@ function renderModelDownloadSection(): string {
              (p.file_bytes_total > 0 ? ` &middot; ${formatBytes(p.file_bytes_done)} / ${formatBytes(p.file_bytes_total)}` : "")
            : "Starting&hellip;"
        }</p>`
-    : `<p class="dim-note">Fetches the Qwen, GLiClass, and Granite model files from Hugging Face once
+    : `<p class="dim-note">Fetches the two Qwen model files from Hugging Face once
         (public repos, no account needed). BackLog stays fully offline for document processing afterward.</p>`;
 
   return `

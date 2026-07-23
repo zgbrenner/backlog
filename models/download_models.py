@@ -11,6 +11,14 @@ Usage:
 
 ``--verify-only`` imports no Hub client and performs no network access. Ettin is
 a separate training input and is deliberately not part of this runtime bundle.
+
+This is the slim, torch-free sidecar profile's bundle: just the two Apache-2.0
+Qwen3 GGUFs. gliclass (doc-type classification) and granite (salience
+embeddings) are not fetched here -- they're torch-only naming enhancements
+that ``sidecar/convertd.py``'s ``_gliclass``/``_granite`` loaders degrade to
+deterministic fallbacks for when their libraries or snapshots are absent, and
+the slim sidecar never installs those libraries. See
+``docs/DEPENDENCY_COMPATIBILITY.md``.
 """
 
 from __future__ import annotations
@@ -34,7 +42,10 @@ class ModelSpec:
 
 
 MODEL_SPECS = [
-    # Apache-2.0 Qwen GGUFs served by llama.cpp.
+    # Apache-2.0 Qwen GGUFs served by llama.cpp. This is the whole bundle on
+    # the slim, torch-free sidecar profile -- gliclass (doc-type
+    # classification) and granite (salience embeddings) are deliberately
+    # absent; see the module docstring above.
     ModelSpec(
         "Qwen/Qwen3-0.6B-GGUF",
         "Qwen3-0.6B-Q8_0.gguf",
@@ -44,14 +55,6 @@ MODEL_SPECS = [
         "Qwen/Qwen3-1.7B-GGUF",
         "Qwen3-1.7B-Q8_0.gguf",
         "Qwen3-1.7B-Q8_0.gguf",
-    ),
-    # Zero-shot document classification.
-    ModelSpec("knowledgator/gliclass-base-v3.0", None, "gliclass-base-v3.0"),
-    # Salience embeddings.
-    ModelSpec(
-        "ibm-granite/granite-embedding-small-english-r2",
-        None,
-        "granite-embedding-small-english-r2",
     ),
 ]
 

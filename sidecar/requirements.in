@@ -4,14 +4,17 @@
 # NOTE: intentionally the bare `markitdown` extra, not `markitdown[all]` --
 # `[all]` pulls opencv/pandas/azure/youtube-transcript-api that this app never
 # uses, bloating the sidecar binary for no runtime benefit.
+# NOTE: torch/transformers/sentence-transformers/gliclass are deliberately
+# absent. This is the slim, torch-free sidecar profile: the classify,
+# salience, and ettin_spans ops degrade to sensible defaults in
+# convertd.py when those libraries (or their models) are unavailable, so
+# convert/OCR/langid/naming keep working without ~450 MB of PyTorch. See
+# docs/DEPENDENCY_COMPATIBILITY.md and docs/IMPLEMENTATION_STATUS.md.
 markitdown>=0.1.1,<0.2
 pypdfium2>=4.30,<5
 rapidocr>=3.9,<4
 onnxruntime>=1.18,<2
 lingua-language-detector==2.1.1
-gliclass>=0.1.18,<0.2
-sentence-transformers>=3.0,<6
-transformers>=5.1,<6
-torch>=2.3,<3
+huggingface_hub>=0.24,<2
 pillow>=10.3,<13
 numpy>=1.26,<3

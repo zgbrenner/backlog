@@ -16,9 +16,11 @@ locally before the release is uploaded.
 - **Rust** stable + the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/)
   (MSVC build tools, WebView2 — preinstalled on Windows 11).
 - **Node 18+**.
-- **Python 3.11** for the sidecar. The ML dependencies (torch, onnxruntime,
-  rapidocr, fastText, gliclass) have **no 3.13/3.14 wheels**, so 3.11 is required
-  even if your default Python is newer. If you don't have 3.11 system-wide, use
+- **Python 3.11** for the sidecar. The ML dependencies (onnxruntime, rapidocr)
+  have **no 3.13/3.14 wheels**, so 3.11 is required even if your default
+  Python is newer. This is the slim, torch-free sidecar profile -- no torch,
+  transformers, sentence-transformers, or gliclass; see
+  `docs/DEPENDENCY_COMPATIBILITY.md`. If you don't have 3.11 system-wide, use
   a userspace standalone via [`uv`](https://docs.astral.sh/uv/) (no admin):
   ```powershell
   uv python install 3.11
@@ -87,9 +89,10 @@ gitignored) — see step 5.
 
 ### 5. Models (shipped or first-run)
 Run `python models/download_models.py` on an internet-connected machine to fetch
-the GGUFs / ONNX models and produce `models/models.lock.json` (commit the lock;
+the two Qwen GGUFs and produce `models/models.lock.json` (commit the lock;
 the weights stay untracked). Either ship the `models/` folder alongside the
-installer, or have the operator run the download once. The app's Settings tab
+installer, or have the operator run the download once (or use the in-app
+downloader in Settings, which fetches the same bundle). The app's Settings tab
 points at the model paths.
 
 ## Publish the release (no Actions minutes)

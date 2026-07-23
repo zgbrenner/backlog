@@ -16,11 +16,7 @@ pip install -r requirements.txt pyinstaller
 pyinstaller --onefile --name convertd \
   --collect-all rapidocr \
   --collect-all lingua \
-  --collect-all gliclass \
   --collect-all markitdown \
-  --collect-all torch \
-  --collect-all transformers \
-  --collect-all sentence_transformers \
   --collect-all pypdfium2 \
   --hidden-import onnxruntime \
   convertd.py
@@ -38,14 +34,18 @@ copy dist\convertd.exe ..\src-tauri\binaries\convertd-x86_64-pc-windows-msvc.exe
 
 ## Notes
 
-- First PyInstaller build is slow; expect a 600 MB-1 GB binary because torch
-  ships inside. If that offends you (it should), build a second slim profile
-  without torch and set `BACKLOG_ETTIN_DIR` empty: gliclass also needs torch,
-  so the slim profile drops classify + ettin + VL fallback and keeps
-  convert/ocr/langid/salience via onnxruntime only. Slice 2-3 works fully on
-  the slim profile.
-- The `torch`/`transformers`/`sentence_transformers`/`pypdfium2` `--collect-all`
-  flags pull in their data files (weights loaders, `*.pyi`, native libs, version
+- This is the slim, torch-free sidecar profile: `requirements.txt` has no
+  torch/transformers/sentence-transformers/gliclass, so the frozen binary
+  should land well under the ~450 MB a torch-inclusive build used to produce
+  (torch alone was ~500 MB installed). The `classify`, `salience`, and
+  `ettin_spans` ops still answer `ok=true` -- they degrade to deterministic
+  fallbacks (a neutral doc type, document-order sentences, no spans) instead
+  of using gliclass/granite/Ettin models, per `convertd.py`'s module
+  docstring and its `_gliclass`/`_granite`/`_ettin` loaders. `convert`, `ocr`,
+  `langid`, and naming are unaffected. `BACKLOG_ETTIN_DIR` unset (the default)
+  already disables the Ettin lane the same way.
+- The `rapidocr`/`lingua`/`markitdown`/`pypdfium2` `--collect-all` flags pull
+  in their data files (weights loaders, `*.pyi`, native libs, version
   metadata) that PyInstaller otherwise misses, so the frozen binary can load
   models at runtime instead of failing on import.
 - Smoke test before bundling. The `\` line-continuation above and the `echo`

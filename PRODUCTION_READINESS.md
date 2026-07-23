@@ -113,12 +113,15 @@ Ordered roughly by priority.
 > with its DLLs) and a validated NSIS installer; `sidecar/requirements.lock`; the
 > **licensing-clean model swap** (Qwen3 + Lingua + RapidOCR, dropping the
 > Liquid-licensed LFM2.5 and CC-BY-SA fastText); the **runtime preflight**
-> readiness check + UI; the Unicode `harvest()` crash fix; and the Power Automate
-> **manifest-v2 contract**. Still open: install-and-run validation on a clean
-> machine with the models; encryption at rest for the ledger; the async-hygiene
-> (`spawn_blocking`) refinement; an optional **slim sidecar** (drop torch → ~3×
-> smaller, trading away the gliclass/granite naming enhancements); an in-flight
-> claim; the dev-only Vite advisory; and an auto-updater.
+> readiness check + UI; the Unicode `harvest()` crash fix; the Power Automate
+> **manifest-v2 contract**; and the **slim, torch-free sidecar** (dropped
+> torch/transformers/sentence-transformers/gliclass, ~3x smaller Python
+> dependency footprint; `classify`/`salience`/`ettin_spans` degrade to
+> deterministic `ok=true` fallbacks instead of the gliclass/granite/Ettin
+> naming enhancements -- see `docs/DEPENDENCY_COMPATIBILITY.md`). Still open:
+> install-and-run validation on a clean machine with the models; encryption at
+> rest for the ledger; the async-hygiene (`spawn_blocking`) refinement; an
+> in-flight claim; the dev-only Vite advisory; and an auto-updater.
 
 1. **Real app icon.** `icons/icon.{png,ico}` is a 32×32 placeholder. Supply a
    1024×1024 source and run `npm run tauri icon <source.png>` to generate the
