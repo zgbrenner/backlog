@@ -278,6 +278,10 @@ fn found_on_path(name: &str) -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
     };
+    // `mut`/`Vec` are only load-bearing on Windows, where the PATH probe also
+    // has to try the `.exe` form; the cfg_attr keeps a Linux/macOS CI clippy
+    // run warning-free without an unconditional `#[allow]`.
+    #[cfg_attr(not(windows), allow(unused_mut, clippy::useless_vec))]
     let mut names = vec![name.to_string()];
     #[cfg(windows)]
     {

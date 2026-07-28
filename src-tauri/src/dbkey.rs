@@ -13,14 +13,19 @@
 //!
 //! `CryptUnprotectData` is the exact inverse: handed the DPAPI blob, it
 //! returns the original 32 bytes, decryptable only by that same user login.
+//!
+//! ## Non-Windows builds
+//!
+//! BackLog ships Windows-only (`bundle.targets` is NSIS), so the DPAPI path
+//! below is the only one a user ever runs. The `#[cfg(not(windows))]` fallback
+//! exists purely so this crate — and therefore the ledger, pipeline, manifest,
+//! and checker test suites — compiles and runs on a Linux CI runner. It wraps
+//! the key with a marker header and 0600 permissions rather than DPAPI, which
+//! is strictly weaker; `resolve_key` logs a warning saying so, and
+//! `assert_shipping_key_protection_is_dpapi` fails the build's own test suite
+//! if that fallback is ever reached on a Windows target.
 
 use std::path::Path;
-
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
-use windows::Win32::Security::Cryptography::{
-    CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
-};
 
 pub const KEY_LEN: usize = 32;
 
@@ -30,12 +35,19 @@ pub const KEY_LEN: usize = 32;
 /// Never writes the raw key to disk: the file at `key_path` always holds
 /// the `CryptProtectData` ciphertext blob, not the key itself.
 pub fn resolve_key(key_path: &Path) -> anyhow::Result<[u8; KEY_LEN]> {
+    #[cfg(not(windows))]
+    log::warn!(
+        "ledger key at {} is protected by file permissions, not DPAPI: this is a \
+         non-Windows development/CI build and must never be shipped",
+        key_path.display()
+    );
+
     if key_path.exists() {
         let blob = std::fs::read(key_path)
             .map_err(|e| anyhow::anyhow!("reading ledger key blob {}: {e}", key_path.display()))?;
-        let key = dpapi_unprotect(&blob).map_err(|e| {
+        let key = unprotect(&blob).map_err(|e| {
             anyhow::anyhow!(
-                "DPAPI-decrypting ledger key {} (usually means a different Windows user/machine): {e}",
+                "decrypting ledger key {} (usually means a different Windows user/machine): {e}",
                 key_path.display()
             )
         })?;
@@ -50,17 +62,49 @@ pub fn resolve_key(key_path: &Path) -> anyhow::Result<[u8; KEY_LEN]> {
     } else {
         let mut key = [0u8; KEY_LEN];
         getrandom::getrandom(&mut key)?;
-        let blob = dpapi_protect(&key)?;
+        let blob = protect(&key)?;
         if let Some(parent) = key_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(key_path, &blob)?;
+        write_key_file(key_path, &blob)?;
         Ok(key)
     }
 }
 
+/// Write the wrapped key blob, owner-only where the platform can express it.
+///
+/// On Windows the blob is already DPAPI-bound to the user, so ACLs are belt
+/// and braces; on Unix the 0600 mode *is* the protection, and the mode is set
+/// at create time rather than chmod'd afterwards so there is no window in
+/// which the file is group/world-readable.
+fn write_key_file(key_path: &Path, blob: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(key_path)?;
+    f.write_all(blob)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+use windows::core::PCWSTR;
+#[cfg(windows)]
+use windows::Win32::Foundation::{HLOCAL, LocalFree};
+#[cfg(windows)]
+use windows::Win32::Security::Cryptography::{
+    CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+};
+
 /// DPAPI-encrypt `data` under the current Windows user's login credentials.
-fn dpapi_protect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+#[cfg(windows)]
+fn protect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     unsafe {
         let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
         let mut output = CRYPT_INTEGER_BLOB::default();
@@ -77,8 +121,9 @@ fn dpapi_protect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-/// Inverse of `dpapi_protect`: decrypt a DPAPI blob back to its raw bytes.
-fn dpapi_unprotect(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
+/// Inverse of `protect`: decrypt a DPAPI blob back to its raw bytes.
+#[cfg(windows)]
+fn unprotect(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
     unsafe {
         let input = CRYPT_INTEGER_BLOB { cbData: blob.len() as u32, pbData: blob.as_ptr() as *mut u8 };
         let mut output = CRYPT_INTEGER_BLOB::default();
@@ -99,6 +144,7 @@ fn dpapi_unprotect(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// an owned `Vec`, then free the buffer DPAPI handed back — callers own
 /// `output` on the stack, but the *contents* `pbData` points at are on
 /// DPAPI's local heap until we free them here.
+#[cfg(windows)]
 unsafe fn take_blob(blob: CRYPT_INTEGER_BLOB) -> Vec<u8> {
     unsafe {
         let bytes = std::slice::from_raw_parts(blob.pbData, blob.cbData as usize).to_vec();
@@ -107,9 +153,54 @@ unsafe fn take_blob(blob: CRYPT_INTEGER_BLOB) -> Vec<u8> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Non-Windows (development / CI only — never shipped; see the module docs).
+// ---------------------------------------------------------------------------
+
+/// Marker prefix so a fallback-wrapped key file is instantly identifiable and
+/// can never be mistaken for — or silently read as — a DPAPI blob.
+#[cfg(not(windows))]
+const FALLBACK_MAGIC: &[u8] = b"BACKLOG-DEVKEY-v1\n";
+
+#[cfg(not(windows))]
+fn protect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(FALLBACK_MAGIC.len() + data.len());
+    out.extend_from_slice(FALLBACK_MAGIC);
+    out.extend_from_slice(data);
+    Ok(out)
+}
+
+#[cfg(not(windows))]
+fn unprotect(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let body = blob.strip_prefix(FALLBACK_MAGIC).ok_or_else(|| {
+        anyhow::anyhow!(
+            "ledger key file is not a development-fallback blob (a DPAPI blob written on \
+             Windows cannot be opened on this platform)"
+        )
+    })?;
+    Ok(body.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guards the cfg split itself: if the non-Windows fallback ever ends up
+    /// compiled into a Windows build, the shipped artifact would store the
+    /// SQLCipher key with a 18-byte header and no DPAPI wrapping at all. This
+    /// test makes that a build failure rather than a silent downgrade.
+    #[test]
+    fn assert_shipping_key_protection_is_dpapi() {
+        let key = [7u8; KEY_LEN];
+        let blob = protect(&key).unwrap();
+        if cfg!(windows) {
+            // DPAPI always expands and randomizes; it never emits the raw key.
+            assert_ne!(blob, key.to_vec(), "Windows build is not DPAPI-protecting the key");
+            assert!(blob.len() > KEY_LEN);
+        } else {
+            assert!(blob.starts_with(b"BACKLOG-DEVKEY-v1\n"));
+        }
+    }
 
     #[test]
     fn generates_and_persists_a_key() {
