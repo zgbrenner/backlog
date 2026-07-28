@@ -10,11 +10,42 @@
 //! non-standard model license.
 
 use crate::checker::SlmOutput;
+use crate::sidecar::log_child_stderr;
 use serde_json::{json, Value};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long a freshly spawned llama-server gets to answer `/health` before
+/// the child is killed and the slot cleared. Loading a 1.8 GB GGUF off a
+/// cold disk is genuinely slow; being wedged forever is not acceptable.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How far above the configured base port `reserve_port` will look for a free
+/// one before giving up.
+const PORT_SCAN_RANGE: u16 = 20;
+
+/// llama-server logs its whole startup banner before serving; that plus any
+/// failure is what is worth keeping out of a backfill's request narration.
+const MAX_LOGGED_SERVER_LINES: usize = 400;
+
+/// One running llama-server and the port it was given. Killing on drop is
+/// what makes "clear the slot" a real recovery rather than an orphan factory.
+struct Server {
+    child: Child,
+    port: u16,
+    _stderr: std::thread::JoinHandle<()>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
 pub struct SlmLane {
     // Retained as a compatibility input while older installations still bundle
@@ -26,8 +57,12 @@ pub struct SlmLane {
     parallel: u8,
     primary_port: u16,
     escalation_port: u16,
-    primary: Mutex<Option<Child>>,
-    escalation: Mutex<Option<Child>>,
+    /// Per-run bearer token handed to llama-server via `--api-key`. Without
+    /// it the naming lane is an unauthenticated inference endpoint on
+    /// loopback that any local process can post harvested document text to.
+    api_key: String,
+    primary: Mutex<Option<Server>>,
+    escalation: Mutex<Option<Server>>,
     http: reqwest::Client,
 }
 
@@ -35,6 +70,32 @@ pub struct SlmLane {
 pub enum Tier {
     Primary,
     Escalation,
+}
+
+/// Pick a loopback port this process has just proved is free.
+///
+/// The fixed, shared default port is the whole problem: `ensure_up` used to
+/// spawn and then trust whatever answered `/health` on it. That is an orphan
+/// llama-server from a crashed previous session — silently binding the batch
+/// to a different GGUF than every manifest's `model_versions` records — or
+/// any unprivileged local process that bound the port first, which then sees
+/// the evidence text of every document and dictates the date and subject the
+/// checker goes on to validate. Binding it ourselves first means the
+/// responder is the child we spawned unless something wins a microsecond race
+/// on a port it could not have predicted.
+fn reserve_port(preferred: u16) -> anyhow::Result<u16> {
+    for offset in 0..PORT_SCAN_RANGE {
+        let Some(candidate) = preferred.checked_add(offset) else {
+            break;
+        };
+        if TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "no free loopback port for llama-server in {preferred}..{}; something else is using them",
+        preferred.saturating_add(PORT_SCAN_RANGE)
+    )
 }
 
 impl SlmLane {
@@ -46,6 +107,8 @@ impl SlmLane {
         base_port: u16,
         parallel: u8,
     ) -> Self {
+        let mut token = [0u8; 32];
+        getrandom::getrandom(&mut token).expect("CSPRNG for the llama-server API key");
         Self {
             _fallback_grammar: grammar,
             llama_server_exe,
@@ -54,6 +117,7 @@ impl SlmLane {
             parallel,
             primary_port: base_port,
             escalation_port: base_port + 1,
+            api_key: hex::encode(token),
             primary: Mutex::new(None),
             escalation: Mutex::new(None),
             http: reqwest::Client::builder()
@@ -65,7 +129,7 @@ impl SlmLane {
         }
     }
 
-    fn spawn_server(&self, gguf: &Path, port: u16) -> anyhow::Result<Child> {
+    fn spawn_server(&self, gguf: &Path, port: u16) -> anyhow::Result<Server> {
         anyhow::ensure!(gguf.is_file(), "GGUF model not found: {}", gguf.display());
         let mut command = Command::new(&self.llama_server_exe);
         command
@@ -84,44 +148,116 @@ impl SlmLane {
                 // template for the /v1/chat/completions endpoint below.
                 "--jinja",
                 "--no-webui",
+                // Reject requests from anything that is not this process.
+                "--api-key",
+                &self.api_key,
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            // Piped, not null: llama-server explains a refused port, a bad
+            // GGUF or an OOM here and nowhere else. See `log_child_stderr`.
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        Ok(command.spawn()?)
+        let mut child = command.spawn()?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no llama-server stderr"))?;
+        let stderr_thread = log_child_stderr("llama-server", stderr, MAX_LOGGED_SERVER_LINES)?;
+        Ok(Server {
+            child,
+            port,
+            _stderr: stderr_thread,
+        })
     }
 
+    /// Why the child is re-checked and the slot cleared rather than polled to
+    /// exhaustion: a llama-server that died on startup (missing CUDA runtime,
+    /// corrupt GGUF, port taken) used to cost 60 seconds of polling followed
+    /// by a message that named the port and nothing else — and every later
+    /// call paid the same 60 seconds against the same dead child forever.
     async fn ensure_up(&self, tier: Tier) -> anyhow::Result<u16> {
-        let (slot, gguf, port) = match tier {
+        let (slot, gguf, preferred_port) = match tier {
             Tier::Primary => (&self.primary, &self.primary_gguf, self.primary_port),
-            Tier::Escalation => (&self.escalation, &self.escalation_gguf, self.escalation_port),
+            Tier::Escalation => (
+                &self.escalation,
+                &self.escalation_gguf,
+                self.escalation_port,
+            ),
         };
-        {
+        let port = {
             let mut guard = slot.lock().unwrap();
-            let must_spawn = match guard.as_mut() {
-                None => true,
-                Some(child) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
+            let live = match guard.as_mut() {
+                Some(server) => match server.child.try_wait() {
+                    Ok(None) => Some(server.port),
+                    _ => None,
+                },
+                None => None,
             };
-            if must_spawn {
-                *guard = Some(self.spawn_server(gguf, port)?);
+            match live {
+                Some(port) => port,
+                None => {
+                    // Drops (and therefore kills) whatever was there before.
+                    *guard = None;
+                    let port = reserve_port(preferred_port)?;
+                    let server = self.spawn_server(gguf, port)?;
+                    *guard = Some(server);
+                    port
+                }
             }
-        }
+        };
 
         let health_url = format!("http://127.0.0.1:{port}/health");
-        for _ in 0..120 {
-            if let Ok(response) = self.http.get(&health_url).send().await {
+        let deadline = Instant::now() + HEALTH_TIMEOUT;
+        loop {
+            if let Some(exit) = self.child_exit(slot)? {
+                *slot.lock().unwrap() = None;
+                anyhow::bail!(
+                    "llama-server exited during startup ({exit}); its output is in the log file"
+                );
+            }
+            if let Ok(response) = self
+                .http
+                .get(&health_url)
+                .bearer_auth(&self.api_key)
+                .send()
+                .await
+            {
                 if response.status().is_success() {
                     return Ok(port);
                 }
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
         }
-        anyhow::bail!("llama-server on port {port} never became healthy")
+        // Clear the slot so the next call gets a clean spawn instead of
+        // re-paying the full wait against the same wedged child.
+        *slot.lock().unwrap() = None;
+        anyhow::bail!(
+            "llama-server on port {port} did not become healthy within {}s; it has been stopped",
+            HEALTH_TIMEOUT.as_secs()
+        )
+    }
+
+    /// `Some(status)` once the spawned child has exited, `None` while it is
+    /// still running. Split out so the health loop never holds the slot lock
+    /// across an `await`.
+    fn child_exit(&self, slot: &Mutex<Option<Server>>) -> anyhow::Result<Option<String>> {
+        let mut guard = slot.lock().unwrap();
+        let Some(server) = guard.as_mut() else {
+            anyhow::bail!("the llama-server slot was cleared while it was starting");
+        };
+        Ok(match server.child.try_wait() {
+            Ok(Some(status)) => Some(status.to_string()),
+            Ok(None) => None,
+            Err(e) => Some(format!("could not be waited on: {e}")),
+        })
     }
 
     fn response_schema() -> Value {
@@ -241,6 +377,7 @@ impl SlmLane {
         let response: Value = self
             .http
             .post(&url)
+            .bearer_auth(&self.api_key)
             .json(&body)
             .send()
             .await?
@@ -257,11 +394,9 @@ impl SlmLane {
     }
 
     pub fn shutdown(&self) {
+        // `Server`'s Drop kills and reaps; taking the slot is the whole job.
         for slot in [&self.primary, &self.escalation] {
-            if let Some(mut child) = slot.lock().unwrap().take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            drop(slot.lock().unwrap_or_else(|e| e.into_inner()).take());
         }
     }
 }
@@ -305,5 +440,74 @@ mod tests {
     fn isolates_json_from_template_noise() {
         let value = "<think></think>\n```json\n{\"date\":\"none\"}\n```";
         assert_eq!(SlmLane::json_object(value).unwrap(), "{\"date\":\"none\"}");
+    }
+
+    fn lane(base_port: u16) -> SlmLane {
+        SlmLane::new(
+            PathBuf::from("/nonexistent/llama-server"),
+            String::new(),
+            PathBuf::from("/nonexistent/primary.gguf"),
+            PathBuf::from("/nonexistent/escalation.gguf"),
+            base_port,
+            1,
+        )
+    }
+
+    /// Two lanes must never share a token, and a token must be long enough
+    /// that a local process cannot simply guess its way onto the endpoint.
+    #[test]
+    fn each_lane_gets_its_own_unguessable_api_key() {
+        let (a, b) = (lane(19_137), lane(19_137));
+        assert_eq!(a.api_key.len(), 64);
+        assert!(a.api_key.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a.api_key, b.api_key, "the token must be per-run");
+    }
+
+    /// The squatter case: something already owns the configured port, so the
+    /// lane must move rather than spawn into it and then trust whatever
+    /// answers there.
+    #[test]
+    fn reserve_port_skips_a_port_someone_else_already_holds() {
+        let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = squatter.local_addr().unwrap().port();
+
+        let chosen = reserve_port(taken).expect("a free port above the taken one");
+        assert_ne!(chosen, taken, "must not hand back an occupied port");
+        assert!(chosen > taken && chosen <= taken + PORT_SCAN_RANGE);
+
+        // And the port it did hand back is genuinely bindable.
+        drop(TcpListener::bind(("127.0.0.1", chosen)).expect("chosen port must be free"));
+    }
+
+    #[test]
+    fn reserve_port_returns_the_preferred_port_when_it_is_free() {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let free = probe.local_addr().unwrap().port();
+        drop(probe);
+        assert_eq!(reserve_port(free).unwrap(), free);
+    }
+
+    /// A missing or dead llama-server must fail fast with something a support
+    /// ticket can act on, not after a 60-second poll against a corpse.
+    #[tokio::test]
+    async fn ensure_up_fails_immediately_when_the_binary_cannot_be_spawned() {
+        let lane = lane(19_237);
+        let started = Instant::now();
+        let error = lane
+            .ensure_up(Tier::Primary)
+            .await
+            .expect_err("a nonexistent GGUF must not be waited on");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must not burn the health timeout first"
+        );
+        assert!(
+            error.to_string().contains("GGUF model not found"),
+            "{error}"
+        );
+        assert!(
+            lane.primary.lock().unwrap().is_none(),
+            "a failed spawn must not leave a slot behind"
+        );
     }
 }

@@ -98,6 +98,35 @@ fn lexical_norm(p: &Path) -> PathBuf {
     p.components().collect()
 }
 
+/// Trim surrounding whitespace and one matched pair of surrounding quotes.
+///
+/// Windows Explorer's "Copy as path" puts the path on the clipboard *with*
+/// double quotes, and a hand-edited `backlog.config.json` picks up stray
+/// spaces. Either turns into a literal folder name that can never exist, and
+/// the user is then told their folder "does not exist" while looking at a
+/// value that reads exactly right. Non-UTF-8 paths are left untouched — there
+/// is nothing to trim that we could re-encode safely.
+fn normalize_path(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    PathBuf::from(normalize_path_text(text))
+}
+
+fn normalize_path_text(text: &str) -> String {
+    let trimmed = text.trim();
+    let unquoted = ['"', '\'']
+        .iter()
+        .find_map(|q| {
+            trimmed
+                .strip_prefix(*q)
+                .and_then(|rest| rest.strip_suffix(*q))
+                .filter(|_| trimmed.len() >= 2)
+        })
+        .unwrap_or(trimmed);
+    unquoted.trim().to_string()
+}
+
 fn default_convert_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).clamp(1, 6))
@@ -106,13 +135,33 @@ fn default_convert_workers() -> usize {
 
 impl Config {
     pub fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
+        let mut cfg = match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
                 log::warn!("config parse failed ({e}); using defaults");
                 Self::default()
             }),
             Err(_) => Self::default(),
+        };
+        cfg.normalize();
+        cfg
+    }
+
+    /// Clean every operator-supplied value in place. Called on load and again
+    /// in `set_config`, so a quoted or space-padded path is tolerated whether
+    /// it arrived from the Browse dialog, a paste into the text field, or a
+    /// hand-edited `backlog.config.json`.
+    pub fn normalize(&mut self) {
+        for dir in [
+            &mut self.processing_dir,
+            &mut self.outbox_dir,
+            &mut self.quarantine_dir,
+            &mut self.cache_dir,
+            &mut self.slm_primary_gguf,
+            &mut self.slm_escalation_gguf,
+        ] {
+            *dir = normalize_path(dir);
         }
+        self.ettin_model_dir = normalize_path_text(&self.ettin_model_dir);
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -141,6 +190,16 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         if !self.ready() {
             return Err("Set the Processing, Outbox, and Quarantine folders first.".into());
+        }
+        // `SlmLane` binds `llama_port` and `llama_port + 1`, so the top of the
+        // range is not merely unusable — it overflows the u16 add. Reject it
+        // here, where the value is entered, rather than at spawn time.
+        if self.llama_port < 1024 || self.llama_port == u16::MAX {
+            return Err(format!(
+                "The llama-server port must be between 1024 and {}; {} is not usable.",
+                u16::MAX - 1,
+                self.llama_port
+            ));
         }
         let named: [(&str, &Path); 4] = [
             ("Processing", self.processing_dir.as_path()),
@@ -189,7 +248,9 @@ mod tests {
 
     #[test]
     fn accepts_distinct_folders() {
-        assert!(cfg("/a/proc", "/a/out", "/a/quar", "/a/cache").validate().is_ok());
+        assert!(cfg("/a/proc", "/a/out", "/a/quar", "/a/cache")
+            .validate()
+            .is_ok());
     }
 
     #[test]
@@ -207,5 +268,63 @@ mod tests {
     #[test]
     fn rejects_unset_folders() {
         assert!(cfg("", "", "", "").validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_llama_port_whose_escalation_neighbour_overflows() {
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.llama_port = u16::MAX;
+        assert!(c.validate().is_err());
+        c.llama_port = 80;
+        assert!(c.validate().is_err());
+        c.llama_port = 8137;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn normalize_strips_quotes_and_padding_from_every_path_field() {
+        // Exactly what Explorer's "Copy as path" pastes, plus the stray
+        // spaces a hand-edited config picks up.
+        let mut c = cfg(
+            "  \"C:\\Users\\z\\Processing\"  ",
+            " 'D:/Outbox' ",
+            "C:\\Quarantine ",
+            "\"C:\\Cache\"",
+        );
+        c.slm_primary_gguf = " \"C:\\models\\a.gguf\" ".into();
+        c.ettin_model_dir = "  \"C:\\ettin\"  ".to_string();
+        c.normalize();
+
+        assert_eq!(c.processing_dir, PathBuf::from("C:\\Users\\z\\Processing"));
+        assert_eq!(c.outbox_dir, PathBuf::from("D:/Outbox"));
+        assert_eq!(c.quarantine_dir, PathBuf::from("C:\\Quarantine"));
+        assert_eq!(c.cache_dir, PathBuf::from("C:\\Cache"));
+        assert_eq!(c.slm_primary_gguf, PathBuf::from("C:\\models\\a.gguf"));
+        assert_eq!(c.ettin_model_dir, "C:\\ettin");
+    }
+
+    #[test]
+    fn normalize_leaves_an_unquoted_path_and_a_lone_quote_alone() {
+        let mut c = cfg("/a/proc", "/a/o\"ut", "/a/quar", "");
+        c.normalize();
+        assert_eq!(c.processing_dir, PathBuf::from("/a/proc"));
+        // Only a *matched* surrounding pair is stripped; an interior quote is
+        // a legal (if unwise) filename character and must survive.
+        assert_eq!(c.outbox_dir, PathBuf::from("/a/o\"ut"));
+        assert_eq!(c.cache_dir, PathBuf::from(""));
+    }
+
+    #[test]
+    fn load_normalizes_a_hand_edited_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backlog.config.json");
+        std::fs::write(
+            &path,
+            r#"{"processing_dir":"  \"C:\\Processing\"  ","outbox_dir":"C:\\Outbox"}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path);
+        assert_eq!(cfg.processing_dir, PathBuf::from("C:\\Processing"));
+        assert_eq!(cfg.outbox_dir, PathBuf::from("C:\\Outbox"));
     }
 }

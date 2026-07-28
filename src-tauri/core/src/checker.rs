@@ -2,11 +2,12 @@
 //! fields; nothing reaches a filesystem or SharePoint without passing here.
 //! Every rule is boring on purpose.
 
-use crate::harvest::Harvest;
-use chrono::{Datelike, Duration, NaiveDate, Utc};
+use crate::harvest::{self, Harvest};
+use chrono::{Duration, Local, NaiveDate, TimeZone, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlmOutput {
@@ -31,7 +32,7 @@ pub struct Validated {
 pub enum CheckError {
     #[error("date '{0}' is not a valid calendar date")]
     BadDate(String),
-    #[error("date '{0}' outside plausible range 1900-01-01..today+30d")]
+    #[error("date '{0}' outside plausible range 1800-01-01..today+400d")]
     DateOutOfRange(String),
     #[error("date '{0}' not present in document evidence or file metadata")]
     DateNotInEvidence(String),
@@ -63,18 +64,159 @@ impl CheckError {
     }
 }
 
-static GENERIC_SUBJECTS: &[&str] = &[
-    "document", "scan", "scanned document", "untitled", "pdf", "file",
-    "attachment", "img", "image", "doc", "new document", "letter",
+/// Who wrote the fields being checked. A 0.6B model and the office worker in
+/// the review pane get the same safety rules (illegal characters, PII, sentence
+/// shape) but not the same style rules: the word count and the forward-date
+/// ceiling exist to catch a model guessing, and applying them to a human turns
+/// the correction pane into a dead end for someone who must never open a
+/// terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Model,
+    Human,
+}
+
+// --- date bounds ---------------------------------------------------------
+// The floor catches OCR garbage and truncated years, not genuinely old paper.
+// The ceiling is wide because forward-dated leases, policy renewals and hearing
+// notices are routine and appear verbatim in the document; anything past
+// today+30 still earns a soft flag so the index can be audited.
+const DATE_FLOOR_YEAR: i32 = 1800;
+const FUTURE_HARD_DAYS: i64 = 400;
+const FUTURE_SOFT_DAYS: i64 = 30;
+/// Beyond this byte offset a date is body text, not letterhead or a date line.
+const HEAD_REGION_BYTES: usize = 1500;
+
+// --- subject shape -------------------------------------------------------
+const SUBJECT_MIN_WORDS: usize = 2;
+const SUBJECT_MAX_WORDS: usize = 10;
+/// Han/Kana/Thai do not put spaces between words, so a whitespace word count is
+/// structurally incapable of passing them. Bound characters instead.
+const SUBJECT_MIN_CHARS_UNSPACED: usize = 4;
+const SUBJECT_MAX_CHARS_UNSPACED: usize = 40;
+
+/// Tokens that carry no information about what a document *is*. A subject whose
+/// content words are drawn entirely from this set is a scanner default, not a
+/// name — and before this list was consulted ahead of the word count it had
+/// never once fired.
+static GENERIC_SUBJECT_TOKENS: &[&str] = &[
+    "a",
+    "attachment",
+    "copy",
+    "doc",
+    "document",
+    "documents",
+    "file",
+    "files",
+    "from",
+    "image",
+    "images",
+    "img",
+    "letter",
+    "microsoft",
+    "new",
+    "of",
+    "pdf",
+    "scan",
+    "scanned",
+    "scanner",
+    "scans",
+    "the",
+    "untitled",
+    "word",
+];
+
+/// Words that ground nothing: every document has them, so seeing one echoed in
+/// the evidence says nothing about whether the subject came from the document.
+static UNGROUNDING_TOKENS: &[&str] = &[
+    "agreement",
+    "and",
+    "application",
+    "certificate",
+    "confirmation",
+    "contract",
+    "copy",
+    "dated",
+    "draft",
+    "executed",
+    "final",
+    "for",
+    "form",
+    "from",
+    "invoice",
+    "lease",
+    "letter",
+    "license",
+    "memo",
+    "memorandum",
+    "minutes",
+    "notice",
+    "notification",
+    "order",
+    "policy",
+    "receipt",
+    "regarding",
+    "report",
+    "request",
+    "response",
+    "signed",
+    "statement",
+    "summary",
+    "the",
+    "with",
 ];
 
 // Anything SharePoint/Windows dislikes, plus '#' and '%' which break some
-// SharePoint URL paths, plus control chars.
-static RE_ILLEGAL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"[\\/:*?"<>|#%\x00-\x1f]"#).unwrap());
+// SharePoint URL paths, plus control chars. Replaced with a space.
+static RE_ILLEGAL: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"[\\/:*?"<>|#%\x00-\x1f\x7f]"#).unwrap());
+// Zero-width, bidi-override and BOM codepoints. These are DELETED rather than
+// spaced: a U+202E sits *between* letters, so spacing it would fabricate a word
+// boundary. Left in, "Notice of Termination \u{202E}fdp.exe" renders in
+// Explorer and SharePoint as "...exe.pdf" — a working phishing primitive built
+// out of attacker-influenceable document text, in a file other staff click.
+static RE_ZERO_WIDTH: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"[\u{200b}-\u{200f}\u{202a}-\u{202e}\u{2060}\u{2066}-\u{2069}\u{feff}]").unwrap()
+});
+// NBSP and friends must become plain spaces before the collapse, or they
+// survive into the filename and silently break the exact-string comparisons
+// dedupe_name and the Power Automate flows rely on.
+static RE_UNICODE_SPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\p{White_Space}").unwrap());
 static RE_MULTISPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s{2,}").unwrap());
-static RE_SSN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap());
-static RE_CCN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(?:\d[ -]?){13,19}\b").unwrap());
-static RE_SENTENCE_END: Lazy<Regex> = Lazy::new(|| Regex::new(r"[.!?]").unwrap());
+static RE_SSN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(\d{3})-(\d{2})-(\d{4})\b").unwrap());
+/// A maximal run of digits with optional single-character separators. The
+/// Luhn/format decision happens in Rust; a regex cannot do a checksum.
+static RE_DIGIT_RUN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d(?:[\d -]*\d)?").unwrap());
+/// Terminal punctuation, including the CJK and Arabic full stops — without them
+/// no non-Latin description can ever satisfy the one-sentence rule. Kept in
+/// step with `TERMINALS` by `terminal_set_and_regex_agree`.
+static RE_SENTENCE_END: Lazy<Regex> = Lazy::new(|| Regex::new(r"[.!?。！？؟]").unwrap());
+const TERMINALS: [char; 7] = ['.', '!', '?', '。', '！', '？', '؟'];
+/// Scripts that do not separate words with spaces.
+static RE_UNSPACED_SCRIPT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"[\p{Han}\p{Hiragana}\p{Katakana}\p{Thai}]").unwrap());
+/// Trailing serial numbers a scanner appends: "… 001", "… (2)", "… #3".
+static RE_TRAILING_SERIAL: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s*[#(]?\d{1,4}\)?$").unwrap());
+static RE_LEADING_QUALIFIER: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)^(?:new|copy of)\s+").unwrap());
+/// A file extension echoed back into the subject, which pipeline.rs would then
+/// re-append: "Invoice 2024 Q3.pdf" -> "….pdf.pdf".
+static RE_TRAILING_EXT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\.(pdf|docx?|xlsx?|pptx?|txt|rtf|odt|ods|odp|csv|msg|eml|jpe?g|png|gif|tiff?|bmp|heic|html?|md|xml|zip)$").unwrap()
+});
+// Masks for the one-sentence rule. Each turns an internal '.' into '-' so the
+// terminal count sees only real sentence ends.
+static RE_MASK_ELLIPSIS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\.{2,}").unwrap());
+/// The whole numeric run, not one separator: `replace_all` is non-overlapping
+/// and `\d\.\d` consumes the digit on both sides, so in "v2.1.3" only "2.1" was
+/// masked and the dot in "1.3" was still counted as a sentence end.
+static RE_MASK_DECIMAL: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d+(?:\.\d+)+").unwrap());
+static RE_MASK_ABBREV: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:inc|corp|co|ltd|llc|plc|no|nos|dept|div|att|attn|ref|est|approx|exh|sched|para|bros|vs|et al|e\.g|i\.e|a\.m|p\.m|mr|mrs|ms|dr|prof|st|ave|rd|blvd|fig|vol|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec)\.").unwrap()
+});
+/// Single capital letter + period: "U.S.", "J. Smith", "P.O." — the single most
+/// common reason legal and corporate prose blew the raw terminal count.
+static RE_MASK_INITIAL: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[A-Z]\.").unwrap());
 
 pub struct Checker {
     pub max_filename_len: usize,
@@ -85,6 +227,7 @@ impl Checker {
         Self { max_filename_len }
     }
 
+    /// Validate a proposal from the on-device model.
     pub fn check(
         &self,
         out: &SlmOutput,
@@ -92,6 +235,47 @@ impl Checker {
         file_metadata_dates: &[String], // ISO dates from fs/doc properties
         file_modified_iso: &str,
         ettin_date: Option<&str>, // top DATE span from the Ettin lane, if any
+    ) -> Result<Validated, CheckError> {
+        self.check_with(
+            out,
+            harvest,
+            file_metadata_dates,
+            file_modified_iso,
+            ettin_date,
+            Source::Model,
+        )
+    }
+
+    /// Validate a correction typed by the user in the review pane. Same safety
+    /// rules; the model-style rules (word count, forward-date ceiling) are the
+    /// human's call, because rejecting their answer leaves the file stuck with
+    /// no path forward.
+    pub fn check_human(
+        &self,
+        out: &SlmOutput,
+        harvest: &Harvest,
+        file_metadata_dates: &[String],
+        file_modified_iso: &str,
+        ettin_date: Option<&str>,
+    ) -> Result<Validated, CheckError> {
+        self.check_with(
+            out,
+            harvest,
+            file_metadata_dates,
+            file_modified_iso,
+            ettin_date,
+            Source::Human,
+        )
+    }
+
+    fn check_with(
+        &self,
+        out: &SlmOutput,
+        harvest: &Harvest,
+        file_metadata_dates: &[String],
+        file_modified_iso: &str,
+        ettin_date: Option<&str>,
+        source: Source,
     ) -> Result<Validated, CheckError> {
         let mut soft_flags = Vec::new();
 
@@ -102,28 +286,54 @@ impl Checker {
         }
 
         // ---- date ----------------------------------------------------------
-        let (date_iso, date_source) = if out.date == "none" || out.date_source == "none" {
+        // Only a literal "none" takes the fallback. A model that proposes a
+        // real, evidence-backed date but mislabels its provenance must not lose
+        // that date — DATE_SOURCE_CORRECTED already records the disagreement.
+        let (date_iso, date_source) = if out.date == "none" {
             // Undated documents exist (policies, org charts). Fall back to the
             // file modified date and be honest about provenance in the index.
-            (file_modified_iso.to_string(), "metadata".to_string())
+            // This is the one path where a string becomes a filename without
+            // the model's involvement, so it gets the same parse and range
+            // check as anything else.
+            let d = NaiveDate::parse_from_str(file_modified_iso, "%Y-%m-%d")
+                .map_err(|_| CheckError::BadDate(file_modified_iso.to_string()))?;
+            Self::range_check(d, file_modified_iso, source, &mut soft_flags)?;
+            soft_flags.push("DATE_FROM_FILE_MTIME".into());
+            (d.format("%Y-%m-%d").to_string(), "metadata".to_string())
         } else {
             let d = NaiveDate::parse_from_str(&out.date, "%Y-%m-%d")
                 .map_err(|_| CheckError::BadDate(out.date.clone()))?;
-            let today = Utc::now().date_naive();
-            let min = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
-            if d < min || d > today + Duration::days(30) {
-                return Err(CheckError::DateOutOfRange(out.date.clone()));
-            }
+            Self::range_check(d, &out.date, source, &mut soft_flags)?;
             // Anti-hallucination tripwire: the date must exist somewhere we
             // can point to.
-            let in_doc = harvest.dates.iter().any(|f| f.iso == out.date);
+            let evidence: Vec<&harvest::FoundDate> =
+                harvest.dates.iter().filter(|f| f.iso == out.date).collect();
+            let in_doc = !evidence.is_empty();
             let in_meta = file_metadata_dates.iter().any(|m| m == &out.date);
             if !in_doc && !in_meta {
                 return Err(CheckError::DateNotInEvidence(out.date.clone()));
             }
             let src = if in_doc { "document" } else { "metadata" };
             if src != out.date_source {
-                soft_flags.push(format!("DATE_SOURCE_CORRECTED:{}->{}", out.date_source, src));
+                soft_flags.push(format!(
+                    "DATE_SOURCE_CORRECTED:{}->{}",
+                    out.date_source, src
+                ));
+            }
+            if in_doc {
+                // A date whose only support is a day-first re-reading of an
+                // ambiguous numeric form is a coin flip; say so rather than
+                // shipping `date_source: "document"` with full confidence.
+                if evidence.iter().all(|f| f.ambiguous) {
+                    soft_flags.push("DATE_AMBIGUOUS_FORMAT".into());
+                }
+                // Letterhead and date lines live at the top. A date found only
+                // deep in the body is far likelier to be a reference to some
+                // other document's date.
+                let first = evidence.iter().map(|f| f.offset).min().unwrap_or(0);
+                if first > HEAD_REGION_BYTES {
+                    soft_flags.push("DATE_FROM_BODY".into());
+                }
             }
             (out.date.clone(), src.to_string())
         };
@@ -136,7 +346,11 @@ impl Checker {
         }
 
         // ---- subject -------------------------------------------------------
-        let subject = self.sanitize_subject(&out.subject)?;
+        let (subject, subject_flags) = self.sanitize_subject_inner(&out.subject, source)?;
+        soft_flags.extend(subject_flags);
+        if source == Source::Model && subject_grounded(&subject, harvest) == Some(false) {
+            soft_flags.push("SUBJECT_UNGROUNDED".into());
+        }
 
         // ---- description ---------------------------------------------------
         let description = Self::validate_description(&out.description, &subject)?;
@@ -145,59 +359,172 @@ impl Checker {
         let base_name = format!("{date_iso} {subject}");
         // Reserve room for " (99)" collision suffix + "." + a long extension.
         if base_name.chars().count() + 12 > self.max_filename_len {
-            return Err(CheckError::TooLong(base_name.chars().count(), self.max_filename_len));
+            return Err(CheckError::TooLong(
+                base_name.chars().count(),
+                self.max_filename_len,
+            ));
         }
 
-        Ok(Validated { date_iso, date_source, subject, description, base_name, soft_flags })
+        Ok(Validated {
+            date_iso,
+            date_source,
+            subject,
+            description,
+            base_name,
+            soft_flags,
+        })
+    }
+
+    fn range_check(
+        d: NaiveDate,
+        raw: &str,
+        source: Source,
+        soft_flags: &mut Vec<String>,
+    ) -> Result<(), CheckError> {
+        let today = Utc::now().date_naive();
+        let min = NaiveDate::from_ymd_opt(DATE_FLOOR_YEAR, 1, 1).unwrap();
+        let hard_max = today + Duration::days(FUTURE_HARD_DAYS);
+        if d < min || (source == Source::Model && d > hard_max) {
+            return Err(CheckError::DateOutOfRange(raw.to_string()));
+        }
+        if d > today + Duration::days(FUTURE_SOFT_DAYS) {
+            soft_flags.push("DATE_IN_FUTURE".into());
+        }
+        Ok(())
     }
 
     pub fn sanitize_subject(&self, raw: &str) -> Result<String, CheckError> {
-        let mut s = RE_ILLEGAL.replace_all(raw, " ").to_string();
+        self.sanitize_subject_inner(raw, Source::Model)
+            .map(|(s, _)| s)
+    }
+
+    /// Sanitize a subject the user typed. Illegal characters, PII and the
+    /// generic-scanner-default check still apply; the word count does not.
+    pub fn sanitize_subject_human(&self, raw: &str) -> Result<String, CheckError> {
+        self.sanitize_subject_inner(raw, Source::Human)
+            .map(|(s, _)| s)
+    }
+
+    fn sanitize_subject_inner(
+        &self,
+        raw: &str,
+        source: Source,
+    ) -> Result<(String, Vec<String>), CheckError> {
+        let mut flags = Vec::new();
+
+        // NFC first so a decomposed "é" is one char for every rule below and
+        // one char in the filename SharePoint stores.
+        let mut s: String = raw.nfc().collect();
+        s = RE_ZERO_WIDTH.replace_all(&s, "").to_string();
+        s = RE_ILLEGAL.replace_all(&s, " ").to_string();
+        s = RE_UNICODE_SPACE.replace_all(&s, " ").to_string();
         s = RE_MULTISPACE.replace_all(&s, " ").trim().to_string();
         s = s.trim_matches(['.', ' ']).to_string();
 
-        let words: Vec<&str> = s.split_whitespace().collect();
-        if words.len() < 3 || words.len() > 8 {
-            return Err(CheckError::BadSubject(format!(
-                "{} words (need 3-8): '{s}'", words.len()
-            )));
+        if s.is_empty() {
+            return Err(CheckError::BadSubject("empty after sanitization".into()));
         }
-        let lower = s.to_lowercase();
-        if GENERIC_SUBJECTS.contains(&lower.as_str()) {
+
+        // The model loves to echo the date it just proposed, which composes
+        // into "2026-07-20 2026-07-20 Termination Notice".
+        if let Some(stripped) = strip_leading_date(&s) {
+            if stripped.is_empty() {
+                return Err(CheckError::BadSubject(format!(
+                    "subject is only a date: '{s}'"
+                )));
+            }
+            s = stripped;
+            flags.push("SUBJECT_DATE_STRIPPED".into());
+        }
+        // …and to echo the source filename, which composes into "….pdf.pdf".
+        if let Some(m) = RE_TRAILING_EXT.find(&s) {
+            let stripped = s[..m.start()].trim().to_string();
+            if !stripped.is_empty() {
+                s = stripped;
+                flags.push("SUBJECT_EXT_STRIPPED".into());
+            }
+        }
+
+        // Generic check runs BEFORE the size gate. Behind it, every entry in
+        // the list is short enough to die at the word count first, which is why
+        // "Scanned Document 001" and "New Microsoft Word Document" sailed
+        // through to SharePoint for the entire life of this rule.
+        if is_generic_subject(&s) {
             return Err(CheckError::BadSubject(format!("generic subject '{s}'")));
         }
-        if RE_SSN.is_match(&s) || RE_CCN.is_match(&s) {
+
+        // Proportion, not presence: one Japanese company name inside an English
+        // title is still an English title, and switching it to the character
+        // bound rejected "Invoice from 株式会社 Acme Trading Company Limited
+        // Group Holdings" at 53 characters. The second clause covers the real
+        // target — a subject with no whitespace word structure to count at all.
+        if unspaced_script_majority(&s)
+            || (RE_UNSPACED_SCRIPT.is_match(&s) && subject_words(&s).len() < 2)
+        {
+            let n = s.chars().filter(|c| !c.is_whitespace()).count();
+            if !(SUBJECT_MIN_CHARS_UNSPACED..=SUBJECT_MAX_CHARS_UNSPACED).contains(&n) {
+                return Err(CheckError::BadSubject(format!(
+                    "{n} characters (need {SUBJECT_MIN_CHARS_UNSPACED}-{SUBJECT_MAX_CHARS_UNSPACED}): '{s}'"
+                )));
+            }
+        } else {
+            let words = subject_words(&s);
+            if words.is_empty() {
+                return Err(CheckError::BadSubject(format!("no word characters: '{s}'")));
+            }
+            if source == Source::Model
+                && !(SUBJECT_MIN_WORDS..=SUBJECT_MAX_WORDS).contains(&words.len())
+            {
+                return Err(CheckError::BadSubject(format!(
+                    "{} words (need {SUBJECT_MIN_WORDS}-{SUBJECT_MAX_WORDS}): '{s}'",
+                    words.len()
+                )));
+            }
+        }
+
+        if contains_ssn(&s) || contains_card_number(&s) {
             return Err(CheckError::BadSubject(
                 "subject contains an identifier pattern (SSN/card-like)".into(),
             ));
         }
-        Ok(s)
+        Ok((s, flags))
     }
 
     fn validate_description(raw: &str, subject: &str) -> Result<String, CheckError> {
         let d = raw.trim().replace(['\n', '\r'], " ");
         let d = RE_MULTISPACE.replace_all(&d, " ").to_string();
         let n = d.chars().count();
-        if !(15..=200).contains(&n) {
-            return Err(CheckError::BadDescription(format!("{n} chars (need 15-200)")));
+        // An unspaced script says as much in 8 characters as English does in 15.
+        let min = if unspaced_script_majority(&d) { 8 } else { 15 };
+        if !(min..=200).contains(&n) {
+            return Err(CheckError::BadDescription(format!(
+                "{n} chars (need {min}-200)"
+            )));
         }
-        let terminals = RE_SENTENCE_END.find_iter(&d).count();
-        let ends_ok = d.ends_with(['.', '!', '?']);
-        // Allow internal periods only for common abbreviations by tolerating
-        // up to 2 terminal marks when the string ends with one.
-        if !ends_ok || terminals > 2 {
+        // Count terminals only after masking abbreviations, initials, decimals
+        // and ellipses. The old raw count tolerated two terminals, so "U.S."
+        // alone consumed both slots and rejected exactly the legal/corporate
+        // prose this corpus is made of — while the rambling two-sentence
+        // description the rule exists to prevent still got through.
+        let masked = mask_non_terminals(&d);
+        let terminals = RE_SENTENCE_END.find_iter(&masked).count();
+        let ends_ok = RE_SENTENCE_END
+            .find_iter(&masked)
+            .last()
+            .is_some_and(|m| m.end() == masked.len());
+        if terminals != 1 || !ends_ok {
             return Err(CheckError::BadDescription(
                 "must be exactly one sentence ending in terminal punctuation".into(),
             ));
         }
-        if d.to_lowercase() == subject.to_lowercase()
-            || d.to_lowercase().trim_end_matches('.') == subject.to_lowercase()
-        {
+        let dl = d.to_lowercase();
+        let sl = subject.to_lowercase();
+        if dl == sl || dl.trim_end_matches(['.', '。']) == sl {
             return Err(CheckError::BadDescription(
                 "description merely restates the filename subject".into(),
             ));
         }
-        if RE_SSN.is_match(&d) || RE_CCN.is_match(&d) {
+        if contains_ssn(&d) || contains_card_number(&d) {
             return Err(CheckError::BadDescription(
                 "description contains an identifier pattern".into(),
             ));
@@ -206,23 +533,337 @@ impl Checker {
     }
 }
 
-/// ISO dates derivable from filesystem metadata for the presence check.
-pub fn fs_metadata_dates(path: &std::path::Path) -> (Vec<String>, String) {
-    let mut dates = Vec::new();
-    let mut modified_iso = Utc::now().date_naive().format("%Y-%m-%d").to_string();
-    if let Ok(meta) = std::fs::metadata(path) {
-        if let Ok(m) = meta.modified() {
-            let dt: chrono::DateTime<Utc> = m.into();
-            modified_iso = format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day());
-            dates.push(modified_iso.clone());
-        }
-        if let Ok(c) = meta.created() {
-            let dt: chrono::DateTime<Utc> = c.into();
-            dates.push(format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day()));
+/// True when most of the letters are from a script that does not separate words
+/// with spaces, which is when a whitespace word count is structurally incapable
+/// of judging the text. A single Han/Kana/Thai character is not enough.
+fn unspaced_script_majority(s: &str) -> bool {
+    let mut buf = [0u8; 4];
+    let mut letters = 0usize;
+    let mut unspaced = 0usize;
+    for c in s.chars().filter(|c| c.is_alphanumeric()) {
+        letters += 1;
+        if RE_UNSPACED_SCRIPT.is_match(c.encode_utf8(&mut buf)) {
+            unspaced += 1;
         }
     }
+    letters > 0 && unspaced * 2 > letters
+}
+
+/// Split on whitespace and on the joiners a filename-derived title uses, so
+/// "2026-07-20_Termination_Notice_Smith" is not counted as a single word.
+fn subject_words(s: &str) -> Vec<&str> {
+    s.split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/')
+        .filter(|w| w.chars().any(char::is_alphanumeric))
+        .collect()
+}
+
+/// A leading date the model echoed from its own `date` field, plus whatever
+/// separator followed it. Returns `None` when the subject does not start with a
+/// date.
+fn strip_leading_date(s: &str) -> Option<String> {
+    // '_' is a regex word character, so "2026-07-20_Notice" hides its own date
+    // from the harvester's word boundaries. Probe a copy with the joiner
+    // spaced out; both are one byte, so offsets and lengths still line up.
+    let probe = s.replace('_', " ");
+    let d = harvest::extract_dates(&probe)
+        .into_iter()
+        .find(|d| d.offset == 0)?;
+    let rest = &s[d.raw.len()..];
+    Some(
+        rest.trim_start_matches([' ', '-', '_', ':', ',', '.', '–', '—'])
+            .trim()
+            .to_string(),
+    )
+}
+
+/// True when every content token is a scanner default. Serial suffixes and
+/// "New "/"Copy of " prefixes are stripped first because "Scanned Document 001"
+/// and the bare "Scanned Document" are the same failure.
+fn is_generic_subject(s: &str) -> bool {
+    let core = RE_TRAILING_SERIAL.replace(s, "");
+    let core = RE_LEADING_QUALIFIER.replace(&core, "");
+    let mut any = false;
+    for tok in core.split(|c: char| !c.is_alphanumeric()) {
+        if tok.is_empty() {
+            continue;
+        }
+        any = true;
+        if !GENERIC_SUBJECT_TOKENS.contains(&tok.to_lowercase().as_str()) {
+            return false;
+        }
+    }
+    any
+}
+
+/// Every scrap of text the harvest could point at, lowercased.
+fn evidence_text(h: &Harvest) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for v in [&h.subject_lines, &h.headings, &h.caption_lines] {
+        parts.extend(v.iter().map(String::as_str));
+    }
+    parts.push(&h.head_excerpt);
+    parts.push(&h.signature_block);
+    parts.join("\n").to_lowercase()
+}
+
+/// Does the proposed subject actually come from the document?
+///
+/// `None` when the question cannot be answered — no evidence text at all, or a
+/// subject made entirely of doc-type words — because a flag we cannot justify
+/// is worse than no flag.
+///
+/// Matching is by whole token and a majority of the subject's content tokens
+/// must be found. The first cut was a substring search that accepted on any one
+/// token: against a document headed "TERMINATION OF EMPLOYMENT - JOHN SMITH" it
+/// grounded "Termination Notice for Jane Doe" and "…for Maria Alvarez" alike,
+/// so it never fired for the invented-name failure it exists to catch, and
+/// "law" grounded on "unlawful". It stays a soft flag, and it stays imperfect:
+/// a half-invented "…for Jane Smith" still clears the majority.
+pub fn subject_grounded(subject: &str, harvest: &Harvest) -> Option<bool> {
+    let text = evidence_text(harvest);
+    let evidence: std::collections::HashSet<&str> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if evidence.is_empty() {
+        return None;
+    }
+    let tokens: Vec<String> = subject
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|t| t.chars().count() >= 3)
+        .filter(|t| !t.chars().all(|c| c.is_ascii_digit()))
+        .filter(|t| !UNGROUNDING_TOKENS.contains(&t.as_str()))
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let found = tokens
+        .iter()
+        .filter(|t| evidence.contains(t.as_str()))
+        .count();
+    Some(found * 2 >= tokens.len())
+}
+
+/// Replace the periods that are not sentence ends with '-', preserving length
+/// so the "terminal is the final character" test stays meaningful.
+///
+/// The description's own last character is held back from the mask pass. A
+/// trailing abbreviation ("…issued to Beta Holdings Inc.", "…at 4 Elm St.")
+/// otherwise has its full stop rewritten, leaving zero terminals and rejecting
+/// ordinary output — the same dead end as the raw terminal count, reached from
+/// the other side.
+fn mask_non_terminals(d: &str) -> String {
+    let (body, tail) = match d.chars().next_back() {
+        Some(c) if TERMINALS.contains(&c) => d.split_at(d.len() - c.len_utf8()),
+        _ => (d, ""),
+    };
+    let mut m = body.to_string();
+    for re in [
+        &*RE_MASK_ELLIPSIS,
+        &*RE_MASK_DECIMAL,
+        &*RE_MASK_ABBREV,
+        &*RE_MASK_INITIAL,
+    ] {
+        m = re
+            .replace_all(&m, |c: &regex::Captures| c[0].replace('.', "-"))
+            .to_string();
+    }
+    m.push_str(tail);
+    m
+}
+
+/// The PAN lengths that go with a run's issuer prefix, empty when no real
+/// issuer starts that way.
+///
+/// Luhn alone accepts one arbitrary digit string in ten, so a checksum with a
+/// free starting position is not a filter at all: sliding 13..=19 over a
+/// 20-digit run tries 35 windows and rejected 197 of 200 pseudo-random runs
+/// (`luhn_alone_is_not_a_filter` measures it). The issuer prefix is what makes
+/// the rule mean something.
+fn issuer_lengths(digits: &[u8]) -> &'static [usize] {
+    let d = |i: usize| digits.get(i).map_or(u32::MAX, |v| u32::from(*v));
+    let n2 = d(0) * 10 + d(1);
+    let n3 = n2 * 10 + d(2);
+    let n4 = n3 * 10 + d(3);
+    if d(0) == 4 {
+        &[13, 16, 19] // Visa
+    } else if (51..=55).contains(&n2) || (2221..=2720).contains(&n4) {
+        &[16] // Mastercard
+    } else if n2 == 34 || n2 == 37 {
+        &[15] // American Express
+    } else if n4 == 6011 || n2 == 65 {
+        &[16] // Discover
+    } else if (300..=305).contains(&n3) || n4 == 3095 || n2 == 36 || n2 == 38 || n2 == 39 {
+        &[14] // Diners Club
+    } else {
+        &[]
+    }
+}
+
+/// True when a run of digits really is a payment card number, or begins with
+/// one.
+///
+/// Only offset 0 is ever tried, and only at the lengths that issuer's cards are
+/// actually printed at, so "Tracking 12345678901234567890 received" and
+/// "Meter 000000000000000000 unit" — the latter Luhn-valid, being all zeros —
+/// are not identifiers. A PAN buried in the *middle* of a longer run is
+/// deliberately not detected: no anchor is left, and the false-positive rate
+/// that buys costs the office worker three model attempts and a Needs Review
+/// entry on an invoice reference number.
+fn pan_at_start(digits: &[u8]) -> bool {
+    let lengths = issuer_lengths(digits);
+    if lengths.is_empty() {
+        return false;
+    }
+    if (13..=19).contains(&digits.len()) && luhn_ok(digits) {
+        return true;
+    }
+    lengths
+        .iter()
+        .any(|&n| n <= digits.len() && luhn_ok(&digits[..n]))
+}
+
+fn luhn_ok(digits: &[u8]) -> bool {
+    let mut sum = 0u32;
+    for (i, d) in digits.iter().rev().enumerate() {
+        let mut v = u32::from(*d);
+        if i % 2 == 1 {
+            v *= 2;
+            if v > 9 {
+                v -= 9;
+            }
+        }
+        sum += v;
+    }
+    sum.is_multiple_of(10)
+}
+
+/// True when the text contains something that really is a payment card number.
+///
+/// The old rule was `\b(?:\d[ -]?){13,19}\b` with no checksum, which hard-
+/// rejected "Invoice covering 2026-07-20 2026-07-21 period", "Meter readings
+/// 1234567 8901234 recorded" and "ISBN 978-0-13-235088-4 copy" — invoices and
+/// timesheets, i.e. exactly the high-volume document types this appliance
+/// exists for — while telling the user their file "contains an identifier
+/// pattern".
+fn contains_card_number(s: &str) -> bool {
+    for m in RE_DIGIT_RUN.find_iter(s) {
+        let run = m.as_str();
+        // A card is written 4111111111111111, "4111 1111 1111 1111" or
+        // "4111-1111-1111-1111" — never with a mix. A mixed run is a date
+        // range or a docket string.
+        let seps: Vec<char> = run.chars().filter(|c| !c.is_ascii_digit()).collect();
+        let sep = match seps.first() {
+            None => None,
+            Some(&c) if seps.iter().all(|&x| x == c) => Some(c),
+            _ => continue,
+        };
+        if let Some(sep) = sep {
+            // Card groupings are 4-4-4-4 or 4-6-5. An ISBN's 3-1-2-6-1 and a
+            // pair of 7-digit meter readings are not cards.
+            if run.split(sep).any(|g| g.len() < 3 || g.len() > 6) {
+                continue;
+            }
+        }
+        let digits: Vec<u8> = run
+            .chars()
+            .filter_map(|c| c.to_digit(10).map(|d| d as u8))
+            .collect();
+        if digits.len() < 13 {
+            continue;
+        }
+        // A separated run is the whole number by construction; an unseparated
+        // one may be a PAN with trailing digits glued on, which the old
+        // trailing \b meant was not examined at all. Either way the number has
+        // to start where the run starts.
+        if pan_at_start(&digits) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when the text contains something that really is an SSN. A trailing
+/// group that is a plausible year, or a match the date harvester reads as a
+/// date, is a date — and "contains an identifier pattern" is then both false
+/// and unactionable.
+fn contains_ssn(s: &str) -> bool {
+    RE_SSN.captures_iter(s).any(|c| {
+        let tail: i32 = c[3].parse().unwrap_or(0);
+        if (1900..=2100).contains(&tail) {
+            return false;
+        }
+        harvest::extract_dates(c.get(0).unwrap().as_str()).is_empty()
+    })
+}
+
+/// ISO dates derivable from filesystem metadata for the presence check.
+pub fn fs_metadata_dates(path: &std::path::Path) -> (Vec<String>, String) {
+    let meta = std::fs::metadata(path).ok();
+    let modified = meta.as_ref().and_then(|m| m.modified().ok());
+    let created = meta.as_ref().and_then(|m| m.created().ok());
+    metadata_date_strings(modified, created)
+}
+
+/// Split out from `fs_metadata_dates` so the calendar arithmetic is testable
+/// without touching a filesystem.
+fn metadata_date_strings(
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+) -> (Vec<String>, String) {
+    metadata_date_strings_in(modified, created, &Local)
+}
+
+/// The zone is a parameter because the whole point of this function is that the
+/// calendar day comes from the user's zone rather than UTC — and under the
+/// `TZ=UTC` of a CI box the two readings are identical, so a test that reads the
+/// ambient zone passes just as well against the UTC-only code this replaced.
+fn metadata_date_strings_in<Tz: TimeZone>(
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    tz: &Tz,
+) -> (Vec<String>, String) {
+    let mut dates = Vec::new();
+    // The user's calendar is the local one: a file saved at 17:00 Pacific on
+    // 2026-07-20 has a UTC mtime of 2026-07-21, and the undated fallback would
+    // put that wrong day straight into the filename while Explorer shows the
+    // user 7/20. Both readings go into the candidate list so the presence check
+    // still accepts a model that read the UTC value from document properties.
+    let mut modified_iso = Utc::now()
+        .with_timezone(tz)
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    if let Some(m) = modified {
+        let (local, utc) = local_and_utc_dates(m, tz);
+        modified_iso = local.clone();
+        dates.push(local);
+        dates.push(utc);
+    }
+    if let Some(c) = created {
+        let (local, utc) = local_and_utc_dates(c, tz);
+        dates.push(local);
+        dates.push(utc);
+    }
+    (dedup_dates(dates), modified_iso)
+}
+
+fn local_and_utc_dates<Tz: TimeZone>(t: std::time::SystemTime, tz: &Tz) -> (String, String) {
+    let utc: chrono::DateTime<Utc> = t.into();
+    let iso = |d: chrono::NaiveDate| d.format("%Y-%m-%d").to_string();
+    (
+        iso(utc.with_timezone(tz).date_naive()),
+        iso(utc.date_naive()),
+    )
+}
+
+/// `Vec::dedup` only collapses *consecutive* duplicates, so created-vs-modified
+/// on the same day survived it whenever anything sat between them.
+fn dedup_dates(mut dates: Vec<String>) -> Vec<String> {
+    dates.sort();
     dates.dedup();
-    (dates, modified_iso)
+    dates
 }
 
 #[cfg(test)]
@@ -232,7 +873,10 @@ mod tests {
 
     fn harvest_with(dates: &[&str]) -> Harvest {
         let text = dates.join(" and ");
-        Harvest { dates: harvest::extract_dates(&text), ..Default::default() }
+        Harvest {
+            dates: harvest::extract_dates(&text),
+            ..Default::default()
+        }
     }
 
     fn ok_out() -> SlmOutput {
@@ -244,13 +888,25 @@ mod tests {
         }
     }
 
+    fn today_plus(days: i64) -> String {
+        (Utc::now().date_naive() + Duration::days(days))
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    // ---- date rules ----------------------------------------------------
+
     #[test]
     fn accepts_valid_output() {
         let c = Checker::new(120);
         let h = harvest_with(&["2026-07-20"]);
         let v = c.check(&ok_out(), &h, &[], "2026-07-21", None).unwrap();
         assert_eq!(v.base_name, "2026-07-20 Termination Notice for John Smith");
-        assert!(v.soft_flags.is_empty());
+        assert!(
+            v.soft_flags.is_empty(),
+            "unexpected flags: {:?}",
+            v.soft_flags
+        );
     }
 
     #[test]
@@ -258,19 +914,157 @@ mod tests {
         let c = Checker::new(120);
         let h = harvest_with(&["2026-01-05"]);
         let e = c.check(&ok_out(), &h, &[], "2026-07-21", None).unwrap_err();
-        matches!(e, CheckError::DateNotInEvidence(_));
+        // Was a bare `matches!(...)` expression statement: it asserted nothing.
+        assert!(matches!(e, CheckError::DateNotInEvidence(_)), "got {e:?}");
+        assert_eq!(e.code(), "DATE_NOT_IN_EVIDENCE");
     }
 
     #[test]
-    fn rejects_future_and_ancient_dates() {
+    fn date_range_boundaries() {
+        let c = Checker::new(120);
+        // (date, expected error code or None for accept)
+        let cases: Vec<(String, Option<&str>)> = vec![
+            ("1799-12-31".into(), Some("DATE_OUT_OF_RANGE")),
+            ("1800-01-01".into(), None),
+            ("2026-07-20".into(), None),
+            (today_plus(60), None),  // routine forward-dated lease
+            (today_plus(399), None), // still inside the widened ceiling
+            (today_plus(401), Some("DATE_OUT_OF_RANGE")),
+            ("2026-02-30".into(), Some("BAD_DATE")),
+            ("July 20 2026".into(), Some("BAD_DATE")),
+        ];
+        for (date, want) in cases {
+            let mut o = ok_out();
+            o.date = date.clone();
+            // Feed the same date as metadata so only the range rule is in play.
+            let r = c.check(
+                &o,
+                &Harvest::default(),
+                std::slice::from_ref(&date),
+                "2026-07-21",
+                None,
+            );
+            match want {
+                None => assert!(r.is_ok(), "{date} should be accepted, got {:?}", r.err()),
+                Some(code) => assert_eq!(r.unwrap_err().code(), code, "for {date}"),
+            }
+        }
+    }
+
+    #[test]
+    fn forward_dated_beyond_thirty_days_is_soft_flagged() {
         let c = Checker::new(120);
         let mut o = ok_out();
-        o.date = "2062-07-20".into();
-        let h = harvest_with(&["2062-07-20"]);
-        assert!(c.check(&o, &h, &[], "2026-07-21", None).is_err());
-        o.date = "1899-12-31".into();
-        let h = harvest_with(&["1899-12-31"]);
-        assert!(c.check(&o, &h, &[], "2026-07-21", None).is_err());
+        o.date = today_plus(60);
+        o.date_source = "metadata".into();
+        let v = c
+            .check(
+                &o,
+                &Harvest::default(),
+                &[o.date.clone()],
+                "2026-07-21",
+                None,
+            )
+            .unwrap();
+        assert!(
+            v.soft_flags.iter().any(|f| f == "DATE_IN_FUTURE"),
+            "{:?}",
+            v.soft_flags
+        );
+    }
+
+    #[test]
+    fn human_date_beyond_the_ceiling_is_accepted() {
+        // The review pane must never be a dead end: a human who knows the date
+        // is authoritative for the range, and still gets the soft flag.
+        let c = Checker::new(120);
+        let mut o = ok_out();
+        o.date = today_plus(900);
+        o.date_source = "metadata".into();
+        assert!(c
+            .check(
+                &o,
+                &Harvest::default(),
+                &[o.date.clone()],
+                "2026-07-21",
+                None
+            )
+            .is_err());
+        let v = c
+            .check_human(
+                &o,
+                &Harvest::default(),
+                &[o.date.clone()],
+                "2026-07-21",
+                None,
+            )
+            .unwrap();
+        assert!(v.soft_flags.iter().any(|f| f == "DATE_IN_FUTURE"));
+    }
+
+    #[test]
+    fn metadata_evidence_path_corrects_the_source() {
+        // Every pre-existing test passed &[] here, so this whole branch was
+        // dead in the suite.
+        let c = Checker::new(120);
+        let mut o = ok_out();
+        o.date_source = "document".into();
+        let v = c
+            .check(
+                &o,
+                &Harvest::default(),
+                &["2026-07-20".into()],
+                "2026-07-21",
+                None,
+            )
+            .unwrap();
+        assert_eq!(v.date_source, "metadata");
+        assert!(
+            v.soft_flags
+                .contains(&"DATE_SOURCE_CORRECTED:document->metadata".to_string()),
+            "{:?}",
+            v.soft_flags
+        );
+    }
+
+    #[test]
+    fn document_evidence_corrects_a_metadata_claim() {
+        let c = Checker::new(120);
+        let mut o = ok_out();
+        o.date_source = "metadata".into();
+        let v = c
+            .check(&o, &harvest_with(&["2026-07-20"]), &[], "2026-07-21", None)
+            .unwrap();
+        assert_eq!(v.date_source, "document");
+        assert!(v
+            .soft_flags
+            .contains(&"DATE_SOURCE_CORRECTED:metadata->document".to_string()));
+    }
+
+    #[test]
+    fn a_real_date_survives_a_wrong_source_token() {
+        // The old `out.date == "none" || out.date_source == "none"` threw away
+        // a correct, evidence-backed date over one wrong enum token and filed
+        // the document under the day it happened to be processed.
+        let c = Checker::new(120);
+        let mut o = ok_out();
+        o.date_source = "none".into();
+        let v = c
+            .check(&o, &harvest_with(&["2026-07-20"]), &[], "2026-07-21", None)
+            .unwrap();
+        assert_eq!(v.date_iso, "2026-07-20");
+        assert_eq!(v.date_source, "document");
+    }
+
+    #[test]
+    fn bad_date_source_token_is_rejected() {
+        let c = Checker::new(120);
+        let mut o = ok_out();
+        o.date_source = "guess".into();
+        let e = c
+            .check(&o, &harvest_with(&["2026-07-20"]), &[], "2026-07-21", None)
+            .unwrap_err();
+        assert_eq!(e.code(), "BAD_DATE_SOURCE");
     }
 
     #[test]
@@ -279,44 +1073,664 @@ mod tests {
         let mut o = ok_out();
         o.date = "none".into();
         o.date_source = "none".into();
-        let v = c.check(&o, &Harvest::default(), &[], "2026-07-21", None).unwrap();
+        let v = c
+            .check(&o, &Harvest::default(), &[], "2026-07-21", None)
+            .unwrap();
         assert_eq!(v.date_iso, "2026-07-21");
         assert_eq!(v.date_source, "metadata");
+        assert!(v.soft_flags.contains(&"DATE_FROM_FILE_MTIME".to_string()));
     }
 
     #[test]
-    fn strips_illegal_chars_and_rejects_generic() {
+    fn undated_fallback_validates_the_mtime_string() {
+        // The one branch where a string used to reach a filename with no parse,
+        // no range bound and no sanitization at all.
         let c = Checker::new(120);
-        assert_eq!(
-            c.sanitize_subject("Invoice #4411: Acme/Q3 <final>").unwrap(),
-            "Invoice 4411 Acme Q3 final"
-        );
-        assert!(c.sanitize_subject("Scanned Document").is_err()); // 2 words
-        assert!(c.sanitize_subject("Document").is_err());
-    }
-
-    #[test]
-    fn rejects_ssn_in_subject() {
-        let c = Checker::new(120);
-        assert!(c.sanitize_subject("W2 for 123-45-6789 John Smith").is_err());
-    }
-
-    #[test]
-    fn description_must_be_one_sentence() {
-        let c = Checker::new(120);
-        let h = harvest_with(&["2026-07-20"]);
         let mut o = ok_out();
-        o.description = "First sentence. Second sentence. Third one here.".into();
-        assert!(c.check(&o, &h, &[], "2026-07-21", None).is_err());
-        o.description = "no terminal punctuation at all here sadly".into();
-        assert!(c.check(&o, &h, &[], "2026-07-21", None).is_err());
+        o.date = "none".into();
+        o.date_source = "none".into();
+        for bad in ["", "not-a-date", "2026-13-45", "20260721"] {
+            let e = c
+                .check(&o, &Harvest::default(), &[], bad, None)
+                .unwrap_err();
+            assert_eq!(e.code(), "BAD_DATE", "for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_only_evidence_is_flagged() {
+        let c = Checker::new(120);
+        let mut o = ok_out();
+        // 03/04/2026: US reading 2026-03-04, day-first alternate 2026-04-03.
+        o.date = "2026-04-03".into();
+        o.description = "Letter from Acme Corporation about the April schedule change.".into();
+        let h = Harvest {
+            dates: harvest::extract_dates("effective 03/04/2026"),
+            ..Default::default()
+        };
+        let v = c.check(&o, &h, &[], "2026-07-21", None).unwrap();
+        assert!(
+            v.soft_flags.contains(&"DATE_AMBIGUOUS_FORMAT".to_string()),
+            "{:?}",
+            v.soft_flags
+        );
+
+        o.date = "2026-03-04".into();
+        let v = c.check(&o, &h, &[], "2026-07-21", None).unwrap();
+        assert!(!v.soft_flags.contains(&"DATE_AMBIGUOUS_FORMAT".to_string()));
+    }
+
+    #[test]
+    fn a_date_only_in_the_body_is_flagged() {
+        let c = Checker::new(120);
+        let text = format!(
+            "{} the date 2026-07-20 appears here",
+            "filler word ".repeat(200)
+        );
+        let h = Harvest {
+            dates: harvest::extract_dates(&text),
+            ..Default::default()
+        };
+        let v = c.check(&ok_out(), &h, &[], "2026-07-21", None).unwrap();
+        assert!(
+            v.soft_flags.contains(&"DATE_FROM_BODY".to_string()),
+            "{:?}",
+            v.soft_flags
+        );
     }
 
     #[test]
     fn span_mismatch_is_soft() {
         let c = Checker::new(120);
         let h = harvest_with(&["2026-07-20", "2026-06-01"]);
-        let v = c.check(&ok_out(), &h, &[], "2026-07-21", Some("2026-06-01")).unwrap();
+        let v = c
+            .check(&ok_out(), &h, &[], "2026-07-21", Some("2026-06-01"))
+            .unwrap();
         assert!(v.soft_flags.iter().any(|f| f.starts_with("SPAN_MISMATCH")));
+    }
+
+    // ---- subject rules --------------------------------------------------
+
+    #[test]
+    fn subject_table() {
+        let c = Checker::new(160);
+        // (raw subject, Some(expected output) for accept | None for reject)
+        let cases: &[(&str, Option<&str>)] = &[
+            (
+                "Invoice #4411: Acme/Q3 <final>",
+                Some("Invoice 4411 Acme Q3 final"),
+            ),
+            // C1: scanner defaults. Every one of these returned Ok before.
+            ("Scanned Document 001", None),
+            ("New Microsoft Word Document", None),
+            ("Untitled Document 1", None),
+            ("Document from Scanner 3", None),
+            ("Scanned Document", None),
+            ("Document", None),
+            ("Copy of Document (2)", None),
+            ("### %%% ///", None),
+            // …but a real title that merely contains a generic word is fine.
+            ("Letter of Intent Acme", Some("Letter of Intent Acme")),
+            (
+                "Scanner Maintenance Agreement",
+                Some("Scanner Maintenance Agreement"),
+            ),
+            // C4: two-word document types are the commonest office convention.
+            ("Lease Agreement", Some("Lease Agreement")),
+            ("Employment Agreement", Some("Employment Agreement")),
+            ("Termination", None), // 1 word
+            (
+                "Notice of Proposed Rulemaking on Wage and Hour Compliance",
+                Some("Notice of Proposed Rulemaking on Wage and Hour Compliance"),
+            ), // 9
+            (
+                "Notice of Proposed Rulemaking on Wage and Hour Compliance Rules",
+                Some("Notice of Proposed Rulemaking on Wage and Hour Compliance Rules"),
+            ), // 10
+            (
+                "Notice of Proposed Rulemaking on Wage and Hour Compliance Rules Today",
+                None,
+            ), // 11
+            // C14: unspaced scripts can never reach 2 whitespace words, so they
+            // are judged by character count instead.
+            ("終止僱傭通知書", Some("終止僱傭通知書")),
+            ("解雇", None), // 2 chars, under the character floor
+            ("2026年7月20日 解雇通知", Some("2026年7月20日 解雇通知")),
+            // …but that switch is by proportion, not presence. One Japanese
+            // company name inside an English title is still an English title,
+            // and was being rejected at "53 characters (need 4-40)".
+            (
+                "Invoice from 株式会社 Acme Trading Company Limited Group Holdings",
+                Some("Invoice from 株式会社 Acme Trading Company Limited Group Holdings"),
+            ),
+            // Mostly-Latin must not escape the word count via one CJK glyph.
+            (
+                "Alpha Beta Gamma Delta Epsilon Zeta Eta Theta Iota Kappa 株",
+                None,
+            ),
+        ];
+        for (raw, want) in cases {
+            let got = c.sanitize_subject(raw);
+            match want {
+                Some(expect) => assert_eq!(got.as_deref().ok(), Some(*expect), "for {raw:?}"),
+                None => assert!(got.is_err(), "{raw:?} should be rejected, got {got:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn word_count_boundaries() {
+        let c = Checker::new(200);
+        for n in 1..=12usize {
+            let subject = vec!["Alpha"; n].join(" ");
+            let ok = c.sanitize_subject(&subject).is_ok();
+            assert_eq!(ok, (2..=10).contains(&n), "{n} words: {subject}");
+        }
+    }
+
+    #[test]
+    fn joined_titles_are_counted_by_their_words() {
+        let c = Checker::new(160);
+        // Counted as one word before, so it was rejected outright.
+        let s = c
+            .sanitize_subject("2026-07-20_Termination_Notice_Smith")
+            .unwrap();
+        assert_eq!(s, "Termination_Notice_Smith");
+    }
+
+    #[test]
+    fn subject_never_carries_zero_width_or_bidi_characters() {
+        let c = Checker::new(160);
+        // U+202E turns "…fdp.exe" into "…exe.pdf" in Explorer and SharePoint.
+        let s = c
+            .sanitize_subject("Notice of Termination \u{202e}fdp.exe")
+            .unwrap();
+        assert!(!s.contains('\u{202e}'), "bidi override survived: {s:?}");
+        for raw in [
+            "Termination\u{200b} Notice Smith",
+            "Termination\u{00a0}Notice Smith",
+            "Termination\u{feff} Notice Smith",
+            "Termination\u{2066} Notice\u{2069} Smith",
+            "Termination \u{200e}Notice Smith",
+        ] {
+            let s = c
+                .sanitize_subject(raw)
+                .unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+            for bad in [
+                '\u{200b}', '\u{200e}', '\u{202e}', '\u{2066}', '\u{2069}', '\u{feff}', '\u{00a0}',
+            ] {
+                assert!(!s.contains(bad), "{bad:?} survived {raw:?} -> {s:?}");
+            }
+            assert!(!s.contains("  "), "double space in {s:?}");
+        }
+    }
+
+    #[test]
+    fn nfc_normalizes_decomposed_input() {
+        let c = Checker::new(160);
+        // "Reveé" written with a combining acute.
+        let s = c
+            .sanitize_subject("Notice for Reve\u{0301}e Holdings")
+            .unwrap();
+        assert_eq!(s, "Notice for Revée Holdings");
+        assert!(!s.contains('\u{0301}'));
+    }
+
+    #[test]
+    fn subject_date_and_extension_echoes_are_stripped() {
+        let c = Checker::new(160);
+        let (s, flags) = c
+            .sanitize_subject_inner("2026-07-20 Termination Notice", Source::Model)
+            .unwrap();
+        assert_eq!(s, "Termination Notice");
+        assert!(flags.contains(&"SUBJECT_DATE_STRIPPED".to_string()));
+
+        let (s, flags) = c
+            .sanitize_subject_inner("Invoice 2024 Q3.pdf", Source::Model)
+            .unwrap();
+        assert_eq!(s, "Invoice 2024 Q3");
+        assert!(flags.contains(&"SUBJECT_EXT_STRIPPED".to_string()));
+
+        // A subject that is nothing but a date has no name left to give.
+        assert!(c.sanitize_subject("2026-07-20").is_err());
+
+        // Sub-clause numbering is not a date, so nothing may be stripped and
+        // no flag may claim it was. "1.2.34 Rent Schedule" used to come back as
+        // "Rent Schedule" with an untrue SUBJECT_DATE_STRIPPED.
+        for raw in ["1.2.34 Rent Schedule", "10.1.20 Notices and Consents"] {
+            let (s, flags) = c.sanitize_subject_inner(raw, Source::Model).unwrap();
+            assert_eq!(s, raw, "nothing should have been stripped from {raw:?}");
+            assert!(
+                !flags.contains(&"SUBJECT_DATE_STRIPPED".to_string()),
+                "{flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composed_name_contains_exactly_one_date() {
+        let c = Checker::new(120);
+        let mut o = ok_out();
+        o.subject = "2026-07-20 Termination Notice".into();
+        let v = c
+            .check(&o, &harvest_with(&["2026-07-20"]), &[], "2026-07-21", None)
+            .unwrap();
+        assert_eq!(v.base_name, "2026-07-20 Termination Notice");
+        assert_eq!(
+            harvest::extract_dates(&v.base_name)
+                .iter()
+                .filter(|d| !d.ambiguous)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn human_subject_skips_the_word_count_but_not_the_safety_rules() {
+        let c = Checker::new(160);
+        assert!(c.sanitize_subject("Termination").is_err());
+        assert_eq!(
+            c.sanitize_subject_human("Termination").unwrap(),
+            "Termination"
+        );
+        // Illegal characters and PII are still enforced for a human.
+        assert_eq!(
+            c.sanitize_subject_human("Q3/Q4 Plan").unwrap(),
+            "Q3 Q4 Plan"
+        );
+        assert!(c.sanitize_subject_human("W2 for 123-45-6789").is_err());
+        assert!(c.sanitize_subject_human("").is_err());
+    }
+
+    #[test]
+    fn subject_grounding_is_a_soft_flag_only() {
+        let c = Checker::new(160);
+        let mut h = harvest_with(&["2026-07-20"]);
+        h.headings = vec!["TERMINATION OF EMPLOYMENT - JOHN SMITH".into()];
+        h.head_excerpt = "Dear Mr. Smith,\nThis letter confirms your termination.".into();
+
+        // Grounded: "smith" appears in the evidence.
+        let v = c.check(&ok_out(), &h, &[], "2026-07-21", None).unwrap();
+        assert!(
+            !v.soft_flags.contains(&"SUBJECT_UNGROUNDED".to_string()),
+            "{:?}",
+            v.soft_flags
+        );
+
+        // Ungrounded: not one content token is anywhere in the document.
+        let mut o = ok_out();
+        o.subject = "Quarterly Bonus Schedule Alvarez".into();
+        o.description = "Letter from Acme Corporation about the quarterly bonus schedule.".into();
+        let v = c.check(&o, &h, &[], "2026-07-21", None).unwrap();
+        assert!(
+            v.soft_flags.contains(&"SUBJECT_UNGROUNDED".to_string()),
+            "{:?}",
+            v.soft_flags
+        );
+
+        // The failure the flag exists for: right document type, invented name.
+        // The first cut accepted on any single token, so "Termination" alone
+        // grounded both of these and the flag never fired.
+        for invented in [
+            "Termination Notice for Jane Doe",
+            "Termination Notice for Maria Alvarez",
+        ] {
+            assert_eq!(
+                subject_grounded(invented, &h),
+                Some(false),
+                "{invented:?} must not count as grounded"
+            );
+        }
+        assert_eq!(
+            subject_grounded("Termination Notice for John Smith", &h),
+            Some(true)
+        );
+
+        // Whole tokens, not substrings: "law" must not ground on "unlawful".
+        let lawful = Harvest {
+            headings: vec!["UNLAWFUL DETAINER PROCEEDINGS".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            subject_grounded("Law Society Bulletin", &lawful),
+            Some(false)
+        );
+
+        // With no evidence text at all the question is unanswerable, so silent.
+        assert_eq!(
+            subject_grounded("Quarterly Bonus Schedule", &Harvest::default()),
+            None
+        );
+        // A subject made only of doc-type words grounds nothing either way.
+        assert_eq!(subject_grounded("Letter Agreement", &h), None);
+    }
+
+    // ---- PII rules ------------------------------------------------------
+
+    #[test]
+    fn identifier_patterns_table() {
+        let c = Checker::new(200);
+        // (text, is it really an identifier?)
+        let cases: &[(&str, bool)] = &[
+            ("W2 for 123-45-6789 John Smith", true),
+            ("Card 4111 1111 1111 1111 on file", true),
+            ("Card 4111-1111-1111-1111 on file", true),
+            ("Card 4111111111111111 on file", true),
+            ("Amex 378282246310005 on file", true), // 15 digits, prefix 37
+            ("Diners 36227206271667 on file", true), // 14 digits, prefix 36
+            ("Card 5555555555554444 on file", true), // Mastercard 51-55
+            ("Card 2223003122003222 on file", true), // Mastercard 2-series
+            ("Card 6011111111111117 on file", true), // Discover
+            // A real PAN with a real issuer prefix at the head of a 20-digit
+            // run: the old trailing \b meant this was not examined at all.
+            ("Ref 41111111111111119999 attached", true),
+            // C6 false positives, all verified against the old rule.
+            ("Invoice covering 2026-07-20 2026-07-21 period", false),
+            ("Meter readings 1234567 8901234 recorded", false),
+            ("ISBN 978-0-13-235088-4 copy", false),
+            ("Timesheet 2026-07-20 through 2026-07-26", false),
+            ("Docket 555-12-2026 hearing", false),
+            // Luhn-valid (all zeros sum to zero) but no issuer starts with 0.
+            ("Meter 000000000000000000 unit", false),
+            // Same 16 digits, one digit off the checksum.
+            ("Card 4111111111111112 on file", false),
+        ];
+        for (text, is_pii) in cases {
+            assert_eq!(
+                contains_ssn(text) || contains_card_number(text),
+                *is_pii,
+                "for {text:?}"
+            );
+            assert_eq!(
+                c.sanitize_subject_human(text).is_err(),
+                *is_pii,
+                "subject for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn luhn_is_actually_checked() {
+        assert!(luhn_ok(&[4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]));
+        assert!(!luhn_ok(&[4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2]));
+    }
+
+    #[test]
+    fn long_reference_numbers_are_not_card_numbers() {
+        // The bulk of the false-positive risk: 18-22 digit runs, the shape of
+        // every tracking, remittance and meter reference this corpus is full
+        // of. Half of these begin with a live issuer prefix, so the checksum
+        // and the length rule are both doing work here.
+        let cases: &[&str] = &[
+            "Tracking 12345678901234567890 received",
+            "Meter 000000000000000000 unit",
+            "USPS 9405511899223197428490 delivered",
+            "Remittance 20260720000123456789 posted",
+            "FedEx 612345678901234567 in transit",
+            "Batch 4001234567890123456 exported",
+            "Policy 5512345678901234567 renewed",
+            "Account 3412345678901234567 reconciled",
+            "EDI 6511223344556677889900 acknowledged",
+            "Serial 3612345678901234567890 shipped",
+            "Ledger 2223000012345678901 posted",
+            "Reference 987654321098765432 attached",
+            "Consignment 445566778899001122 booked",
+            "Roll 300123456789012345678 counted",
+        ];
+        for t in cases {
+            assert!(
+                !contains_card_number(t),
+                "{t:?} is not a card number, but the rule says it is"
+            );
+        }
+    }
+
+    #[test]
+    fn luhn_alone_is_not_a_filter() {
+        // The measurement behind `issuer_lengths`. Sliding Luhn over 13..=19
+        // digit windows of a 20-digit run tries 35 windows at roughly 1-in-10
+        // each, so it flagged 197 of 200 random runs — "contains an identifier
+        // pattern" on essentially any long reference number. Anchored to an
+        // issuer prefix and an issuer length, the same corpus stays clean
+        // enough that a real invoice is not sent to Needs Review.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand_digit = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 10) as u8
+        };
+        let (mut flagged, mut unanchored, trials) = (0usize, 0usize, 2000usize);
+        for _ in 0..trials {
+            let digits: Vec<u8> = (0..20).map(|_| rand_digit()).collect();
+            let run: String = digits.iter().map(|d| char::from(b'0' + d)).collect();
+            if contains_card_number(&format!("Ref {run} attached")) {
+                flagged += 1;
+            }
+            if (13..=19).any(|n: usize| digits.windows(n).any(luhn_ok)) {
+                unanchored += 1;
+            }
+        }
+        assert!(
+            unanchored * 100 / trials > 90,
+            "the free window scan should flag nearly everything; got {unanchored}/{trials}"
+        );
+        assert!(
+            flagged * 100 / trials < 8,
+            "{flagged}/{trials} random 20-digit runs flagged as cards"
+        );
+    }
+
+    // ---- description rules ----------------------------------------------
+
+    #[test]
+    fn description_table() {
+        let c = Checker::new(200);
+        let h = harvest_with(&["2026-07-20"]);
+        // (description, accepted?)
+        let cases: &[(&str, bool)] = &[
+            (
+                "Notice from the U.S. Department of Labor regarding wage compliance.",
+                true,
+            ),
+            (
+                "Filing by Acme Inc. to the U.S. Dept. of Labor on behalf of staff.",
+                true,
+            ),
+            (
+                "Memo announcing a 3.5% increase effective Jan. 1, 2026 for all staff.",
+                true,
+            ),
+            (
+                "Letter signed by J. Smith confirming receipt of the notice.",
+                true,
+            ),
+            (
+                "Notice covering items 1, 2 and 3 as listed... in the schedule.",
+                true,
+            ),
+            // A description whose LAST token is an abbreviation: the mask
+            // rewrote its full stop, leaving zero terminals and rejecting
+            // ordinary output. Company names and street types end these
+            // sentences constantly.
+            ("Invoice issued to Beta Holdings Inc.", true),
+            (
+                "Employment offer letter addressed to Jane Doe from Acme Corp.",
+                true,
+            ),
+            ("Purchase order for parts from Wilson Bros. Ltd.", true),
+            ("Rent statement for the property at 4 Elm St.", true),
+            (
+                "Notice of hearing set for 10 a.m. before Judge Alvarez.",
+                true,
+            ),
+            // Multi-part version and clause references: the decimal mask
+            // consumed the digit on both sides, so in "2.1.3" only "2.1" was
+            // masked and the dot in "1.3" still counted as a sentence end.
+            (
+                "Update to the travel policy v2.1.3 effective immediately.",
+                true,
+            ),
+            (
+                "Report on the 3.5.2 release of the payroll system for staff.",
+                true,
+            ),
+            (
+                "This is one sentence. This is another complete sentence.",
+                false,
+            ),
+            ("First sentence. Second sentence. Third one here.", false),
+            ("no terminal punctuation at all here sadly", false),
+            (
+                "Ends mid-sentence. Then trails off with no closing mark",
+                false,
+            ),
+            ("Too short.", false),
+            // 15-char floor, exactly.
+            ("Acme wage note.", true),
+        ];
+        for (desc, accept) in cases {
+            let mut o = ok_out();
+            o.description = (*desc).into();
+            let r = c.check(&o, &h, &[], "2026-07-21", None);
+            assert_eq!(r.is_ok(), *accept, "for {desc:?} -> {:?}", r.err());
+        }
+    }
+
+    #[test]
+    fn terminal_set_and_regex_agree() {
+        // mask_non_terminals decides what to hold back with TERMINALS while
+        // validate_description counts with RE_SENTENCE_END; if they drift, a
+        // description ending in one of them silently loses its full stop.
+        let mut buf = [0u8; 4];
+        for c in TERMINALS {
+            assert!(RE_SENTENCE_END.is_match(c.encode_utf8(&mut buf)), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn description_length_bounds() {
+        let c = Checker::new(400);
+        let h = harvest_with(&["2026-07-20"]);
+        for (n, accept) in [(14usize, false), (15, true), (200, true), (201, false)] {
+            let mut o = ok_out();
+            // n chars total, ending in a period.
+            o.description = format!("{}.", "a".repeat(n - 1));
+            let r = c.check(&o, &h, &[], "2026-07-21", None);
+            assert_eq!(r.is_ok(), accept, "{n} chars -> {:?}", r.err());
+        }
+    }
+
+    #[test]
+    fn description_may_not_restate_the_subject() {
+        let c = Checker::new(160);
+        let h = harvest_with(&["2026-07-20"]);
+        let mut o = ok_out();
+        o.description = "termination notice for john smith.".into();
+        let e = c.check(&o, &h, &[], "2026-07-21", None).unwrap_err();
+        assert_eq!(e.code(), "BAD_DESCRIPTION");
+    }
+
+    #[test]
+    fn cjk_description_terminals_are_recognized() {
+        let c = Checker::new(160);
+        let mut o = ok_out();
+        o.subject = "終止僱傭通知書".into();
+        o.description = "安美公司致約翰史密斯的僱傭終止通知。".into();
+        let v = c
+            .check(&o, &harvest_with(&["2026-07-20"]), &[], "2026-07-21", None)
+            .unwrap();
+        assert_eq!(v.base_name, "2026-07-20 終止僱傭通知書");
+    }
+
+    #[test]
+    fn too_long_is_reported_with_the_limit() {
+        let c = Checker::new(40);
+        let e = c
+            .check(
+                &ok_out(),
+                &harvest_with(&["2026-07-20"]),
+                &[],
+                "2026-07-21",
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), "TOO_LONG");
+    }
+
+    // ---- filesystem metadata --------------------------------------------
+
+    /// 2026-07-21T00:30:00Z — 17:30 on the 20th in US Pacific.
+    fn late_evening_pacific() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_784_593_800)
+    }
+
+    fn pacific() -> chrono::FixedOffset {
+        chrono::FixedOffset::east_opt(-7 * 3600).unwrap()
+    }
+
+    #[test]
+    fn metadata_dates_carry_both_calendar_readings() {
+        // Pinned to a fixed -07:00 rather than the ambient zone: this suite runs
+        // under TZ=UTC, where the local and UTC readings are identical and every
+        // assertion below would hold against the Utc-only code C10 replaced.
+        let (dates, modified_iso) = metadata_date_strings_in(
+            Some(late_evening_pacific()),
+            Some(late_evening_pacific()),
+            &pacific(),
+        );
+        assert_eq!(
+            modified_iso, "2026-07-20",
+            "the filename must carry the day Explorer shows the user"
+        );
+        assert!(
+            dates.contains(&"2026-07-20".to_string()) && dates.contains(&"2026-07-21".to_string()),
+            "both readings must be candidates: {dates:?}"
+        );
+        assert_eq!(
+            dates.len(),
+            dates
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+    }
+
+    #[test]
+    fn the_calendar_day_comes_from_the_users_zone() {
+        let (local, utc) = local_and_utc_dates(late_evening_pacific(), &pacific());
+        assert_eq!(local, "2026-07-20");
+        assert_eq!(utc, "2026-07-21");
+        // East of Greenwich the split falls the other way.
+        let (local, utc) = local_and_utc_dates(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_784_591_400), // 23:50Z on the 20th
+            &chrono::FixedOffset::east_opt(9 * 3600).unwrap(),
+        );
+        assert_eq!(local, "2026-07-21");
+        assert_eq!(utc, "2026-07-20");
+    }
+
+    #[test]
+    fn metadata_dates_dedupe_non_adjacent_duplicates() {
+        // Vec::dedup only collapses neighbours, so this survived it.
+        let got = dedup_dates(vec![
+            "2026-07-20".into(),
+            "2026-07-21".into(),
+            "2026-07-20".into(),
+        ]);
+        assert_eq!(
+            got,
+            vec!["2026-07-20".to_string(), "2026-07-21".to_string()]
+        );
+    }
+
+    #[test]
+    fn metadata_dates_with_no_filesystem_answer() {
+        let (dates, modified_iso) = metadata_date_strings_in(None, None, &Local);
+        assert!(dates.is_empty());
+        assert_eq!(
+            modified_iso,
+            Local::now().date_naive().format("%Y-%m-%d").to_string()
+        );
     }
 }
