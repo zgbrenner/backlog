@@ -6,9 +6,9 @@ single number that `package.json`, `src-tauri/tauri.conf.json` and
 `src-tauri/Cargo.toml` must agree on (CI enforces this — see
 `.github/scripts/check-versions.mjs`).
 
-`RELEASING.md` step "Cutting an updating release" references this file: the
-release notes and the `notes` field of `latest.json` should quote the section
-below for the version being cut.
+`RELEASING.md`'s "Cutting a release" procedure references this file: step 1 adds
+the section for the version being cut, and the release notes and the `notes`
+field of `latest.json` should quote it.
 
 > **Provenance.** The 0.2.0 section was reconstructed from the working tree and
 > the superseded `PRODUCTION_READINESS.md` rather than from a per-commit log,
@@ -39,7 +39,11 @@ below for the version being cut.
 
 ### Changed
 - `scripts/dev-stubs.{sh,ps1}` write a `BACKLOG-DEV-STUB-DO-NOT-SHIP` marker
-  instead of zero bytes, so a stub is provably a stub.
+  instead of zero bytes, so a stub is provably a stub to
+  `scripts/verify-binaries.ps1`, which is the gate between a dev checkout and a
+  bundle. The *runtime* readiness check has not caught up: `preflight.rs`'s
+  `binary_exists` still only requires a non-empty file, so it certifies a marked
+  29-byte stub as installed — see `docs/KNOWN_ISSUES.md` item 9.
 - `power-automate/manifest.schema.json`,
   `power-automate/manifest.parse-json.schema.json` and the example fixtures
   move to manifest **v3** (`dismissed` status; `model_versions` required

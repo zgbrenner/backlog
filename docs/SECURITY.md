@@ -38,7 +38,8 @@ the appliance. Where the two differ, this file is the more precise one.
     release asset still cannot ship one; losing the private key ends the update
     chain rather than compromising it. `src/main.ts`'s `checkForUpdates` runs
     once at startup and swallows failures on purpose (a failed check must not
-    interrupt the user) — which is why `RELEASING.md` step 4 asserts the
+    interrupt the user) — which is why `RELEASING.md` Cutting a release step 4
+    asserts the
     endpoint from the build machine instead.
   - **`tauri-plugin-process`** — supplies only the `relaunch()` the frontend
     calls after a successful update install. It grants no process spawning; the

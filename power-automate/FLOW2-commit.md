@@ -247,7 +247,10 @@ If `status` equals `flagged`:
 If `status` equals `dismissed`:
 
 1. If the NeedsReview row exists, update it with `ReviewState = Dismissed`,
-   `ResolvedAt = utcNow()`, and the operator's note from `flag_reason`.
+   `ResolvedAt = utcNow()`, and the operator's note from `flag_reason`. That
+   note reaches SharePoint in the app's own vocabulary — `DISMISSED:<note>`,
+   or `DISMISSED:no reason given` when the operator typed nothing — so the row
+   is explained by `docs/TROUBLESHOOTING.md` §1 like any other reason code.
 2. Otherwise create it with the same values — a dismissal can arrive without a
    prior flagged row when BackLog replaces a still-pending manifest in place.
 3. Delete the manifest.

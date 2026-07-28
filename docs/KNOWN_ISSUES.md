@@ -69,12 +69,40 @@ front now; the honest fix is either a torch-inclusive sidecar profile or
 removing the Settings field.
 
 ### 8. Screenshots are not committed, so a doc cannot embed one
-`npm run harness:shots` renders every screen from the real frontend, in both
-themes, and exits non-zero on any console error — but it writes into
-`dist-harness/`, which is gitignored. `docs/USER_GUIDE.md` therefore describes
-the screens in words and tells the reader how to regenerate the images, rather
-than embedding them. Committing a screenshot set would make the guide better
-and would need a policy for keeping it current; nobody has chosen one.
+`npm run harness:shots` renders every screen from the real frontend (13
+scenarios, both themes, 44 PNGs) and exits non-zero on any console error — but
+it writes into `dist-harness/`, which is gitignored. `docs/USER_GUIDE.md`
+therefore describes the screens in words and contains no images. It also
+contains no instruction to run the harness: its second sentence promises the
+reader will never need a terminal, and a guide that breaks that promise on the
+one reader least able to notice is worse than a guide with no pictures. Anyone
+who *can* run it does so from here or from the Tests block in `README.md`:
+
+```
+npm run harness:shots     # → dist-harness/shots/<scenario>.<theme>[.full].png
+```
+
+Committing a screenshot set would make the guide better and would need a policy
+for keeping it current; nobody has chosen one.
+
+### 9. The readiness panel still accepts a marked dev stub as an installed sidecar
+`scripts/dev-stubs.{sh,ps1}` used to write zero bytes; they now write the 29-byte
+`BACKLOG-DEV-STUB-DO-NOT-SHIP` marker, which is what makes a stub *provably* a
+stub for `scripts/verify-binaries.ps1`. But `binary_exists` in
+`src-tauri/src/preflight.rs:593` is still `m.is_file() && m.len() > 0`, so a
+marked stub is 29 bytes of ASCII and passes. Settings → Readiness will report
+"Document reader (convertd) is installed — Ready" for it; the failure then shows
+up one row down as "Document reader answers — Blocked", which points at the
+wrong thing.
+
+This only reaches a user through the same accident `verify-binaries.ps1` exists
+to stop (a stubbed checkout packaged as a release), and that gate is the one
+that actually blocks shipping. It is recorded here because the *readiness* half
+of the fix has not landed: `binary_exists` should read the first 28 bytes and
+reject the marker, and under `#[cfg(windows)]` require the `MZ` magic, which
+subsumes it. `preflight.rs`'s
+`binary_exists_rejects_zero_length_stubs_and_bare_names` needs the marker case
+added when it does.
 
 ## Closed since `PRODUCTION_READINESS.md` was written
 

@@ -428,6 +428,14 @@ button.danger:hover { background: var(--bad-soft); }
 .undo-strip .filing { flex: 1; line-height: 1.5; }
 .undo-strip .count { font-variant-numeric: tabular-nums; font-weight: 600; }
 
+/* Not a warning: the card simply was not rebuilt, because rebuilding it would
+ * have thrown away typing the reviewer has not filed yet. */
+.kept-note {
+  margin-top: 10px; background: var(--accent-soft); border: 1px solid var(--accent-line);
+  color: var(--text); border-radius: 6px; padding: 9px 11px; font-size: 12.5px;
+  line-height: 1.5;
+}
+
 .card.stale { border-color: var(--warn-line); }
 .stale-note {
   margin-top: 10px; background: var(--warn-soft); border: 1px solid var(--warn-line);

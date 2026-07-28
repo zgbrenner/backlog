@@ -62,7 +62,7 @@ Intake (SharePoint) --Flow 1--> Processing folder (OneDrive-synced)
   and rapidocr publish no 3.13/3.14 wheels.
 - **A `llama-server` binary from llama.cpp.** The build verified for this pilot
   is release **`b10091`** (`llama-b10091-bin-win-cpu-x64.zip`, SHA-256 in
-  `RELEASING.md` step 2). The real requirement is not a date — it is that the
+  `RELEASING.md` Build step 2). The real requirement is not a date — it is that the
   server supports `response_format: {"type": "json_schema", …}` **and**
   `chat_template_kwargs` on `/v1/chat/completions`, which is how `slm.rs`
   constrains the model's output and disables Qwen3's thinking mode. An older
@@ -71,7 +71,7 @@ Intake (SharePoint) --Flow 1--> Processing folder (OneDrive-synced)
   `SLM_FAIL` with a reason that points at the model rather than at the binary.
   Note that `llama-server.exe` is a thin stub that loads about 13 runtime DLLs
   (`llama*.dll`, `ggml*.dll`, `mtmd.dll`, `libomp140.x86_64.dll`); they must be
-  staged beside it — see `RELEASING.md` step 2.
+  staged beside it — see `RELEASING.md` Build step 2.
 
 ## Setup
 
@@ -132,7 +132,7 @@ Settings at wherever you put them.
 See `sidecar/BUILD.md`. Produces `convertd(.exe)`; place it in
 `src-tauri/binaries/` with the target-triple suffix Tauri expects, e.g.
 `convertd-x86_64-pc-windows-msvc.exe`. Place `llama-server` (and its DLLs) the
-same way — `RELEASING.md` steps 1-2.
+same way — `RELEASING.md` Build steps 1-2.
 
 ### 4. In-app configuration (Settings tab)
 

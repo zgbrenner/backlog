@@ -16,9 +16,9 @@ The only things that ever leave this computer are:
 1. **The finished file and its new name**, handed to your own SharePoint by
    your own Power Automate flows — the same place the document was always
    going.
-2. **A one-time download of two model files** (about 2.4 GB) from Hugging Face,
-   when you press "Download models". No account, no login, and nothing about
-   your documents is sent — it is a plain file download.
+2. **A one-time download of two model files** from Hugging Face, when you press
+   **Download models (~2.4 GB)** in Settings. No account, no login, and nothing
+   about your documents is sent — it is a plain file download.
 3. **A check for a new version of BackLog** when the app starts, to a GitHub
    releases URL. It sends nothing but the request itself.
 
@@ -83,7 +83,8 @@ read them:
 Logs record what BackLog did, not what your documents say.
 
 - Folder paths are reduced to the drive and how deep they go —
-  `C:\Users\jane\OneDrive\2024 Terminations` is logged as `C: (+4 levels)`.
+  `C:\Users\jane\OneDrive\2024 Terminations` is logged as `C: (+5 levels)`
+  (the drive counts as one of them).
 - Anything the model produced is replaced with `[model output withheld]`.
 - The permanent event trail inside the ledger stores stable codes
   (`CONVERT_FAIL`, `TIMEOUT`) rather than error text, because a raw error

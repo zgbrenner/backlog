@@ -125,10 +125,15 @@ if (vocabulary.size < 35) {
   process.exit(2);
 }
 
-const doc = read("docs/TROUBLESHOOTING.md");
+// `--doc <path>` exists so the check can be pointed at a deliberately broken
+// copy of the page; see check-troubleshooting-coverage.test.mjs. A gate nobody
+// has watched fail is a gate nobody knows is wired up.
+const docFlag = process.argv.indexOf("--doc");
+const docPath = docFlag < 0 ? "docs/TROUBLESHOOTING.md" : process.argv[docFlag + 1];
+const doc = readFileSync(path.isAbsolute(docPath) ? docPath : path.join(ROOT, docPath), "utf8");
 const missing = [...vocabulary].filter(([code]) => !doc.includes(code));
 if (missing.length) {
-  console.error("codes with no entry in docs/TROUBLESHOOTING.md:");
+  console.error(`codes with no entry in ${docPath}:`);
   for (const [code, label] of missing) console.error(`  - ${code}   (${label})`);
   console.error(
     "\nEvery one of these can appear in front of a non-technical user. " +
@@ -137,4 +142,4 @@ if (missing.length) {
   process.exit(1);
 }
 
-console.log(`All ${vocabulary.size} user-visible codes are documented in docs/TROUBLESHOOTING.md.`);
+console.log(`All ${vocabulary.size} user-visible codes are documented in ${docPath}.`);

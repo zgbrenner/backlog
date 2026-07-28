@@ -82,6 +82,9 @@ the current tree:
 | `python -m pytest sidecar/tests models/tests` | 96 passed, 3 skipped |
 | `python power-automate/validate_examples.py` | passes |
 | `node .github/scripts/check-versions.mjs` | versions agree |
+| `node .github/scripts/check-troubleshooting-coverage.mjs` | 53 user-visible codes, all documented |
+| `node .github/scripts/check-troubleshooting-coverage.test.mjs` | the gate fails on 5 removed codes, as intended |
+| `node .github/scripts/check-stub-marker.mjs` | marker contract holds across 3 scripts |
 
 ## Remaining validation before release
 

@@ -75,7 +75,7 @@ only exists for air-gapped deployment.
 - [ ] `scripts/build-sidecar.ps1 -Clean` succeeds and the NDJSON ping smoke test
       passes.
 - [ ] llama-server is staged with **all** its runtime DLLs and pinned by release
-      provenance, `--version` output, and SHA-256 (`RELEASING.md` step 2).
+      provenance, `--version` output, and SHA-256 (`RELEASING.md` Build step 2).
 - [ ] **Dev stubs are gone and the real binaries verified:**
       `pwsh scripts/verify-binaries.ps1` exits 0. It asserts each
       `binaries/*.exe` is non-empty, carries no `BACKLOG-DEV-STUB-DO-NOT-SHIP`
@@ -84,7 +84,10 @@ only exists for air-gapped deployment.
       `tauri.conf.json`'s `externalBin` only checks that a path exists, so a
       stubbed installer builds clean, installs clean and reports green — the
       failure surfaces on the first document to reach the SLM lane on a user's
-      machine, with no logs.
+      machine, with no logs. **This script is the only gate that catches it:**
+      the in-app readiness check still passes a marked stub, because
+      `preflight.rs`'s `binary_exists` only requires a non-empty file
+      (`docs/KNOWN_ISSUES.md` item 9).
 - [ ] `bundle.windows.webviewInstallMode` is `offlineInstaller` and
       `bundle.windows.nsis.installMode` is `currentUser` in `tauri.conf.json`.
       (Per-machine would make every passive auto-update raise a UAC prompt the
@@ -181,7 +184,8 @@ only exists for air-gapped deployment.
       versions, test results, and known limitations.
 - [ ] The release carries the installer, its `.sig`, **and** `latest.json` as
       assets, and `latest.json`'s `version` equals `tauri.conf.json`'s
-      (`RELEASING.md` step 4). Publishing without `latest.json` makes every
+      (`RELEASING.md` Cutting a release step 4, the update-channel assertion).
+      Publishing without `latest.json` makes every
       installed copy 404 on its update check, and the frontend swallows that
       error — the update channel can be dead fleet-wide with no signal anywhere.
 - [ ] Keep the release labeled `pilot` until the staged runbook gates pass.

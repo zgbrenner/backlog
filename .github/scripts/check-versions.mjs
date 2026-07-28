@@ -39,7 +39,7 @@ const distinct = new Set(sources.map(([, version]) => version));
 if (distinct.size !== 1) {
   console.error("version drift between release inputs:");
   for (const [file, version] of sources) console.error(`  ${version.padEnd(12)} ${file}`);
-  console.error("\nBump all three together (see RELEASING.md, 'Cutting an updating release').");
+  console.error("\nBump all three together (see RELEASING.md, 'Cutting a release', step 1).");
   process.exit(1);
 }
 

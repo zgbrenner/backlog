@@ -45,7 +45,7 @@ ZIP, that ZIP is a redistribution and carries the same obligation.
 | Microsoft WebView2 Evergreen runtime installer | bundled by `bundle.windows.webviewInstallMode: offlineInstaller` | Microsoft WebView2 distribution terms | <https://developer.microsoft.com/microsoft-edge/webview2/> |
 
 The exact SHA-256 of every one of these is recorded per release
-(`RELEASING.md` step 2, `scripts/verify-binaries.ps1`).
+(`RELEASING.md` Build step 2, `scripts/verify-binaries.ps1`).
 
 ## 3. `convertd` sidecar (PyInstaller-frozen; every dependency is redistributed inside the `.exe`)
 

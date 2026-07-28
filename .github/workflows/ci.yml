@@ -75,9 +75,10 @@ jobs:
           key: workspace
       # tauri-build validates `externalBin` and the `bundle.resources` DLL glob
       # at compile time, so without these placeholders the app crate does not
-      # reach a single test. They are marker-stamped, and preflight plus
-      # scripts/verify-binaries.ps1 both refuse a marked file — a stub can pass
-      # this job and still never pass a release.
+      # reach a single test. They are marker-stamped and
+      # scripts/verify-binaries.ps1 refuses a marked file, so a stub can pass
+      # this job and still never pass a release. Runtime preflight does not
+      # refuse one yet — docs/KNOWN_ISSUES.md item 9.
       - name: Stage dev stub sidecars
         run: bash scripts/dev-stubs.sh
       # verify-binaries.ps1 cannot run on a Linux runner, so this checks the
@@ -169,3 +170,14 @@ jobs:
       # who must never open a terminal.
       - name: Check every user-visible code is documented
         run: node .github/scripts/check-troubleshooting-coverage.mjs
+      # The gate above was green for a whole review cycle while DISMISSED was
+      # undocumented, because the file that mints it was not in its source
+      # list. This asserts the gate still fails when a code goes missing.
+      - name: Check the coverage gate itself still fails
+        run: node .github/scripts/check-troubleshooting-coverage.test.mjs
+      # scripts/ci-local.sh is the copy of these gates that actually runs today
+      # (this repo has no Actions minutes — docs/KNOWN_ISSUES.md). Two
+      # definitions of "the gates" with only one of them ever executed is how a
+      # repo ends up green locally and red the day CI is switched on.
+      - name: Check ci.yml and ci-local.sh agree
+        run: node .github/scripts/check-ci-parity.mjs

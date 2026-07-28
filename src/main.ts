@@ -462,7 +462,7 @@ function dismissToast(toast: HTMLElement): void {
  *  The oldest are the ones that get folded: the newest message is the one the
  *  user's last action produced. */
 function trimToasts(): void {
-  const toasts = [...toastHost.querySelectorAll<HTMLElement>(".toast")];
+  const toasts = Array.from(toastHost.querySelectorAll<HTMLElement>(".toast"));
   const folded = toastsExpanded ? 0 : Math.max(0, toasts.length - MAX_VISIBLE_TOASTS);
   toasts.forEach((toast, i) => {
     toast.hidden = i < folded;
@@ -607,7 +607,6 @@ let stats: Record<string, number> = {};
 let queueQuery = "";
 let queueState: string | null = null;
 let queuePage = 0;
-let reviewPage = 0;
 
 let modelsDownloading = false;
 let modelDownloadProgress: ModelDownloadProgress | null = null;
@@ -734,13 +733,13 @@ function ensureShell(): void {
   // The "why is Start greyed out?" hint lives in the activity bar, which is
   // repainted wholesale, so its click is delegated from the bar itself.
   document.getElementById("activity")!.addEventListener("click", (ev) => {
-    if ((ev.target as HTMLElement).id === "start-hint") navigate("settings");
+    if ((ev.target as HTMLElement).id === "start-hint") void goToPreflight();
   });
   applyTheme(theme);
 }
 
-function navigate(next: ViewName): void {
-  if (next === view) return;
+function navigate(next: ViewName): Promise<void> {
+  if (next === view) return Promise.resolve();
   // Anything parked on an undo timer commits now rather than being abandoned
   // on a screen the user has left.
   flushPendingApprovals();
@@ -749,7 +748,20 @@ function navigate(next: ViewName): void {
   // The convertd probe behind get_diagnostics is only worth paying for once
   // the user is on the screen that shows what it returns.
   if (next === "settings") void loadDiagnostics();
-  void render();
+  return render();
+}
+
+/** What the "why can't I start?" hint actually has to do. The app boots
+ *  straight to Settings when it is unconfigured, which is where a first-run
+ *  user meets this hint — so navigate("settings") is a no-op there and the
+ *  link that replaced a never-rendering tooltip was itself inert in exactly
+ *  the state it was written for. Take the user to the control, every time. */
+async function goToPreflight(): Promise<void> {
+  await navigate("settings");
+  const button = document.getElementById("preflight-button");
+  if (!button) return;
+  button.scrollIntoView({ block: "center" });
+  button.focus();
 }
 
 function paintHeader(): void {
@@ -804,9 +816,14 @@ function paintActivity(): void {
   const remaining = Math.max(0, total - resolvedFiles());
 
   if (!runtime.running && !runtime.configured) {
+    // "…in Settings" is wrong when the user is already looking at Settings,
+    // which on an unconfigured install is where the app boots.
+    const here = view === "settings";
+    const label = runtime.checked
+      ? (here ? "fix what's listed below" : "fix what Settings lists")
+      : (here ? "check this computer" : "check this computer in Settings");
     parts.push(`<span class="blocked-note">BackLog can't start yet — `
-      + `<button type="button" id="start-hint" class="start-hint">${runtime.checked
-        ? "fix what Settings lists" : "check this computer in Settings"}</button>.</span>`);
+      + `<button type="button" id="start-hint" class="start-hint">${label}</button>.</span>`);
   }
 
   if (runtime.running && coldStart && (stats["named"] ?? 0) + (stats["validated"] ?? 0)
@@ -836,6 +853,29 @@ function paintActivity(): void {
 
   bar.innerHTML = parts.join("");
   bar.hidden = parts.length === 0;
+  syncActivityTicker();
+}
+
+/** Everything in the bar above is derived from wall-clock time — how long the
+ *  current file has sat, whether the cold start has outlived its ninety
+ *  seconds, how long the remainder will take — but the only thing that used to
+ *  repaint it was an incoming job-updated event. So the stall line could only
+ *  appear while the pipeline was NOT stalled, and "Starting the naming engine"
+ *  stayed on screen forever if llama-server never came up. One slow tick while
+ *  running evaluates them against the clock instead of against the event
+ *  stream. */
+let activityTicker = 0;
+const ACTIVITY_TICK_MS = 5000;
+
+function syncActivityTicker(): void {
+  if (runtime.running && !activityTicker) {
+    activityTicker = window.setInterval(() => {
+      void loadStats().then(paintHeader);
+    }, ACTIVITY_TICK_MS);
+  } else if (!runtime.running && activityTicker) {
+    window.clearInterval(activityTicker);
+    activityTicker = 0;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -948,7 +988,10 @@ async function loadViewData(wanted: ViewName): Promise<ViewData> {
   }
   try {
     const [jobs, total] = await Promise.all([
-      invoke<Job[]>("list_flagged", { limit: REVIEW_PAGE, offset: reviewPage * REVIEW_PAGE }),
+      // Always the head of the queue: see buildReviewFoot for why this must
+      // not be an offset that walks forward over a set the reviewer is
+      // emptying as they go.
+      invoke<Job[]>("list_flagged", { limit: REVIEW_PAGE, offset: 0 }),
       invoke<number>("count_jobs", { query: null, jobState: "flagged", job_state: "flagged" }),
     ]);
     return { kind: "flagged", jobs, total };
@@ -1121,7 +1164,10 @@ async function onRunButton(): Promise<void> {
         await invoke("start_pipeline");
       } catch (e) {
         coldStart = null;
-        showError(e, { label: "Open Settings", run: () => navigate("settings") });
+        showError(e, { label: "Open Settings", run: () => void navigate("settings") });
+        // Same reason navigate() does it: nothing parked on an undo timer may
+        // be abandoned on a screen the user is being moved away from.
+        flushPendingApprovals();
         view = "settings";
       }
     } else {
@@ -1513,6 +1559,9 @@ function buildReviewCard(job: Job): ReviewCard {
     busy: false,
     patch(next: Job) {
       card.job = next;
+      // Only ever reached for a card with nothing unsaved in it, so the "left
+      // as you had it" note no longer applies.
+      root.querySelector(".kept-note")?.remove();
       const nextCopy = reasonCopy(next.flag_reason);
       q<HTMLElement>(root, ".card-head strong").textContent = next.original_name;
       q<HTMLElement>(root, ".ext").textContent = next.ext.toUpperCase();
@@ -1687,14 +1736,35 @@ function buildReviewCard(job: Job): ReviewCard {
 }
 
 function dropCard(card: ReviewCard): void {
-  reviewCards.delete(card.job.sha256);
-  const next = card.root.nextElementSibling;
-  card.root.remove();
-  void loadStats().then(paintHeader);
-  // Keep the reviewer's hands on the keyboard: land on the next card's first
-  // field rather than dumping focus on <body>.
-  const target = next?.querySelector<HTMLElement>('[name="date"]');
-  target?.focus();
+  const sha256 = card.job.sha256;
+  // A deferred approval commits ten seconds after the click, and a full render
+  // can happen in between. Drop whatever card is on screen for this sha now,
+  // not the node the approval closed over — deleting the map entry while a
+  // rebuilt node stayed in the document left an editable, un-removable card
+  // for a file that had already been filed, and approving it again would write
+  // a second manifest for a document Power Automate has already processed.
+  const live = reviewCards.get(sha256);
+  const target = card.root.isConnected || !live?.root.isConnected ? card : live;
+  reviewCards.delete(sha256);
+
+  // Only move focus if it is inside the card that is going away. Approve is
+  // deferred, so by the time this runs the reviewer is usually typing in a
+  // different card — yanking the caret into a native date input mid-word
+  // swallows everything typed after it. beginApproval already advanced focus
+  // at the moment of the click, which is the case this was written for.
+  const stealing = target.root.contains(document.activeElement);
+  const next = target.root.nextElementSibling;
+  target.root.remove();
+  if (stealing) next?.querySelector<HTMLElement>('[name="date"]')?.focus();
+
+  paintReviewFoot();
+  void loadStats().then(() => {
+    paintHeader();
+    paintReviewFoot();
+  });
+  // The list is never paged forward over a set that shrinks underneath the
+  // reviewer; when the visible head is cleared, the next head is fetched.
+  if (view === "flagged" && reviewCards.size === 0) requestRender();
 }
 
 // --- evidence, timeline, date candidates ------------------------------------
@@ -2111,6 +2181,9 @@ function renderReadinessPanel(): HTMLElement {
     // halfway through typing into are not in either.
     replaceReadinessPanel();
     paintHeader();
+    // Re-probe rather than reuse a cached failure: "check this computer" is
+    // exactly the action that is supposed to clear a stale unavailable line.
+    void loadDiagnostics(true);
   });
   panel.querySelector("#update-check-button")?.addEventListener("click", async (ev) => {
     const button = ev.currentTarget as HTMLButtonElement;
@@ -2210,8 +2283,12 @@ function paintVersions(host: HTMLElement): void {
   host.innerHTML = parts.join(" &middot; ");
 }
 
-async function loadDiagnostics(): Promise<void> {
-  if (diagnosticsRequested) return;
+/** `force` is what "Check this computer" passes. Without it one transient
+ *  probe failure latched `diagnosticsRequested` for the rest of the session,
+ *  so the version line the pilot runbook asks the operator to record stayed
+ *  unreadable until the app was restarted. */
+async function loadDiagnostics(force = false): Promise<void> {
+  if (diagnosticsRequested && !force) return;
   diagnosticsRequested = true;
   try {
     diagnostics = await invoke<Diagnostics>("get_diagnostics");

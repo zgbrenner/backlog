@@ -46,11 +46,19 @@ fewer breaks the update channel silently for everyone already installed.
   ```powershell
   uv python install 3.11
   ```
-- **A `llama-server.exe`** from an llama.cpp release (see step 2).
+- **A `llama-server.exe`** from an llama.cpp release (see Build step 2).
 
 ## Build steps
 
-### 1. Build the `convertd` sidecar
+> **Two numbering spaces, deliberately named.** This document has two numbered
+> procedures — the six **Build steps** here and the seven **Cutting a release**
+> steps below — and both have a step 4. They are cited from other files, so
+> every reference spells out which space it means: "Build step 4
+> (verify-binaries)" is the PE/stub gate, "Cutting a release step 4
+> (update-channel assertion)" is the check that `latest.json` resolves. A bare
+> "step 4" is a bug in whatever document wrote it.
+
+### Build step 1. Build the `convertd` sidecar
 ```powershell
 # From the repo root. Produces src-tauri\binaries\convertd-x86_64-pc-windows-msvc.exe
 pwsh scripts\build-sidecar.ps1
@@ -60,7 +68,7 @@ freezes the resolved set to `sidecar/requirements.lock` (the reproducible lock),
 runs PyInstaller, smoke-tests the binary (`{"id":1,"op":"ping"}` → `{"ok":true}`),
 copies it into `src-tauri/binaries/`, and prints its SHA-256.
 
-### 2. Stage `llama-server` (and its DLLs)
+### Build step 2. Stage `llama-server` (and its DLLs)
 Download a prebuilt Windows x64 CPU build of `llama-server` from the
 [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases). The build
 verified for this pilot:
@@ -91,7 +99,7 @@ Copy-Item llama-cpu\*.dll src-tauri\binaries\
 > DLLs sit alongside `BackLog.exe` and the sidecars; then install once and
 > confirm the SLM lane starts (Settings → Start with a model configured).
 
-### 3. Icon
+### Build step 3. Icon
 The full platform icon set is committed and generated from the 1024×1024
 `src-tauri/icons/icon-source.png`. Nothing to do unless the artwork changes; if
 it does, regenerate the whole set rather than editing one size:
@@ -99,7 +107,7 @@ it does, regenerate the whole set rather than editing one size:
 npm run tauri icon src-tauri\icons\icon-source.png
 ```
 
-### 4. Verify the binaries before bundling
+### Build step 4. Verify the binaries before bundling
 ```powershell
 pwsh scripts\verify-binaries.ps1
 ```
@@ -114,12 +122,12 @@ zero-byte files, anything that is not a valid PE image, and a leftover
 
 ```powershell
 pwsh scripts\verify-binaries.ps1 -Expected @{
-  "llama-server-x86_64-pc-windows-msvc.exe" = "<SHA-256 from step 2>"
-  "convertd-x86_64-pc-windows-msvc.exe"     = "<SHA-256 printed by step 1>"
+  "llama-server-x86_64-pc-windows-msvc.exe" = "<SHA-256 from Build step 2>"
+  "convertd-x86_64-pc-windows-msvc.exe"     = "<SHA-256 printed by Build step 1>"
 }
 ```
 
-### 5. Build the installer
+### Build step 5. Build the installer
 ```powershell
 npm ci
 npm run check               # tsc --noEmit + vite build; fails fast, cheaply
@@ -132,9 +140,9 @@ the WebView2 runtime, so the install needs no network. It installs per-user
 (`nsis.installMode: currentUser`), which is what keeps a passive auto-update
 from raising a UAC prompt.
 
-It does **not** bundle the ML models — see step 6.
+It does **not** bundle the ML models — see Build step 6.
 
-### 6. Models
+### Build step 6. Models
 The models are **not** in the installer. They reach the machine one of two ways:
 
 - **Normally:** the operator presses Settings → **Download models (~2.4 GB)**.
@@ -149,7 +157,8 @@ The models are **not** in the installer. They reach the machine one of two ways:
 ## Updating later
 1. Make the change; if it touches Rust / frontend / sidecar, it needs a rebuild.
 2. Confirm CI is green on the commit.
-3. Re-run steps 1–5 on a Windows machine (step 1 only if the sidecar changed).
+3. Re-run Build steps 1–5 on a Windows machine (Build step 1 only if the sidecar
+   changed).
 4. Follow "Cutting a release" below to sign and publish.
 
 ## Auto-updater: signing key
@@ -184,7 +193,11 @@ endpoint tracks `releases/latest`: publishing any newer release *without* a
 `latest.json` asset makes every installed copy 404 on its update check, and
 `src/main.ts`'s `checkForUpdates` swallows that error deliberately (a failed
 check must not interrupt a user). The update channel can therefore be dead
-fleet-wide with zero signal on any machine. Step 5 below is what catches it.
+fleet-wide with zero signal on any machine. Cutting a release step 4 below is
+what catches it.
+
+Steps in this section are cited elsewhere as **"Cutting a release step N"**, to
+keep them distinct from the **Build steps** above.
 
 1. Bump `version` in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` **and**
    `package.json` — all three, together. Add the matching `CHANGELOG.md`

@@ -346,20 +346,96 @@ const RUNNING_QUEUE: Job[] = [
   ...BIG_QUEUE.slice(1),
 ];
 
-const EVIDENCE =
-  "# Termination Notice\n\nAcme Corporation\n1 Industrial Way\n\n11 March 2026\n\n" +
-  "Dear Mr Smith,\n\nThis letter confirms the termination of your employment with effect from\n" +
-  "2026-03-31, following the consultation meeting held on 4 March 2026.\n\n" +
-  "Yours sincerely,\nH. Okonkwo\nHead of People\n";
-
-const EVENTS = [
-  { id: 9, sha256: "c".repeat(64), at: "2026-07-28T09:12:04.101Z", stage: "flag", detail: "DATE_NOT_IN_EVIDENCE:2026-02-14" },
-  { id: 8, sha256: "c".repeat(64), at: "2026-07-28T09:12:03.882Z", stage: "name", detail: "escalation model proposed 2026-02-14, not found in evidence" },
-  { id: 7, sha256: "c".repeat(64), at: "2026-07-28T09:12:01.400Z", stage: "name", detail: "span mismatch, re-prompting" },
-  { id: 6, sha256: "c".repeat(64), at: "2026-07-28T09:11:58.220Z", stage: "convert", detail: "attempt 2: ocr conf 0.44 below floor 0.60" },
-  { id: 5, sha256: "c".repeat(64), at: "2026-07-28T09:11:50.010Z", stage: "convert", detail: "attempt 1: no embedded text layer" },
-  { id: 4, sha256: "c".repeat(64), at: "2026-07-28T09:11:49.900Z", stage: "ingest", detail: "ingested" },
+// Evidence is the converted markdown at cache_dir/<sha>.md. It exists ONLY for
+// files that got past conversion, and get_evidence (lib.rs:552) surfaces the
+// std::fs read error when it does not — so this is keyed per file rather than
+// being one constant every card shares. A shared constant put "Dates found in
+// the document: 2026-03-31, …" on a card whose flag reason is "The text could
+// not be read", which is a state the backend cannot produce, and it meant a bug
+// harvesting date chips from the wrong document would have screenshotted clean.
+/** One file in flight, last touched just under the stall threshold
+ *  (per_file_wall_clock_secs is 90, so paintActivity calls it stalled at 270s).
+ *  Evaluated when the module loads, i.e. immediately before the app boots, so
+ *  the bar reads "Working on" on the first paint and can only turn into
+ *  "Stalled" if something re-evaluates it against the clock. */
+const STALLING_QUEUE: Job[] = [
+  job({
+    sha256: "8".repeat(64),
+    original_name: "2019 payroll batch 041.pdf",
+    original_path:
+      "C:\\Users\\dana\\OneDrive - Contoso\\BackLog\\Processing\\2019\\2019 payroll batch 041.pdf",
+    state: "filtered",
+    final_filename: null,
+    description: null,
+    updated_at: new Date(Date.now() - 262_000).toISOString(),
+  }),
 ];
+
+const EVIDENCE_BY_SHA: Record<string, string> = {
+  // scan0417.pdf — filed cleanly, kept here because the queue rows reference it.
+  ["a".repeat(64)]:
+    "# Termination Notice\n\nAcme Corporation\n1 Industrial Way\n\n11 March 2026\n\n" +
+    "Dear Mr Smith,\n\nThis letter confirms the termination of your employment with effect from\n" +
+    "2026-03-31, following the consultation meeting held on 4 March 2026.\n\n" +
+    "Yours sincerely,\nH. Okonkwo\nHead of People\n",
+  // IMG_20260214_113355.jpg — OCR'd, then flagged DATE_NOT_IN_EVIDENCE:2026-02-14.
+  // The proposed date is deliberately absent from this text; the dates that ARE
+  // here are the ones the chips must offer.
+  ["c".repeat(64)]:
+    "# Tenancy Agreement\n\nRiverside Court, Unit 4B\n\nBetween Contoso Property Services and\n" +
+    "A. Patel.\n\nThis agreement is dated 9 February 2026 and the tenancy begins on 2026-03-01\n" +
+    "for a term of twelve months, ending 2027-02-28.\n\nSigned ......................\n",
+  // notes.docx — converted fine; the model's subject was the problem, not the text.
+  ["f".repeat(64)]:
+    "# Meeting notes\n\n4 June 2026\n\nPresent: D. Okafor, R. Lindqvist, S. Bhatt.\n\n" +
+    "Agreed the Riverside handover date of 2026-06-30. Actions carried over from the\n" +
+    "previous meeting on 21 May 2026 remain open.\n",
+};
+
+// Newest first, exactly as events_for returns them. Keyed per file: the six
+// events below belong to one specific failure and describing every card with
+// them is the same lie as the shared evidence blob.
+type Event = { id: number; sha256: string; at: string; stage: string; detail: string };
+
+function events(sha: string, rows: Array<[string, string, string]>): Event[] {
+  return rows.map(([at, stage, detail], i) => ({
+    id: 100 - i,
+    sha256: sha,
+    at,
+    stage,
+    detail,
+  }));
+}
+
+const EVENTS_BY_SHA: Record<string, Event[]> = {
+  ["c".repeat(64)]: events("c".repeat(64), [
+    ["2026-07-28T09:12:04.101Z", "flag", "DATE_NOT_IN_EVIDENCE:2026-02-14"],
+    ["2026-07-28T09:12:03.882Z", "name", "escalation model proposed 2026-02-14, not found in evidence"],
+    ["2026-07-28T09:12:01.400Z", "name", "span mismatch, re-prompting"],
+    ["2026-07-28T09:11:58.220Z", "convert", "attempt 2: ocr conf 0.44 below floor 0.60"],
+    ["2026-07-28T09:11:50.010Z", "convert", "attempt 1: no embedded text layer"],
+    ["2026-07-28T09:11:49.900Z", "ingest", "ingested"],
+  ]),
+  ["f".repeat(64)]: events("f".repeat(64), [
+    ["2026-07-28T09:13:22.700Z", "flag", "BAD_SUBJECT:generic subject 'Document'"],
+    ["2026-07-28T09:13:22.310Z", "name", "escalation model proposed subject 'Document'"],
+    ["2026-07-28T09:13:20.980Z", "name", "primary model proposed subject 'Document', rejected as generic"],
+    ["2026-07-28T09:13:19.640Z", "convert", "docx converted, 1 842 characters"],
+    ["2026-07-28T09:13:19.500Z", "ingest", "ingested"],
+  ]),
+  ["1".repeat(64)]: events("1".repeat(64), [
+    ["2026-07-28T09:15:41.220Z", "flag", "UNREADABLE:all conversion attempts exhausted"],
+    ["2026-07-28T09:15:40.880Z", "convert", "attempt 3: ocr conf 0.19 below floor 0.60"],
+    ["2026-07-28T09:15:31.010Z", "convert", "attempt 2: ocr conf 0.22 below floor 0.60"],
+    ["2026-07-28T09:15:22.470Z", "convert", "attempt 1: no embedded text layer"],
+    ["2026-07-28T09:15:22.300Z", "ingest", "ingested"],
+  ]),
+  ["2".repeat(64)]: events("2".repeat(64), [
+    ["2026-07-28T09:16:02.900Z", "flag", "ENCRYPTED:password protected"],
+    ["2026-07-28T09:16:02.740Z", "convert", "pdfium: document is password protected"],
+    ["2026-07-28T09:16:02.600Z", "ingest", "ingested"],
+  ]),
+};
 
 const DIAGNOSTICS = {
   app_version: "0.2.0",
@@ -371,6 +447,30 @@ const DIAGNOSTICS = {
     lingua: "2.0.2",
   },
 };
+
+/** What lib.rs:640-682 really returns when convertd is missing: an Ok payload
+ *  with a real app_version and platform, and the probe failure folded into
+ *  `sidecar_versions.error`. get_diagnostics has no failure path that rejects,
+ *  so a fixture that threw was evidence of an unreachable state. */
+const DIAGNOSTICS_NO_SIDECAR = {
+  app_version: "0.2.0",
+  platform: "windows x86_64",
+  sidecar_versions: { error: "convertd is not installed" },
+};
+
+type ShaArgs = { sha256?: string };
+
+function evidenceFor(args?: unknown): string | Error {
+  const sha = ((args ?? {}) as ShaArgs).sha256 ?? "";
+  const text = EVIDENCE_BY_SHA[sha];
+  // Same shape as the real command: std::fs::read_to_string's error, verbatim.
+  return text ?? new Error("No such file or directory (os error 2)");
+}
+
+function eventsFor(args?: unknown): Event[] {
+  const sha = ((args ?? {}) as ShaArgs).sha256 ?? "";
+  return EVENTS_BY_SHA[sha] ?? [];
+}
 
 const STATS_BUSY = { ingested: 12, converted: 8, named: 4, emitted: 1841, flagged: 4, per_hour: 0 };
 const STATS_EMPTY = {};
@@ -423,8 +523,8 @@ function base(runtime: unknown, stats: unknown, jobs: Job[], flagged: Job[]): Co
     open_logs_folder: null,
     download_models: null,
     get_diagnostics: DIAGNOSTICS,
-    get_events: EVENTS,
-    get_evidence: EVIDENCE,
+    get_events: eventsFor,
+    get_evidence: evidenceFor,
   };
 }
 
@@ -458,6 +558,52 @@ function scenario(
   };
 }
 
+/** A flagged backlog deeper than one fetch, backed by a list that really
+ *  mutates. `dismiss` and `resubmit` remove the row from the ledger in the
+ *  real backend (JobState::Dismissed / Emitted are both outside the flagged
+ *  set), so a fixture that kept handing back the same rows would hide the
+ *  entire class of bug where the reviewer never sees the middle of the list. */
+function reviewScale(count: number): Scenario {
+  const rows: Job[] = Array.from({ length: count }, (_, i) =>
+    job({
+      sha256: ("d" + i.toString(16)).padStart(64, "0"),
+      original_name: `flagged-${String(i).padStart(3, "0")}.pdf`,
+      original_path: `C:\\Users\\dana\\OneDrive - Contoso\\BackLog\\Processing\\2021\\flagged-${String(i).padStart(3, "0")}.pdf`,
+      state: "flagged",
+      flag_reason: "DATE_NOT_IN_EVIDENCE:2021-04-02",
+      quarantine_path: `C:\\ProgramData\\BackLog\\Quarantine\\flagged-${String(i).padStart(3, "0")}.pdf`,
+      proposed_date: "",
+      proposed_subject: `Archive record ${i}`,
+      description: "",
+      final_filename: null,
+    })
+  );
+  const remove = (args?: unknown) => {
+    const sha = ((args ?? {}) as ShaArgs).sha256 ?? "";
+    const at = rows.findIndex((row) => row["sha256"] === sha);
+    if (at === -1) return new Error("That file has already moved on.");
+    rows.splice(at, 1);
+    return null;
+  };
+  return {
+    label: "60 files needing review",
+    view: "flagged",
+    commands: {
+      ...base(READY_RUNTIME, {}, rows, rows),
+      get_stats: () => ({ emitted: 940, flagged: rows.length, per_hour: 0 }),
+      list_flagged: (args?: unknown) => page(rows, args),
+      count_jobs: (args?: unknown) => {
+        const a = (args ?? {}) as ListArgs;
+        const state = a.jobState ?? a.job_state ?? null;
+        if (state === "flagged") return rows.length;
+        return filtered(rows, args).length;
+      },
+      dismiss: remove,
+      resubmit: remove,
+    },
+  };
+}
+
 export const SCENARIOS: Record<string, Scenario> = {
   /** Steady state: configured, preflight green, a real queue behind it. */
   ready: scenario("Ready, queue populated", READY_RUNTIME, STATS_BUSY, QUEUE, FLAGGED),
@@ -469,8 +615,10 @@ export const SCENARIOS: Record<string, Scenario> = {
       ...withFlaggedCount(base(UNCHECKED_RUNTIME, STATS_EMPTY, [], []), [], []),
       get_config: EMPTY_CONFIG,
       // Nothing is installed yet on a fresh machine, so the convertd probe
-      // behind the version line fails rather than answering.
-      get_diagnostics: () => new Error("convertd is not installed"),
+      // behind the version line fails — but the command itself still succeeds
+      // and reports the app version, which is the line the pilot runbook asks
+      // the operator to read off this very screen.
+      get_diagnostics: DIAGNOSTICS_NO_SIDECAR,
     },
   },
 
@@ -532,16 +680,30 @@ export const SCENARIOS: Record<string, Scenario> = {
     { ...STATS_BUSY, flagged: 4 }, QUEUE, FLAGGED, { view: "flagged" }),
 
   /** Several failures at once — the case where toasts used to land exactly on
-   *  top of each other and only the last one was legible. */
+   *  top of each other and only the last one was legible, and then (once they
+   *  stacked) grew off the top of the window and covered the Start button.
+   *
+   *  start_pipeline reports whichever precondition it hit first, so a machine
+   *  with more than one fault gives a different message as each press gets
+   *  further; every string below is one lib.rs really returns. Pressing Start
+   *  again is what a user does when nothing appears to happen, so both the
+   *  repeat (dedupe) and the variety (the cap) are the real case. */
   toasts: {
-    ...scenario("Three errors at once", READY_RUNTIME, STATS_BUSY, QUEUE, FLAGGED),
+    ...scenario("Repeated Start failures", READY_RUNTIME, STATS_BUSY, QUEUE, FLAGGED),
     commands: {
       ...withFlaggedCount(base(READY_RUNTIME, STATS_BUSY, QUEUE, FLAGGED), QUEUE, FLAGGED),
-      start_pipeline: () =>
-        new Error(
+      start_pipeline: (() => {
+        const messages = [
           "BackLog is not ready yet: the naming engine's start-up and the backup model file " +
-            "could not be verified."
-        ),
+            "could not be verified.",
+          "The folder BackLog watches for new documents does not exist yet: " +
+            "C:\\Users\\dana\\OneDrive - Contoso\\BackLog\\Processing.",
+          "BackLog's record of processed files is locked by another process (code 5).",
+          "The part of BackLog that reads your documents did not answer.",
+        ];
+        let n = 0;
+        return () => new Error(messages[n++ % messages.length]);
+      })(),
     },
   },
 
@@ -563,6 +725,26 @@ export const SCENARIOS: Record<string, Scenario> = {
     BIG_QUEUE,
     FLAGGED
   ),
+
+  /** More flagged files than one fetch returns, with a ledger that really
+   *  shrinks as they are worked. This is the only way to prove that every file
+   *  is reachable: the flagged set is a queue being emptied from the head, and
+   *  an offset walked forward over it skips whatever was resolved meanwhile. */
+  "review-scale": reviewScale(60),
+
+  /** Running, with the file at the head of the queue about to cross the stall
+   *  threshold (per_file_wall_clock_secs * 3). Nothing else happens: no event
+   *  ever arrives, so the only thing that can make the bar tell the truth is
+   *  the clock. */
+  stalling: {
+    ...scenario(
+      "About to look stalled",
+      { ...READY_RUNTIME, running: true },
+      { ingested: 3, converted: 1, emitted: 41, flagged: 2, per_hour: 0 },
+      STALLING_QUEUE,
+      FLAGGED
+    ),
+  },
 
   /** A 5,000-file backfill, to expose problems that only appear at size. */
   scale: scenario(

@@ -183,21 +183,6 @@ refuse one that is not — so if the bar appears, the update is genuine.
 Choosing it downloads and installs the new version and restarts BackLog. You
 can dismiss the bar and carry on; it will offer again next time.
 
-## Seeing the screens
-
-The screenshots in this guide are generated from the real interface rather than
-drawn, so they cannot drift out of date:
-
-```
-npm run harness:shots
-```
-
-writes one PNG per screen per theme into `dist-harness/shots/`, named after the
-scenario — first run, a queue mid-batch, readiness failures with their buttons,
-a Needs Review card, and the update bar. It also exits non-zero if any screen
-logs an error, so it doubles as a check that the interface still works. That
-directory is deliberately not committed; regenerate it when you need it.
-
 ## Where things are
 
 | | |

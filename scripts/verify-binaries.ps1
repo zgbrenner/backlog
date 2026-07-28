@@ -12,7 +12,7 @@
   where there are no build logs to explain it.
 
   Run this on the Windows release machine AFTER staging the real binaries
-  (RELEASING.md steps 1-2) and BEFORE `npm run tauri build`. It asserts, for
+  (RELEASING.md Build steps 1-2) and BEFORE `npm run tauri build`. It asserts, for
   every required artifact:
 
     * the file exists and is non-empty;
@@ -25,7 +25,7 @@
 
 .PARAMETER Expected
   Optional map of file name -> SHA-256, e.g. the hashes recorded in the
-  release evidence per RELEASING.md step 2 and docs/RELEASE_CHECKLIST.md:
+  release evidence per RELEASING.md Build step 2 and docs/RELEASE_CHECKLIST.md:
 
       pwsh scripts/verify-binaries.ps1 -Expected @{
         "llama-server-x86_64-pc-windows-msvc.exe" = "B2D9...DEE"
@@ -83,14 +83,14 @@ function Test-CarriesStubMarker {
 }
 
 if (-not (Test-Path $BinDir)) {
-    Write-Error "binaries directory not found: $BinDir. Run RELEASING.md steps 1-2 first."
+    Write-Error "binaries directory not found: $BinDir. Run RELEASING.md Build steps 1-2 first."
 }
 $BinDir = (Resolve-Path $BinDir).Path
 
 foreach ($name in $RequiredBinaries) {
     $path = Join-Path $BinDir $name
     if (-not (Test-Path $path)) {
-        $failures.Add("$name is missing. See RELEASING.md steps 1-2.")
+        $failures.Add("$name is missing. See RELEASING.md Build steps 1-2.")
         continue
     }
     $length = (Get-Item $path).Length
@@ -130,7 +130,7 @@ if ($placeholder) {
 }
 $realDlls = $dlls | Where-Object { $_.Name -ne "_placeholder.dll" }
 if ($realDlls.Count -eq 0) {
-    $failures.Add("no llama runtime DLLs in $BinDir. Copy llama-cpu\*.dll there (RELEASING.md step 2).")
+    $failures.Add("no llama runtime DLLs in $BinDir. Copy llama-cpu\*.dll there (RELEASING.md Build step 2).")
 }
 else {
     foreach ($dll in $realDlls) {
