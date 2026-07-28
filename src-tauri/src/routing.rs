@@ -8,9 +8,9 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Route {
-    Native,        // MarkItDown path
-    Scanned,       // raster + OCR path
-    Flag,          // unprocessable
+    Native,  // MarkItDown path
+    Scanned, // raster + OCR path
+    Flag,    // unprocessable
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,7 +34,13 @@ const NATIVE_TYPES: &[&str] = &[
     "message/rfc822",
 ];
 
-const IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/tiff", "image/bmp", "image/webp"];
+const IMAGE_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/tiff",
+    "image/bmp",
+    "image/webp",
+];
 
 /// Read at most `max` bytes of the header for type detection. Never buffers a
 /// whole (possibly enormous or adversarial) file just to sniff magic bytes —
@@ -76,7 +82,11 @@ pub fn detect(path: &Path) -> RouteDecision {
     let kind = infer::get(&bytes);
     let mime = kind.map(|k| k.mime_type().to_string()).unwrap_or_else(|| {
         // infer misses plain text and eml; sniff cheaply.
-        if bytes.iter().take(2048).all(|b| *b == 9 || *b == 10 || *b == 13 || *b >= 32) {
+        if bytes
+            .iter()
+            .take(2048)
+            .all(|b| *b == 9 || *b == 10 || *b == 13 || *b >= 32)
+        {
             "text/plain".to_string()
         } else {
             "application/octet-stream".to_string()
@@ -85,17 +95,33 @@ pub fn detect(path: &Path) -> RouteDecision {
 
     if mime == "application/pdf" {
         // Text-layer test happens in the sidecar; caller re-routes on the answer.
-        return RouteDecision { route: Route::Native, detected_type: mime, flag_reason: None };
+        return RouteDecision {
+            route: Route::Native,
+            detected_type: mime,
+            flag_reason: None,
+        };
     }
     if IMAGE_TYPES.contains(&mime.as_str()) {
-        return RouteDecision { route: Route::Scanned, detected_type: mime, flag_reason: None };
+        return RouteDecision {
+            route: Route::Scanned,
+            detected_type: mime,
+            flag_reason: None,
+        };
     }
     if NATIVE_TYPES.iter().any(|t| mime.starts_with(t)) || mime.starts_with("text/") {
-        return RouteDecision { route: Route::Native, detected_type: mime, flag_reason: None };
+        return RouteDecision {
+            route: Route::Native,
+            detected_type: mime,
+            flag_reason: None,
+        };
     }
     // Legacy zip-based office files sometimes sniff as zip.
     if mime == "application/zip" {
-        return RouteDecision { route: Route::Native, detected_type: mime, flag_reason: None };
+        return RouteDecision {
+            route: Route::Native,
+            detected_type: mime,
+            flag_reason: None,
+        };
     }
 
     RouteDecision {

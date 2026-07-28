@@ -8,6 +8,9 @@
   </head>
   <body>
     <div id="app"></div>
+    <!-- Outside #app so a full re-render of the shell can never drop a toast
+         the user has not read yet. -->
+    <div id="toasts" class="toast-host" role="region" aria-label="Notifications"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -24,9 +24,25 @@ use serde::Serialize;
 pub struct Evidence {
     pub bundle: String,
     pub language: String,
-    pub doc_type: String,
+    /// `None` when no classifier actually ran. On the shipped torch-free
+    /// profile `_classify_fallback` returns a constant label with
+    /// `available: false`; shipping that constant made every row in the
+    /// SharePoint DocumentIndex claim the same DocType — a fabricated
+    /// classification in a system of record, which is the exact failure mode
+    /// the checker exists to prevent.
+    pub doc_type: Option<String>,
     pub doc_type_score: f64,
     pub harvest: Harvest,
+    /// Dates from the document's own file/embedded metadata. Kept on the
+    /// Evidence so a wider retry bundle can be reassembled from it alone.
+    pub meta_dates: Vec<String>,
+    /// The 5d salience picks, kept for the same reason as `meta_dates` — and
+    /// more urgently, because this is the one bundle section that cannot be
+    /// recomputed without another sidecar round-trip. 5d fires only when the
+    /// deterministic harvest came back thin, i.e. exactly when KEY SENTENCES is
+    /// the only substantive section there is; a retry rung that dropped it
+    /// would hand a thin document LESS evidence than the rung before it.
+    pub salient: Vec<String>,
     pub ettin_spans: Vec<EttinSpan>,
     pub thin: bool,
 }
@@ -34,15 +50,41 @@ pub struct Evidence {
 /// Doc-type taxonomy. Editable config, no retraining: GLiClass is zero-shot.
 pub fn default_labels() -> Vec<String> {
     [
-        "termination notice", "offer letter", "engagement letter", "demand letter",
-        "non-disclosure agreement", "services agreement", "purchase agreement",
-        "lease agreement", "amendment", "invoice", "receipt", "purchase order",
-        "complaint", "answer", "motion", "brief", "court order", "subpoena",
-        "deposition transcript", "discovery request", "settlement agreement",
-        "corporate resolution", "board minutes", "bylaws", "operating agreement",
-        "policy document", "memorandum", "correspondence", "email",
-        "financial statement", "tax document", "insurance document",
-        "employment agreement", "severance agreement", "power of attorney",
+        "termination notice",
+        "offer letter",
+        "engagement letter",
+        "demand letter",
+        "non-disclosure agreement",
+        "services agreement",
+        "purchase agreement",
+        "lease agreement",
+        "amendment",
+        "invoice",
+        "receipt",
+        "purchase order",
+        "complaint",
+        "answer",
+        "motion",
+        "brief",
+        "court order",
+        "subpoena",
+        "deposition transcript",
+        "discovery request",
+        "settlement agreement",
+        "corporate resolution",
+        "board minutes",
+        "bylaws",
+        "operating agreement",
+        "policy document",
+        "memorandum",
+        "correspondence",
+        "email",
+        "financial statement",
+        "tax document",
+        "insurance document",
+        "employment agreement",
+        "severance agreement",
+        "power of attorney",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -57,15 +99,33 @@ fn probes_for(doc_type: &str) -> Vec<String> {
         "subject matter of this document".to_string(),
     ];
     let extra: Vec<&str> = match doc_type {
-        t if t.contains("termination") => vec!["effective date of termination", "employee being terminated"],
-        t if t.contains("agreement") || t.contains("nda") => vec!["effective date of this agreement", "parties entering this agreement"],
-        t if t.contains("invoice") || t.contains("receipt") || t.contains("order") => vec!["invoice number and total amount due", "vendor and customer names"],
-        t if t.contains("complaint") || t.contains("motion") || t.contains("brief") || t.contains("court") => vec!["case caption plaintiff and defendant", "relief requested"],
+        t if t.contains("termination") => {
+            vec!["effective date of termination", "employee being terminated"]
+        }
+        t if t.contains("agreement") || t.contains("nda") => vec![
+            "effective date of this agreement",
+            "parties entering this agreement",
+        ],
+        t if t.contains("invoice") || t.contains("receipt") || t.contains("order") => vec![
+            "invoice number and total amount due",
+            "vendor and customer names",
+        ],
+        t if t.contains("complaint")
+            || t.contains("motion")
+            || t.contains("brief")
+            || t.contains("court") =>
+        {
+            vec!["case caption plaintiff and defendant", "relief requested"]
+        }
         t if t.contains("deposition") => vec!["name of the deponent", "date of the deposition"],
-        t if t.contains("minutes") || t.contains("resolution") => vec!["date of the meeting", "resolutions adopted"],
+        t if t.contains("minutes") || t.contains("resolution") => {
+            vec!["date of the meeting", "resolutions adopted"]
+        }
         _ => vec![],
     };
-    base.into_iter().chain(extra.into_iter().map(String::from)).collect()
+    base.into_iter()
+        .chain(extra.into_iter().map(String::from))
+        .collect()
 }
 
 pub struct FilterOutcome {
@@ -94,9 +154,7 @@ pub fn build_evidence(
         h.headings.join("\n"),
         h.head_excerpt.chars().take(1200).collect::<String>()
     );
-    let (doc_type, doc_type_score) = sidecar
-        .classify(&classify_text, &default_labels())
-        .unwrap_or_else(|_| ("correspondence".into(), 0.0));
+    let (doc_type, doc_type_score) = classify(sidecar, &classify_text, &default_labels());
 
     // Is 5a thin? (no subject line, no caption, few headings)
     let thin = h.subject_lines.is_empty() && h.caption_lines.is_empty() && h.headings.len() < 2;
@@ -106,10 +164,13 @@ pub fn build_evidence(
     if thin {
         let sentences: Vec<String> = split_sentences(markdown, 400);
         if sentences.len() > 4 {
-            let probes = probes_for(&doc_type);
+            let probes = probes_for(doc_type.as_deref().unwrap_or(""));
             if let Ok(mut idx) = sidecar.salience(&sentences, &probes, 12) {
                 idx.sort_unstable(); // restore document order
-                salient = idx.into_iter().filter_map(|i| sentences.get(i).cloned()).collect();
+                salient = idx
+                    .into_iter()
+                    .filter_map(|i| sentences.get(i).cloned())
+                    .collect();
             }
         }
     }
@@ -123,13 +184,74 @@ pub fn build_evidence(
     };
 
     // ---- assemble, budget-bounded (chars/4 ~ tokens) ----------------------
-    let char_budget = token_budget * 4;
+    let bundle = assemble_bundle(
+        &h,
+        &doc_meta_dates,
+        &ettin_spans,
+        &salient,
+        token_budget * 4,
+    );
+
+    Ok(FilterOutcome {
+        evidence: Evidence {
+            bundle,
+            language,
+            doc_type,
+            doc_type_score,
+            harvest: h,
+            meta_dates: doc_meta_dates.clone(),
+            salient,
+            ettin_spans,
+            thin,
+        },
+        doc_meta_dates,
+    })
+}
+
+/// A doc_type we can actually stand behind, or `None`.
+///
+/// Every path that did not really classify the document scores it 0.0:
+/// `_classify_fallback` (no gliclass on the shipped torch-free profile, or a
+/// live model that errored), op_classify's empty-results case, and the
+/// transport failure handled below. A zero-confidence best label is not a
+/// classification, so the score is the gate — and it is a slightly stricter
+/// one than op_classify's `available` flag, which still reports `true` for the
+/// empty-results case. (`Sidecar::classify` collapses the wire response to
+/// `(label, score)` and drops `available` outright; see the cross-workstream
+/// note in this change's report.)
+fn classify(sidecar: &Sidecar, text: &str, labels: &[String]) -> (Option<String>, f64) {
+    // 5c is a naming enhancement, not a requirement: a transport-level error
+    // still must not fail the pipeline.
+    let Ok((label, score)) = sidecar.classify(text, labels) else {
+        return (None, 0.0);
+    };
+    if score > 0.0 {
+        (Some(label), score)
+    } else {
+        (None, 0.0)
+    }
+}
+
+/// The one place the bundle's shape is defined, so a retry that widens the
+/// budget produces the same document in more detail rather than a different
+/// document.
+fn assemble_bundle(
+    h: &Harvest,
+    meta_dates: &[String],
+    ettin_spans: &[EttinSpan],
+    salient: &[String],
+    char_budget: usize,
+) -> String {
     let mut bundle = String::with_capacity(char_budget.min(16_000));
 
     if !ettin_spans.is_empty() {
         bundle.push_str("EXTRACTED SPANS (high confidence):\n");
-        for s in &ettin_spans {
-            let iso = s.iso.as_deref().map(|i| format!(" [{i}]")).unwrap_or_default();
+        for s in ettin_spans {
+            let iso = s
+                .iso
+                .as_deref()
+                .map(|i| format!(" [{i}]"))
+                .unwrap_or_default();
             bundle.push_str(&format!("- {}: {}{}\n", s.label, s.text.trim(), iso));
         }
         bundle.push('\n');
@@ -141,8 +263,11 @@ pub fn build_evidence(
         }
         bundle.push('\n');
     }
-    if !doc_meta_dates.is_empty() {
-        bundle.push_str(&format!("FILE METADATA DATES: {}\n\n", doc_meta_dates.join(", ")));
+    if !meta_dates.is_empty() {
+        bundle.push_str(&format!(
+            "FILE METADATA DATES: {}\n\n",
+            meta_dates.join(", ")
+        ));
     }
     if !h.subject_lines.is_empty() {
         bundle.push_str("SUBJECT / HEADER LINES:\n");
@@ -167,7 +292,7 @@ pub fn build_evidence(
     }
     if !salient.is_empty() {
         bundle.push_str("KEY SENTENCES:\n");
-        for s in &salient {
+        for s in salient {
             bundle.push_str(&format!("- {}\n", s.trim()));
         }
         bundle.push('\n');
@@ -180,19 +305,28 @@ pub fn build_evidence(
     if bundle.len() > char_budget {
         bundle.truncate(floor_char_boundary(&bundle, char_budget));
     }
+    bundle
+}
 
-    Ok(FilterOutcome {
-        evidence: Evidence {
-            bundle,
-            language,
-            doc_type,
-            doc_type_score,
-            harvest: h,
-            ettin_spans,
-            thin,
-        },
-        doc_meta_dates,
-    })
+/// Widened evidence for the "attempt 3" escalation: the same sections, a
+/// larger budget. The ladder's contract is that each rung varies the INPUT;
+/// rung 3 previously varied only the model, so a rejection caused by evidence
+/// that had been truncated away could never be recovered.
+///
+/// Rebuilt from the harvest rather than from `ev.bundle`, because the bundle
+/// is the already-truncated artifact — re-truncating it can only ever remove
+/// more. Every section the first bundle had is carried on the `Evidence` for
+/// this call, salience included: dropping KEY SENTENCES here would have handed
+/// a thin document less material than rung 1 saw, which is the opposite of what
+/// the rung is for.
+pub fn widened_bundle(ev: &Evidence, token_budget: usize) -> String {
+    assemble_bundle(
+        &ev.harvest,
+        &ev.meta_dates,
+        &ev.ettin_spans,
+        &ev.salient,
+        token_budget * 4,
+    )
 }
 
 /// Trimmed evidence for the "attempt 2" retry: 5a-only, half budget.
@@ -233,7 +367,13 @@ fn split_sentences(text: &str, max: usize) -> Vec<String> {
     out
 }
 
-fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+/// The largest char boundary at or below `i`. `String::truncate` panics on a
+/// byte index that splits a codepoint, which is a live hazard here: the budget
+/// is an arithmetic multiple of a configurable token count and has no relation
+/// to where the document's characters happen to fall. `pub(crate)` so the
+/// orchestrator's tests can assert the exact cut rather than that the result
+/// merely parses.
+pub(crate) fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     if i >= s.len() {
         return s.len();
     }

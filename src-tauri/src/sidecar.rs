@@ -7,11 +7,146 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// Longest single stdout line convertd is allowed to send. The protocol is
+/// one JSON object per line and the largest legitimate one is a converted
+/// document's markdown, which `convert` already truncates to head/tail pages;
+/// anything beyond this is a runaway, and `BufRead::read_line` would grow the
+/// buffer to hold it until this process died.
+const MAX_STDOUT_LINE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Stderr is prose, not payload — a traceback line far past this is noise.
+const MAX_STDERR_LINE_BYTES: usize = 16 * 1024;
+
+/// Stderr lines logged per spawned child before the rest are suppressed.
+///
+/// llama-server narrates every request, and a several-thousand-file backfill
+/// would push the startup diagnostics — the whole reason stderr is captured —
+/// out of the rotating log within minutes. Startup output arrives first, so a
+/// per-process cap keeps exactly the part that explains a failure.
+const MAX_LOGGED_STDERR_LINES: usize = 2000;
+
+/// Outcome of one [`read_line_bounded`] call.
+pub enum LineRead {
+    Line(String),
+    /// A line that ran past the ceiling and was discarded, with the number of
+    /// bytes dropped.
+    Overlong(u64),
+    Eof,
+    Err(std::io::Error),
+}
+
+/// `BufRead::read_line` with a hard ceiling.
+///
+/// A child that writes megabytes without ever emitting a newline (a hung
+/// generator, a binary blob on the wrong stream) would otherwise be able to
+/// grow this process's memory without limit. Over-long lines are drained and
+/// dropped rather than buffered, so the reader stays in sync with the stream
+/// and the next well-formed line is still delivered.
+pub fn read_line_bounded(reader: &mut impl BufRead, max_bytes: usize) -> LineRead {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut discarded: u64 = 0;
+    loop {
+        let (complete, consume) = {
+            let available = match reader.fill_buf() {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return LineRead::Err(e),
+            };
+            if available.is_empty() {
+                // EOF. A trailing fragment with no newline is still worth
+                // returning; a fragment we already gave up on is not.
+                return match (discarded, buf.is_empty()) {
+                    (0, true) => LineRead::Eof,
+                    (0, false) => LineRead::Line(String::from_utf8_lossy(&buf).into_owned()),
+                    _ => LineRead::Overlong(discarded),
+                };
+            }
+            match available.iter().position(|byte| *byte == b'\n') {
+                Some(index) => {
+                    if discarded > 0 {
+                        discarded += index as u64;
+                    } else {
+                        buf.extend_from_slice(&available[..index]);
+                    }
+                    (true, index + 1)
+                }
+                None => {
+                    let len = available.len();
+                    if discarded > 0 {
+                        discarded += len as u64;
+                    } else if buf.len() + len > max_bytes {
+                        discarded = (buf.len() + len) as u64;
+                        buf = Vec::new();
+                    } else {
+                        buf.extend_from_slice(available);
+                    }
+                    (false, len)
+                }
+            }
+        };
+        reader.consume(consume);
+        if complete {
+            return if discarded > 0 {
+                LineRead::Overlong(discarded)
+            } else {
+                LineRead::Line(String::from_utf8_lossy(&buf).into_owned())
+            };
+        }
+    }
+}
+
+/// Drain a child process's stderr into the app log on a dedicated thread.
+///
+/// Both of BackLog's children used to get `Stdio::null()`, which threw away
+/// the one signal that explains a wedged run: convertd's tracebacks, and
+/// llama-server's startup diagnostics (a port conflict otherwise surfaces
+/// only as a 60-second timeout followed by SLM_FAIL flags with no cause
+/// recorded anywhere). The shipped build is windowed and has no console, so
+/// `logging.rs`'s rotating file is where this has to land.
+pub fn log_child_stderr(
+    label: &'static str,
+    stderr: ChildStderr,
+    max_lines: usize,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("{label}-stderr"))
+        .spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut logged = 0usize;
+            loop {
+                match read_line_bounded(&mut reader, MAX_STDERR_LINE_BYTES) {
+                    LineRead::Line(line) => {
+                        let line = line.trim_end();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        logged += 1;
+                        match logged.cmp(&max_lines) {
+                            std::cmp::Ordering::Less => log::info!("{label}: {line}"),
+                            std::cmp::Ordering::Equal => log::info!(
+                                "{label}: {line} (further output from this process suppressed)"
+                            ),
+                            std::cmp::Ordering::Greater => {}
+                        }
+                    }
+                    LineRead::Overlong(bytes) => {
+                        log::warn!("{label}: discarded a {bytes}-byte stderr line with no newline")
+                    }
+                    LineRead::Eof => break,
+                    LineRead::Err(e) => {
+                        log::warn!("{label}: stderr could not be read: {e}");
+                        break;
+                    }
+                }
+            }
+        })
+}
 
 #[derive(Debug, Serialize)]
 struct Request<'a> {
@@ -52,6 +187,7 @@ struct Proc {
     stdin: ChildStdin,
     rx: Receiver<std::io::Result<String>>,
     _reader: JoinHandle<()>,
+    _stderr: JoinHandle<()>,
 }
 
 impl Drop for Proc {
@@ -94,7 +230,10 @@ impl Sidecar {
 
     fn spawn(&self) -> anyhow::Result<Proc> {
         let mut cmd = Command::new(&self.exe);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Piped, not null: see `log_child_stderr`.
+            .stderr(Stdio::piped());
         if let Some(dir) = &self.models_dir {
             cmd.env("BACKLOG_MODELS_DIR", dir);
         }
@@ -105,8 +244,19 @@ impl Sidecar {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no sidecar stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no sidecar stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no sidecar stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no sidecar stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no sidecar stderr"))?;
+        let stderr_thread = log_child_stderr("convertd", stderr, MAX_LOGGED_STDERR_LINES)?;
 
         // Drain stdout on a dedicated thread so `call` can enforce a per-request
         // deadline with recv_timeout. A blocking read on the pipe is otherwise
@@ -118,26 +268,41 @@ impl Sidecar {
             .spawn(move || {
                 let mut r = BufReader::new(stdout);
                 loop {
-                    let mut line = String::new();
-                    match r.read_line(&mut line) {
-                        Ok(0) => break, // EOF: the child closed stdout
-                        Ok(_) => {
+                    match read_line_bounded(&mut r, MAX_STDOUT_LINE_BYTES) {
+                        LineRead::Line(line) => {
                             if tx.send(Ok(line)).is_err() {
                                 break; // receiver gone; nothing to do
                             }
                         }
-                        Err(e) => {
+                        // Dropped rather than forwarded: `call` would fail to
+                        // parse it anyway, and the point is that it never got
+                        // buffered in the first place.
+                        LineRead::Overlong(bytes) => {
+                            log::warn!(
+                                "convertd: discarded a {bytes}-byte response with no newline"
+                            )
+                        }
+                        LineRead::Eof => break, // the child closed stdout
+                        LineRead::Err(e) => {
                             let _ = tx.send(Err(e));
                             break;
                         }
                     }
                 }
             })?;
-        Ok(Proc { child, stdin, rx, _reader: reader })
+        Ok(Proc {
+            child,
+            stdin,
+            rx,
+            _reader: reader,
+            _stderr: stderr_thread,
+        })
     }
 
     pub fn call(&self, op: &str, args: Value) -> anyhow::Result<Value> {
-        let id = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut guard = self.inner.lock().unwrap();
 
         // Lazy spawn / respawn if dead.
@@ -230,7 +395,13 @@ impl Sidecar {
         Ok(serde_json::from_value(v)?)
     }
 
-    pub fn ocr(&self, path: &str, dpi: u32, head_pages: usize, tail_pages: usize) -> anyhow::Result<ConvertResult> {
+    pub fn ocr(
+        &self,
+        path: &str,
+        dpi: u32,
+        head_pages: usize,
+        tail_pages: usize,
+    ) -> anyhow::Result<ConvertResult> {
         let v = self.call(
             "ocr",
             serde_json::json!({ "path": path, "dpi": dpi, "head_pages": head_pages, "tail_pages": tail_pages }),
@@ -244,21 +415,33 @@ impl Sidecar {
     }
 
     pub fn classify(&self, text: &str, labels: &[String]) -> anyhow::Result<(String, f64)> {
-        let v = self.call("classify", serde_json::json!({ "text": text, "labels": labels }))?;
+        let v = self.call(
+            "classify",
+            serde_json::json!({ "text": text, "labels": labels }),
+        )?;
         Ok((
             v["label"].as_str().unwrap_or("correspondence").to_string(),
             v["score"].as_f64().unwrap_or(0.0),
         ))
     }
 
-    pub fn salience(&self, sentences: &[String], probes: &[String], top_k: usize) -> anyhow::Result<Vec<usize>> {
+    pub fn salience(
+        &self,
+        sentences: &[String],
+        probes: &[String],
+        top_k: usize,
+    ) -> anyhow::Result<Vec<usize>> {
         let v = self.call(
             "salience",
             serde_json::json!({ "sentences": sentences, "probes": probes, "top_k": top_k }),
         )?;
         Ok(v["indices"]
             .as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|u| u as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|u| u as usize))
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
@@ -303,6 +486,66 @@ pub struct EttinSpan {
     pub iso: Option<String>, // normalized, DATE spans only
 }
 
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+
+    fn read_all(input: &[u8], max_bytes: usize) -> Vec<String> {
+        let mut reader = BufReader::with_capacity(8, input);
+        let mut out = Vec::new();
+        loop {
+            match read_line_bounded(&mut reader, max_bytes) {
+                LineRead::Line(line) => out.push(line),
+                LineRead::Overlong(bytes) => out.push(format!("<dropped {bytes}>")),
+                LineRead::Eof => return out,
+                LineRead::Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn splits_on_newlines_across_buffer_refills() {
+        // An 8-byte BufReader capacity forces the multi-`fill_buf` path that
+        // a real pipe hits on any response worth reading.
+        assert_eq!(
+            read_all(b"{\"id\":1}\n{\"id\":2,\"ok\":true}\n", 1024),
+            vec![
+                "{\"id\":1}".to_string(),
+                "{\"id\":2,\"ok\":true}".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn returns_a_trailing_fragment_that_never_got_its_newline() {
+        assert_eq!(
+            read_all(b"a\nb", 1024),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    /// The point of the ceiling: a child that never emits a newline must not
+    /// be able to grow this process's memory, and the reader must stay in
+    /// sync so the *next* line still arrives.
+    #[test]
+    fn discards_an_overlong_line_and_keeps_reading() {
+        let mut input = vec![b'x'; 4096];
+        input.push(b'\n');
+        input.extend_from_slice(b"{\"id\":9}\n");
+
+        let lines = read_all(&input, 64);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("<dropped "), "{}", lines[0]);
+        assert_eq!(lines[1], "{\"id\":9}");
+    }
+
+    #[test]
+    fn an_unterminated_overlong_line_ends_the_stream_without_buffering_it() {
+        let input = vec![b'x'; 100_000];
+        assert_eq!(read_all(&input, 128), vec!["<dropped 100000>".to_string()]);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -325,13 +568,17 @@ mod tests {
         );
 
         let sidecar = Sidecar::with_timeout(executable.clone(), Duration::from_millis(75));
-        let error = sidecar.call("ping", serde_json::json!({})).expect_err("silent sidecar must time out");
+        let error = sidecar
+            .call("ping", serde_json::json!({}))
+            .expect_err("silent sidecar must time out");
         assert!(error.to_string().contains("timed out"));
 
         write_executable(
             &executable,
             "#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' '{\"id\":2,\"ok\":true}'; done\n",
         );
-        sidecar.ping().expect("next request should spawn a clean process");
+        sidecar
+            .ping()
+            .expect("next request should spawn a clean process");
     }
 }

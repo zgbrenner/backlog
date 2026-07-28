@@ -37,6 +37,14 @@
     "resources": {
       "resources/*": "resources/",
       "binaries/*.dll": "./"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller"
+      },
+      "nsis": {
+        "installMode": "currentUser"
+      }
     }
   },
   "plugins": {

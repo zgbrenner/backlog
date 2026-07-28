@@ -1,20 +1,35 @@
-# Releasing BackLog without GitHub Actions
+# Releasing BackLog
 
 BackLog is built and packaged **locally on a Windows machine** and published as
-a **GitHub Release asset**. GitHub Releases are plain file hosting — creating one
-and attaching an installer costs **zero GitHub Actions minutes**. Nothing in this
-repo runs in CI; if a future change needs compiling or bundling, it must be built
-locally before the release is uploaded.
+a **GitHub Release asset**. The NSIS bundle needs Windows, DPAPI and the real
+sidecars, so no runner produces it.
 
-> If you update the app and a change touches Rust, the frontend, or the sidecar,
-> you must rebuild locally and upload a fresh installer. There is no automated
-> build. Flag any PR that changes those areas as "needs local rebuild before
-> release" if you can't rebuild it at merge time.
+Everything that *can* be checked without Windows is checked by
+`./scripts/ci-local.sh` — the trust core, the whole Rust workspace, the
+frontend and UI harness, the Python sidecar tests, the manifest contract, and
+the version agreement between `package.json`, `tauri.conf.json` and
+`Cargo.toml`. **Do not cut a release from a commit where that script has not
+been run and passed;** it is the only thing standing between "it compiled on my
+machine" and a signed installer.
+
+`.github/workflows/ci.yml` describes the same five jobs, but no run of it has
+ever been assigned a runner (`docs/KNOWN_ISSUES.md` item 11), so there is no
+green badge to defer to. Run the script yourself and attach the output to the
+release record.
+
+> If a change touches Rust, the frontend, or the sidecar, you must rebuild
+> locally and upload a fresh installer. CI does not produce one.
+
+There is **one** publish procedure, below under "Cutting a release". It always
+attaches three assets — installer, `.sig`, `latest.json` — because attaching
+fewer breaks the update channel silently for everyone already installed.
 
 ## One-time prerequisites (build machine, Windows x64)
 
-- **Rust** stable + the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/)
-  (MSVC build tools, WebView2 — preinstalled on Windows 11).
+- **Rust** — the channel pinned in `rust-toolchain.toml` (rustup installs it
+  automatically, with `rustfmt` and `clippy`) plus the
+  [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/) (MSVC build
+  tools, WebView2 — preinstalled on Windows 11).
 - **A Windows-native Perl + NASM** for the vendored OpenSSL build that backs
   `rusqlite`'s `bundled-sqlcipher-vendored-openssl` feature (the ledger is
   SQLCipher-encrypted at rest — see `src-tauri/src/dbkey.rs`). MSYS/Git-Bash's
@@ -26,7 +41,7 @@ locally before the release is uploaded.
   ```
   This first build compiles OpenSSL from source and takes several minutes;
   subsequent builds are incremental and fast.
-- **Node 18+**.
+- **Node 22** (the version CI and `package-lock.json` are resolved against).
 - **Python 3.11** for the sidecar. The ML dependencies (onnxruntime, rapidocr)
   have **no 3.13/3.14 wheels**, so 3.11 is required even if your default
   Python is newer. This is the slim, torch-free sidecar profile -- no torch,
@@ -36,11 +51,19 @@ locally before the release is uploaded.
   ```powershell
   uv python install 3.11
   ```
-- **A `llama-server.exe`** from an llama.cpp release (see step 2).
+- **A `llama-server.exe`** from an llama.cpp release (see Build step 2).
 
 ## Build steps
 
-### 1. Build the `convertd` sidecar
+> **Two numbering spaces, deliberately named.** This document has two numbered
+> procedures — the six **Build steps** here and the seven **Cutting a release**
+> steps below — and both have a step 4. They are cited from other files, so
+> every reference spells out which space it means: "Build step 4
+> (verify-binaries)" is the PE/stub gate, "Cutting a release step 4
+> (update-channel assertion)" is the check that `latest.json` resolves. A bare
+> "step 4" is a bug in whatever document wrote it.
+
+### Build step 1. Build the `convertd` sidecar
 ```powershell
 # From the repo root. Produces src-tauri\binaries\convertd-x86_64-pc-windows-msvc.exe
 pwsh scripts\build-sidecar.ps1
@@ -50,7 +73,7 @@ freezes the resolved set to `sidecar/requirements.lock` (the reproducible lock),
 runs PyInstaller, smoke-tests the binary (`{"id":1,"op":"ping"}` → `{"ok":true}`),
 copies it into `src-tauri/binaries/`, and prints its SHA-256.
 
-### 2. Stage `llama-server` (and its DLLs)
+### Build step 2. Stage `llama-server` (and its DLLs)
 Download a prebuilt Windows x64 CPU build of `llama-server` from the
 [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases). The build
 verified for this pilot:
@@ -81,58 +104,75 @@ Copy-Item llama-cpu\*.dll src-tauri\binaries\
 > DLLs sit alongside `BackLog.exe` and the sidecars; then install once and
 > confirm the SLM lane starts (Settings → Start with a model configured).
 
-### 3. Icon
-`src-tauri/icons/icon.ico` is committed but is a low-res placeholder. For a real
-release, generate the full icon set from a 1024×1024 source:
+### Build step 3. Icon
+The full platform icon set is committed and generated from the 1024×1024
+`src-tauri/icons/icon-source.png`. Nothing to do unless the artwork changes; if
+it does, regenerate the whole set rather than editing one size:
 ```powershell
-npm run tauri icon path\to\icon-1024.png
+npm run tauri icon src-tauri\icons\icon-source.png
 ```
 
-### 4. Build the installer
+### Build step 4. Verify the binaries before bundling
 ```powershell
-npm install
+pwsh scripts\verify-binaries.ps1
+```
+This is the gate between a dev checkout and a shippable one. `externalBin` in
+`tauri.conf.json` only checks that a path *exists*, so an installer built over
+the zero-byte-era dev stubs bundled clean, installed clean, and reported green —
+and failed only when the first document reached the SLM lane on a user's
+machine, with no logs. The script refuses stubs (they carry the
+`BACKLOG-DEV-STUB-DO-NOT-SHIP` marker written by `scripts/dev-stubs.*`),
+zero-byte files, anything that is not a valid PE image, and a leftover
+`_placeholder.dll`. Pass the recorded hashes to pin them:
+
+```powershell
+pwsh scripts\verify-binaries.ps1 -Expected @{
+  "llama-server-x86_64-pc-windows-msvc.exe" = "<SHA-256 from Build step 2>"
+  "convertd-x86_64-pc-windows-msvc.exe"     = "<SHA-256 printed by Build step 1>"
+}
+```
+
+### Build step 5. Build the installer
+```powershell
+npm ci
+npm run check               # tsc --noEmit + vite build; fails fast, cheaply
 npm run tauri build         # compiles release + bundles the NSIS installer
 ```
-The installer lands in `src-tauri/target/release/bundle/nsis/BackLog_<version>_x64-setup.exe`
-(and/or the MSI under `bundle/msi/`). It bundles the app, the two sidecars, and
-`resources/name.gbnf`. It does **not** bundle the ML models (they're large and
-gitignored) — see step 5.
+The installer lands in `src-tauri/target/release/bundle/nsis/BackLog_<version>_x64-setup.exe`.
+It bundles the app, the two sidecars, `resources/name.gbnf`, the llama runtime
+DLLs, and — because `bundle.windows.webviewInstallMode` is `offlineInstaller` —
+the WebView2 runtime, so the install needs no network. It installs per-user
+(`nsis.installMode: currentUser`), which is what keeps a passive auto-update
+from raising a UAC prompt.
 
-### 5. Models (shipped or first-run)
-Run `python models/download_models.py` on an internet-connected machine to fetch
-the two Qwen GGUFs and produce `models/models.lock.json` (commit the lock;
-the weights stay untracked). Either ship the `models/` folder alongside the
-installer, or have the operator run the download once (or use the in-app
-downloader in Settings, which fetches the same bundle). The app's Settings tab
-points at the model paths.
+It does **not** bundle the ML models — see Build step 6.
 
-## Publish the release (no Actions minutes)
+### Build step 6. Models
+The models are **not** in the installer. They reach the machine one of two ways:
 
-```powershell
-# Tag the exact commit you built from, then attach the artifacts.
-git tag v0.1.0
-git push origin v0.1.0
-gh release create v0.1.0 `
-  "src-tauri\target\release\bundle\nsis\BackLog_0.1.0_x64-setup.exe" `
-  --title "BackLog v0.1.0" `
-  --notes "First pilot build. Built locally; see RELEASING.md."
-```
-`gh release create` uploads the files as release assets over the API — it does
-**not** trigger a workflow. Users download the installer from the repo's Releases
-page. Record the installer's SHA-256 in the release notes so downloaders can
-verify it.
+- **Normally:** the operator presses Settings → **Download models (~2.4 GB)**.
+  Resumable, cancellable, SHA-256-verified against `models.lock.json`. Nothing
+  for you to do.
+- **Air-gapped:** run `python models/download_models.py` on a connected machine
+  to fetch the two Qwen GGUFs and produce `models/models.lock.json` (commit the
+  lock; the weights stay untracked), then copy the two `.gguf` files into
+  `%APPDATA%\ai.sonomos.backlog\models` on the target, or point Settings →
+  Browse at wherever you put them.
 
 ## Updating later
 1. Make the change; if it touches Rust / frontend / sidecar, it needs a rebuild.
-2. Re-run steps 1–4 on a Windows machine (step 1 only if the sidecar changed).
-3. Follow "Cutting an updating release" below to build, sign, and publish.
+2. Run `./scripts/ci-local.sh` on the commit and confirm every gate passes.
+3. Re-run Build steps 1–5 on a Windows machine (Build step 1 only if the sidecar
+   changed).
+4. Follow "Cutting a release" below to sign and publish.
 
 ## Auto-updater: signing key
 
 BackLog self-updates via `tauri-plugin-updater`, checking a `latest.json` file
 published to each GitHub Release (`releases/latest/download/latest.json` —
-GitHub's "latest release" redirect resolves this with **zero Actions
-minutes**, since it's just release-asset hosting). Updates are verified with
+GitHub's "latest release" redirect resolves this to whichever release is
+currently latest, which is exactly why every release must carry that asset).
+Updates are verified with
 a minisign keypair before install: the public half is embedded in
 `src-tauri/tauri.conf.json` (`plugins.updater.pubkey`), and the private half
 signs each build.
@@ -149,10 +189,30 @@ lost, no future release can be signed to match the pubkey already embedded in
 installed copies of the app, and users would need a fresh (unsigned-chain)
 manual install to move to a new keypair.
 
-## Cutting an updating release
+## Cutting a release
 
-1. Bump `version` in `src-tauri/tauri.conf.json` (and `src-tauri/Cargo.toml`
-   if you keep them in lockstep).
+This is the **only** publish procedure. Every release — first pilot build or
+tenth patch — attaches three assets: the installer, its `.sig`, and
+`latest.json`. There is no "just the installer" path, because the updater
+endpoint tracks `releases/latest`: publishing any newer release *without* a
+`latest.json` asset makes every installed copy 404 on its update check, and
+`src/main.ts`'s `checkForUpdates` swallows that error deliberately (a failed
+check must not interrupt a user). The update channel can therefore be dead
+fleet-wide with zero signal on any machine. Cutting a release step 4 below is
+what catches it.
+
+Steps in this section are cited elsewhere as **"Cutting a release step N"**, to
+keep them distinct from the **Build steps** above.
+
+1. Bump `version` in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` **and**
+   `package.json` — all three, together. Add the matching `CHANGELOG.md`
+   section. Confirm with:
+   ```powershell
+   node .github/scripts/check-versions.mjs
+   ```
+   `./scripts/ci-local.sh version-drift` runs this too, so a mismatch fails a
+   gate rather than shipping an update manifest whose version nothing agrees
+   with.
 2. Build with the signing key available to the CLI via environment variables
    (PowerShell):
    ```powershell
@@ -204,7 +264,27 @@ manual install to move to a new keypair.
    ```
    The `latest.json` filename on the release **must** be exactly `latest.json`
    so `releases/latest/download/latest.json` resolves to it.
-4. Installed copies of BackLog check that endpoint at startup (see
+4. **Assert the update channel actually resolves — before you tell anyone.**
+   This is the one check that catches a dead fleet-wide update channel, and it
+   takes five seconds:
+   ```powershell
+   $endpoint = "https://github.com/zgbrenner/backlog/releases/latest/download/latest.json"
+   $published = Invoke-RestMethod $endpoint          # follows GitHub's /latest redirect
+   $expected  = (Get-Content src-tauri\tauri.conf.json -Raw | ConvertFrom-Json).version
+   if ($published.version -ne $expected) {
+     throw "latest.json says $($published.version), tauri.conf.json says $expected"
+   }
+   $sig = (Get-Content "src-tauri\target\release\bundle\nsis\BackLog_$expected`_x64-setup.exe.sig" -Raw).Trim()
+   if ($published.platforms.'windows-x86_64'.signature -ne $sig) {
+     throw "published latest.json carries a signature that is not this build's"
+   }
+   Invoke-WebRequest -Method Head $published.platforms.'windows-x86_64'.url | Out-Null
+   "update channel OK: $($published.version)"
+   ```
+   A 404 here means no `latest.json` asset resolved. A version mismatch means
+   an older release is still the `latest` one, or the manifest was built from a
+   stale bump. Either way, fix it now — installed copies will not tell you.
+5. Installed copies of BackLog check that endpoint at startup (see
    `src/main.ts`'s `checkForUpdates`), compare the manifest's version against
    their own, and — if newer — verify the manifest's signature against the
    pubkey baked into their own `tauri.conf.json` at the time they were built.
@@ -213,8 +293,11 @@ manual install to move to a new keypair.
    than silently applied. On accept, the app downloads the installer,
    installs it passively (`plugins.updater.windows.installMode: "passive"`),
    and relaunches into the new version via `@tauri-apps/plugin-process`.
-5. Every release published this way must be signed with the **same** private
+6. Every release published this way must be signed with the **same** private
    key (`C:/Users/zgbre/.backlog-signing/backlog-updater.key`) so its
    signature keeps validating against the pubkey already shipped in prior
    installs. Rotating the key breaks the update chain for everyone on an
    older version until they reinstall manually.
+7. Record the installer's SHA-256 in the release notes so downloaders can
+   verify it, and complete the "Release evidence" section of
+   `docs/RELEASE_CHECKLIST.md`.

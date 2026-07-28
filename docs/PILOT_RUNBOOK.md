@@ -2,8 +2,8 @@
 
 The pilot proves safety and measurable naming quality before BackLog touches a
 large real collection. Every stage uses a frozen app commit, installer hash,
-model-bundle ZIP hash, model lock, llama-server hash, configuration snapshot,
-and Power Automate export.
+model lock, llama-server hash, configuration snapshot, and Power Automate
+export.
 
 ## Roles
 
@@ -21,7 +21,8 @@ and Power Automate export.
 Before Stage 0, record:
 
 - PR commit SHA and unsigned installer SHA-256;
-- model-bundle ZIP SHA-256 and `models.lock.json` SHA-256;
+- `models.lock.json` SHA-256, and the model-bundle ZIP SHA-256 if one was
+  produced for air-gapped staging;
 - Qwen3 primary and escalation GGUF hashes (the slim, torch-free sidecar
   profile's whole model bundle -- no GLiClass or Granite snapshot; see
   `docs/DEPENDENCY_COMPATIBILITY.md`);
@@ -35,14 +36,17 @@ and restarts that stage.
 
 ## Stage 0: synthetic local shadow run
 
-1. Build and install the pilot candidate through the Windows packaging workflow.
-2. Confirm preflight resolves the bundled Qwen paths under the installed Tauri
-   resource directory.
+1. Build and install the pilot candidate per `RELEASING.md`.
+2. Install the models: Settings -> **Download models**, or copy the two locked
+   `.gguf` files into `%APPDATA%\ai.sonomos.backlog\models` by hand. They are
+   **not** in the installer (`bundle.resources` maps only `resources/*` and
+   `binaries/*.dll`). Then confirm preflight reports both model files present.
 3. Set Processing to a local test folder.
 4. Set Outbox to a local, unsynced shadow folder so no manifest reaches Power
    Automate.
 5. Set local quarantine and cache folders outside Processing and Outbox.
-6. Run preflight with networking disabled.
+6. Run preflight with networking disabled (after the models are in place --
+   the download is the one step that needs a network).
 7. Copy the synthetic fixture set into Processing.
 8. Exercise Pause before one file arrives, then Resume.
 9. Kill `convertd.exe` during one request and verify bounded recovery.
@@ -51,7 +55,7 @@ and restarts that stage.
 Required results:
 
 - zero source deletion, overwrite, or silent loss;
-- every emitted JSON file validates against schema v2;
+- every emitted JSON file validates against manifest schema v3;
 - Unicode and ambiguous-date fixtures do not panic;
 - Lingua returns a usable ISO language code for the Danish fixture;
 - the zero-byte and unsupported fixtures are flagged;
@@ -68,7 +72,9 @@ Use non-sensitive or appropriately approved representative documents. Keep a
 read-only backup outside every watched and synced folder.
 
 1. Flow concurrency: `1`.
-2. `manifest_emit_per_min`: `10`.
+2. `manifest_emit_per_min`: `10`. The shipped default in `config.rs` is `0`
+   (unlimited); it must be set explicitly in `backlog.config.json` or the
+   Stage 2 no-unrecovered-429 gate cannot be met.
 3. Review every file before relying on the index.
 4. Reconcile Processing, Processed, Archive, DocumentIndex, NeedsReview,
    commit checkpoints, and `_pa_errors` at the end.
@@ -143,7 +149,9 @@ Stop the batch and preserve all evidence when any of these occurs:
 - a destination file is overwritten;
 - a date unsupported by evidence passes the checker;
 - document content leaves the approved local and SharePoint boundary;
-- an unexpected outbound runtime connection occurs;
+- an outbound connection occurs that is not one of the two documented ones
+  (the one-time Hugging Face model download, and the startup updater check to
+  `releases/latest/download/latest.json`);
 - the same failure repeats after one controlled recovery attempt; or
 - safety or accuracy materially regresses from the preceding stage.
 

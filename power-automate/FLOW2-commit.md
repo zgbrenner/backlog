@@ -1,4 +1,4 @@
-# Flow 2: Commit manifest v2 to SharePoint
+# Flow 2: Commit manifest v3 to SharePoint
 
 Flow 2 consumes each JSON file from `<Outbox>/_manifests`, commits one physical
 file instance to SharePoint, records the result, and deletes the manifest only
@@ -107,6 +107,7 @@ Reference fixtures:
 - `examples/manifest-ok.json`
 - `examples/manifest-duplicate.json`
 - `examples/manifest-flagged.json`
+- `examples/manifest-dismissed.json`
 
 The Parse JSON schema establishes the payload shape. The explicit contract
 condition enforces stable identifiers and status-specific requirements before
@@ -153,7 +154,7 @@ replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
 
 ```text
 and(
-  equals(body('Parse_JSON')?['schema'], 2),
+  equals(body('Parse_JSON')?['schema'], 3),
   equals(length(body('Parse_JSON')?['manifest_id']), 64),
   equals(body('Parse_JSON')?['manifest_id'], toLower(body('Parse_JSON')?['manifest_id'])),
   empty(outputs('ManifestIdNonHex')),
@@ -170,10 +171,14 @@ and(
       not(empty(trim(coalesce(body('Parse_JSON')?['description'], '')))),
       not(empty(trim(coalesce(body('Parse_JSON')?['date'], '')))),
       not(empty(trim(coalesce(body('Parse_JSON')?['date_source'], '')))),
-      empty(coalesce(body('Parse_JSON')?['flag_reason'], ''))
+      empty(coalesce(body('Parse_JSON')?['flag_reason'], '')),
+      not(empty(coalesce(body('Parse_JSON')?['model_versions'], json('{}'))))
     ),
     and(
-      equals(body('Parse_JSON')?['status'], 'flagged'),
+      or(
+        equals(body('Parse_JSON')?['status'], 'flagged'),
+        equals(body('Parse_JSON')?['status'], 'dismissed')
+      ),
       not(empty(trim(coalesce(body('Parse_JSON')?['flag_reason'], '')))),
       empty(coalesce(body('Parse_JSON')?['new_filename'], ''))
     )
@@ -184,6 +189,18 @@ and(
 On a false result, create `_pa_errors` stage `flow2-contract`, leave the
 manifest in place, and terminate as failed. This condition is the runtime
 equivalent of the stricter CI schema.
+
+Two v3 changes are in that expression and both matter:
+
+- **`schema` is now `3`.** A `2` there rejects every real manifest the app
+  emits, and the symptom is a `_pa_errors` row per document with no clue which
+  side is stale. Keep this number equal to `MANIFEST_SCHEMA_VERSION` in
+  `src-tauri/src/manifest.rs`; `validate_examples.py` fails CI if the JSON
+  schemas drift from it.
+- **`model_versions` must be a non-empty object on `ok`.** It is the only
+  record of what produced a name, and `Manifest::validate` refuses an `ok`
+  delivery without it. `empty()` on an object is true when it has no
+  properties, so this catches `{}` as well as a missing key.
 
 Useful expressions:
 
@@ -214,7 +231,10 @@ physical instance and must receive its own index row.
 Use **Get items** on `NeedsReview` with the same ManifestId filter and Top Count
 `1`. Save the result for both branches.
 
-### Step 4: Handle `status = flagged`
+### Step 4: Handle `status = flagged` and `status = dismissed`
+
+Neither status renames, copies or moves anything. Both write one NeedsReview
+row and stop. They differ only in `ReviewState`.
 
 If `status` equals `flagged`:
 
@@ -224,8 +244,32 @@ If `status` equals `flagged`:
 3. Delete the manifest.
 4. Terminate as succeeded.
 
-The original file is already in BackLog's local quarantine. Flow 2 must not
-copy or rename it.
+If `status` equals `dismissed`:
+
+1. If the NeedsReview row exists, update it with `ReviewState = Dismissed`,
+   `ResolvedAt = utcNow()`, and the operator's note from `flag_reason`. That
+   note reaches SharePoint in the app's own vocabulary — `DISMISSED:<note>`,
+   or `DISMISSED:no reason given` when the operator typed nothing — so the row
+   is explained by `docs/TROUBLESHOOTING.md` §1 like any other reason code.
+2. Otherwise create it with the same values — a dismissal can arrive without a
+   prior flagged row when BackLog replaces a still-pending manifest in place.
+3. Delete the manifest.
+4. Terminate as succeeded.
+
+`dismissed` is new in manifest v3. It is a terminal human decision — *this file
+needs no name at all*: junk, a stray sync artifact, a duplicate the operator
+does not want indexed. It is deliberately distinct from `flagged` (which is
+still waiting for a person) and from `ok` (which is work delivered), so the
+`ReviewState = Pending` default view empties as the operator works and
+throughput numbers do not count dismissals as filings.
+
+**A dismissal must never reach `DocumentIndex.`** If your flow treats an
+unrecognised status as `ok`, a dismissed file is archived and indexed under a
+name that does not exist. The contract condition in step 1 rejects any status
+outside the three, which is what stops that.
+
+The original file is already in BackLog's local quarantine in both cases.
+Flow 2 must not copy or rename it.
 
 Use this expression for optional flags:
 
@@ -408,7 +452,7 @@ Processing paths. The expected result is:
 
 ## 8. Throttling
 
-Start with Flow 2 concurrency `1` and BackLog `manifest_emit_per_min = 30`.
+Start with Flow 2 concurrency `1` and BackLog `manifest_emit_per_min = 10`.
 Raise concurrency only after the duplicate, replay, interruption, and conflict
 tests pass. The SharePoint connector is throttled per connection, so increasing
 parallelism can reduce throughput when it creates more 429 retries.

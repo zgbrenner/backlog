@@ -84,6 +84,10 @@ try {
     #    Slim, torch-free profile: no torch/transformers/sentence_transformers/
     #    gliclass --collect-all entries. classify/salience/ettin_spans degrade
     #    to deterministic fallbacks at runtime instead (see convertd.py).
+    #    onnxruntime/cv2/shapely/pyclipper are RapidOCR's native halves and
+    #    ship .pyd/data files a bare --hidden-import does not pull; pdfminer
+    #    (CMap tables) and pptx (its default template) are the same story for
+    #    the markitdown parser extras.
     Write-Host "Running PyInstaller (slim, torch-free profile)..." -ForegroundColor Cyan
     & $VenvPy -m PyInstaller --clean --noconfirm --onefile --name convertd `
         --collect-all rapidocr `
@@ -91,21 +95,62 @@ try {
         --collect-all markitdown `
         --collect-all magika `
         --collect-all pypdfium2 `
-        --hidden-import onnxruntime `
+        --collect-all onnxruntime `
+        --collect-all cv2 `
+        --collect-all shapely `
+        --collect-all pyclipper `
+        --collect-all pdfminer `
+        --collect-all pptx `
         convertd.py
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed." }
 
     $built = Join-Path $SidecarDir "dist/convertd.exe"
     if (-not (Test-Path $built)) { throw "Expected build output missing: $built" }
 
-    # 4. Smoke test: the protocol must answer a ping.
-    Write-Host "Smoke-testing the built sidecar..." -ForegroundColor Cyan
-    $resp = '{"id":1,"op":"ping"}' | & $built
-    $parsed = $resp | ConvertFrom-Json
-    if (-not ($parsed.ok -eq $true -and $parsed.id -eq 1)) {
-        throw "Smoke test failed; sidecar did not answer ping with ok=true. Got: $resp"
+    # 4. Smoke test: drive real documents through one warm process.
+    #    `ping` returns {} and every heavy component sits behind a lazy
+    #    factory, so a ping-only gate passes a build with a missed hidden
+    #    import or an uncollected ONNX data file and fails on the customer's
+    #    first document. These three fixtures cover the three lanes:
+    #    markitdown/mammoth (docx), markitdown/pdfminer (pdf), and
+    #    rapidocr+onnxruntime (scanned png). All four requests go through ONE
+    #    process, which is also how the app uses it.
+    Write-Host "Smoke-testing the built sidecar on real fixtures..." -ForegroundColor Cyan
+    $Fixtures = Join-Path $SidecarDir "fixtures"
+    $requests = @(
+        @{ id = 1; op = "versions" },
+        @{ id = 2; op = "convert"; path = (Join-Path $Fixtures "sample_letter.docx"); head_pages = 10; tail_pages = 3 },
+        @{ id = 3; op = "convert"; path = (Join-Path $Fixtures "sample_text.pdf"); head_pages = 10; tail_pages = 3 },
+        @{ id = 4; op = "ocr"; path = (Join-Path $Fixtures "sample_scan.png"); dpi = 300; head_pages = 10; tail_pages = 3 }
+    ) | ForEach-Object { $_ | ConvertTo-Json -Compress }
+
+    $responses = @{}
+    $requests | & $built | ForEach-Object {
+        if ($_.Trim()) {
+            $parsed = $_ | ConvertFrom-Json
+            $responses[[int]$parsed.id] = $parsed
+        }
     }
-    Write-Host "Smoke test passed: $resp" -ForegroundColor Green
+
+    foreach ($id in 1..4) {
+        if (-not $responses.ContainsKey($id)) { throw "Smoke test failed; no response for request $id." }
+        if ($responses[$id].ok -ne $true) {
+            throw "Smoke test failed; request ${id}: $($responses[$id].error)"
+        }
+    }
+    if (-not $responses[1].convertd) { throw "Smoke test failed; 'versions' reported no convertd version." }
+    foreach ($id in 2, 3) {
+        if ([string]::IsNullOrWhiteSpace($responses[$id].markdown)) {
+            throw "Smoke test failed; request $id converted to empty markdown -- a parser dependency is missing from the frozen binary."
+        }
+    }
+    # OCR is graded on the lane having run, not on recognition quality: an
+    # uncollected ONNX model or missing cv2 makes RapidOCR raise on
+    # construction, which shows up as ok=false above.
+    if ($responses[4].ocr_used -ne $true -or [int]$responses[4].page_count -lt 1) {
+        throw "Smoke test failed; the OCR lane did not run on sample_scan.png."
+    }
+    Write-Host "Smoke test passed: versions + docx/pdf convert + png OCR." -ForegroundColor Green
 
     # 5. Place it where Tauri's externalBin expects it.
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null

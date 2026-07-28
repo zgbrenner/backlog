@@ -2,16 +2,23 @@
 # Human-maintained convertd dependency intent.
 # Regenerate a fully hash-pinned Windows lock with pip-compile on the release
 # machine before producing a signed installer.
-# NOTE: intentionally the bare `markitdown` extra, not `markitdown[all]` --
-# `[all]` pulls opencv/pandas/azure/youtube-transcript-api that this app never
-# uses, bloating the sidecar binary for no runtime benefit.
+# NOTE: the five markitdown extras below are the document parsers, not a
+# convenience. Base `markitdown` requires only beautifulsoup4,
+# charset-normalizer, defusedxml, magika, markdownify and requests -- every
+# Office/PDF reader is an extra, so without these a .docx raises
+# FileConversionException and the file quarantines. `xls` earns its place the
+# same way: routing.rs puts application/vnd.ms-excel in NATIVE_TYPES, and
+# markitdown's XLS branch is pd.read_excel(engine="xlrd"), so without it every
+# legacy .xls in the backfill quarantines too. Still NOT `markitdown[all]`:
+# that additionally pulls azure-*/youtube-transcript-api/pydub/
+# speechrecognition, none of which this app uses.
 # NOTE: torch/transformers/sentence-transformers/gliclass are deliberately
 # absent. This is the slim, torch-free sidecar profile: the classify,
 # salience, and ettin_spans ops degrade to sensible defaults in
 # convertd.py when those libraries (or their models) are unavailable, so
 # convert/OCR/langid/naming keep working without ~450 MB of PyTorch. See
 # docs/DEPENDENCY_COMPATIBILITY.md and docs/IMPLEMENTATION_STATUS.md.
-markitdown>=0.1.1,<0.2
+markitdown[pdf,docx,pptx,xls,xlsx]>=0.1.1,<0.2
 pypdfium2>=4.30,<5
 rapidocr>=3.9,<4
 onnxruntime>=1.18,<2

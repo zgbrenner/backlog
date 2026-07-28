@@ -1,5 +1,5 @@
 {
-  "schema": 2,
+  "schema": 3,
   "manifest_id": "2222222222222222222222222222222222222222222222222222222222222222",
   "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "status": "ok",
@@ -12,7 +12,9 @@
   "doc_type": "agreement",
   "language": "en",
   "duplicate_of": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "soft_flags": ["DUPLICATE_CONTENT"],
+  "soft_flags": [
+    "DUPLICATE_CONTENT"
+  ],
   "model_versions": {
     "convertd": "0.1.0",
     "primary_slm": "qwen3-0.6b-q4_k_m"

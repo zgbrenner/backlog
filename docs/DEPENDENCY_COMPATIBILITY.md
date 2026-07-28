@@ -1,6 +1,6 @@
 # Dependency compatibility and redistribution review
 
-**Reviewed:** 2026-07-22
+**Reviewed:** 2026-07-28
 
 > **Status (this branch).** This document describes the *licensing-clean* stack
 > (Qwen3 SLM, Lingua language ID, RapidOCR 3) chosen to drop the CC-BY-SA
@@ -40,8 +40,8 @@ requirements for the intended audience have been reviewed.
 
 | Component | BackLog contract | Status and release rule |
 |---|---|---|
-| Tauri 2 | Target-triple external binaries plus a Windows resource map for locked models | Supported. Windows resources are copied under `$RESOURCE/models`, and Rust resolves relative defaults against the installed resource directory. |
-| llama.cpp `llama-server` | Loopback-only `/health` and `/v1/chat/completions`; embedded Jinja chat templates; JSON Schema `response_format` | Supported by current upstream. Record `llama-server --version`, source release, and SHA-256 for every installer. |
+| Tauri 2 | Target-triple external binaries (`externalBin`) plus a resource map for `resources/*` and the llama runtime DLLs | Supported. **Models are not installer resources.** `bundle.resources` maps only `resources/*` and `binaries/*.dll`; `lib.rs` rehomes both GGUF paths to `app_data_dir()/models` (`%APPDATA%\ai.sonomos.backlog\models`) at startup, which is where the in-app downloader and `BACKLOG_MODELS_DIR` also point. A path a user set through Settings' Browse dialog passes through untouched. |
+| llama.cpp `llama-server` | Loopback-only `/health` and `/v1/chat/completions`; embedded Jinja chat templates; **`response_format: {"type": "json_schema"}` and `chat_template_kwargs`** | Verified against release `b10091`. Both request keys are required, not preferred: a build that accepts and ignores them yields free text, the checker rejects every proposal, and every document ends in `SLM_FAIL` blaming the model. Record `llama-server --version`, source release, and SHA-256 for every installer, plus the ~13 runtime DLLs the `.exe` loads. |
 | Qwen3-0.6B GGUF | `Qwen3-0.6B-Q8_0.gguf`, primary naming tier | Official Qwen repository, Apache-2.0. Bundle only the exact file recorded in `models.lock.json`. |
 | Qwen3-1.7B GGUF | `Qwen3-1.7B-Q8_0.gguf`, escalation tier | Official Qwen repository, Apache-2.0. Same lock and notice rule. |
 | RapidOCR | Unified `rapidocr` 3.x result-object API with legacy tuple normalization | Supported. The deprecated `rapidocr-onnxruntime` distribution is not used. The final retry is enhanced 600-DPI classical OCR, not a separately licensed vision-language model. |
@@ -50,11 +50,13 @@ requirements for the intended audience have been reviewed.
 | Granite embedding small English R2 | Not shipped in the slim sidecar profile | Removed from `sidecar/requirements.txt` (needs sentence-transformers, which needs torch). `sidecar/convertd.py::op_salience` degrades to `ok=true` with document-order sentence indices (`available: false`). See "Deliberately excluded" below. |
 | Ettin encoder 32M | Training base for a locally trained token-classification head | MIT. The raw encoder is not an extractor. Leave the runtime lane disabled until a trained directory passes the documented F1 gates. `sidecar/convertd.py::op_ettin_spans` returns `ok=true` with `{"spans": []}` whenever `BACKLOG_ETTIN_DIR` is unset (the default) or transformers is absent (always true on the slim profile). |
 | MarkItDown | `MarkItDown(enable_plugins=False).convert(...).text_content` | Supported by the reviewed 0.1.x range. Review transitive format-parser licenses in the frozen sidecar SBOM. |
-| Python sidecar | 64-bit Python 3.11, PyInstaller 6.x, offline Hugging Face Hub environment, **no torch/transformers/sentence-transformers/gliclass** (the slim, torch-free profile) | Windows pilot contract. The app injects the installed model resource directory through `BACKLOG_MODELS_DIR`. `huggingface_hub` stays a listed dependency (it's a lightweight pure-Python HTTP client with no torch pull-through) even though `convertd.py` doesn't import it directly today; `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`/`HF_DATASETS_OFFLINE` remain forced regardless. |
+| Python sidecar | 64-bit Python 3.11 **exactly** (`scripts/build-sidecar.ps1` throws otherwise; onnxruntime and rapidocr publish no 3.13/3.14 wheels), PyInstaller 6.x, offline Hugging Face Hub environment, **no torch/transformers/sentence-transformers/gliclass** (the slim, torch-free profile) | Windows pilot contract. The app injects the app-data models directory through `BACKLOG_MODELS_DIR`. `huggingface_hub` stays a listed dependency (it's a lightweight pure-Python HTTP client with no torch pull-through) even though `convertd.py` doesn't import it directly today; `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`/`HF_DATASETS_OFFLINE` remain forced regardless. |
 
 ## Primary upstream references
 
 - Tauri resources: <https://v2.tauri.app/develop/resources/>
+- Tauri Windows installer options (`webviewInstallMode`, `nsis.installMode`):
+  <https://v2.tauri.app/distribute/windows-installer/>
 - Tauri external binaries: <https://v2.tauri.app/develop/sidecar/>
 - llama.cpp server: <https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md>
 - Qwen3 0.6B GGUF: <https://huggingface.co/Qwen/Qwen3-0.6B-GGUF>
@@ -88,6 +90,10 @@ requirements for the intended audience have been reviewed.
 
 Before any installer or model bundle leaves the internal pilot group:
 
+0. **`NOTICE.md` enumerates every redistributed component** — the two Apache-2.0
+   Qwen3 GGUFs, the MIT llama.cpp binaries and their DLLs, the embedded WebView2
+   runtime, and the full PyInstaller-frozen dependency set from
+   `sidecar/requirements.lock`. Confirm it still matches this build;
 1. archive the exact model cards and license files represented by the lockfile;
 2. confirm commercial distribution rights and required notices;
 3. generate software and model bills of materials;
@@ -98,6 +104,11 @@ Before any installer or model bundle leaves the internal pilot group:
    release artifacts, screenshots, or training data; and
 7. obtain the required legal, security, and pilot-owner approval.
 
-The Windows workflow requires caller-supplied, SHA-256-pinned archives for both
-llama-server and the reviewed model bundle. It never silently downloads model
-weights while producing an installer.
+The release procedure (`RELEASING.md`) requires SHA-256-pinned archives for
+llama-server (Build step 2, hash checked inline before extraction) and for the model
+bundle (`models.lock.json`, verified by `models/download_models.py
+--verify-only`). `npm run tauri build` never downloads model weights: the
+models are not installer resources at all — they reach the machine through the
+in-app downloader or a hand copy into `%APPDATA%\ai.sonomos.backlog\models`
+(Build step 6). `scripts/verify-binaries.ps1` (Build step 4) is the gate that stops a
+dev-stubbed or truncated binary reaching the bundle.

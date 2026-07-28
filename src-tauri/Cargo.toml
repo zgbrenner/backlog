@@ -40,10 +40,6 @@ chrono = { version = "0.4", features = ["serde"] }
 # "std" is required explicitly (not on by default) so getrandom::Error
 # implements std::error::Error and `?` can convert it into anyhow::Error.
 getrandom = { version = "0.2", features = ["std"] }
-# DPAPI (CryptProtectData/CryptUnprotectData) to protect the SQLCipher key
-# at rest — see dbkey.rs. Version matches the copy tauri/webview2 already
-# resolve transitively.
-windows = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
 # "stream" backs model_download.rs's chunked GGUF/safetensors downloads
 # (Response::bytes_stream) so a multi-GB file is never buffered whole in
 # memory.
@@ -56,6 +52,16 @@ env_logger = "0.11"
 # (compiled as part of the normal lib target) needs it for its
 # writable-directory probe tests.
 tempfile = "3"
+
+# DPAPI (CryptProtectData/CryptUnprotectData) protects the SQLCipher key at
+# rest — see dbkey.rs. Windows-only on purpose: gating it here (rather than
+# depending on it unconditionally) is what lets the whole app crate compile and
+# run its test suite on Linux/macOS, so CI can exercise the ledger, pipeline,
+# manifest, and checker logic on a cheap Linux runner instead of only on a
+# Windows box. `bundle.targets` is NSIS-only, so the shipped artifact always
+# takes the real DPAPI path below.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
 
 [profile.release]
 lto = true

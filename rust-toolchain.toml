@@ -1,0 +1,8 @@
+[toolchain]
+# Pinned so `cargo fmt --check` and `-D warnings` mean the same thing on the
+# Linux CI runner, on the Windows release machine, and on a contributor's box.
+# rustfmt and clippy are named explicitly because a minimal rustup profile
+# ships neither, and a missing component turns a hard gate into a skipped one.
+channel = "1.94"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

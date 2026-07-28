@@ -42,7 +42,10 @@ pub fn instance_id(content_sha256: &str, normalized_relpath: &str) -> String {
 
 /// A manifest/instance id or content SHA is exactly 64 lowercase hex chars.
 pub fn is_safe_identifier(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[cfg(test)]
@@ -59,8 +62,14 @@ mod tests {
     #[test]
     fn instance_id_is_deterministic_and_path_sensitive() {
         let sha = "b".repeat(64);
-        assert_eq!(instance_id(&sha, "a/one.pdf"), instance_id(&sha, "a/one.pdf"));
-        assert_ne!(instance_id(&sha, "a/one.pdf"), instance_id(&sha, "a/two.pdf"));
+        assert_eq!(
+            instance_id(&sha, "a/one.pdf"),
+            instance_id(&sha, "a/one.pdf")
+        );
+        assert_ne!(
+            instance_id(&sha, "a/one.pdf"),
+            instance_id(&sha, "a/two.pdf")
+        );
     }
 
     #[test]
@@ -73,6 +82,10 @@ mod tests {
     fn rejects_unsafe_identifiers() {
         assert!(!is_safe_identifier("short"));
         assert!(!is_safe_identifier(&"g".repeat(64))); // non-hex
-        assert!(!is_safe_identifier(&format!("{}-{}", "a".repeat(47), "b".repeat(16))));
+        assert!(!is_safe_identifier(&format!(
+            "{}-{}",
+            "a".repeat(47),
+            "b".repeat(16)
+        )));
     }
 }

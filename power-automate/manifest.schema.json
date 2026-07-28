@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://backlog.local/schemas/manifest-v2.json",
-  "title": "BackLog Power Automate Manifest v2",
-  "description": "One replay-safe delivery record for one physical file instance.",
+  "$id": "https://backlog.local/schemas/manifest-v3.json",
+  "title": "BackLog Power Automate Manifest v3",
+  "description": "One replay-safe delivery record for one physical file instance. Mirrors src-tauri/src/manifest.rs::Manifest::validate; the two move together.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -18,7 +18,7 @@
   "properties": {
     "schema": {
       "type": "integer",
-      "const": 2
+      "const": 3
     },
     "manifest_id": {
       "type": "string",
@@ -32,7 +32,8 @@
     },
     "status": {
       "type": "string",
-      "enum": ["ok", "flagged"]
+      "description": "'dismissed' is a terminal human decision - this file needs no name at all - and carries the operator's note in flag_reason. It renames nothing, exactly like 'flagged'.",
+      "enum": ["ok", "flagged", "dismissed"]
     },
     "original_name": {
       "type": "string",
@@ -108,14 +109,19 @@
       "then": {
         "required": ["new_filename", "description", "date", "date_source"],
         "properties": {
-          "flag_reason": false
+          "flag_reason": false,
+          "model_versions": {
+            "description": "An emitted name has to be reproducible, and this is the only record of what produced it. An empty object means the sidecar was never successfully asked - a transient hiccup at pipeline construction would otherwise void that promise silently, for a whole batch.",
+            "type": "object",
+            "minProperties": 1
+          }
         }
       }
     },
     {
       "if": {
         "properties": {
-          "status": { "const": "flagged" }
+          "status": { "enum": ["flagged", "dismissed"] }
         },
         "required": ["status"]
       },

@@ -1,13 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "BackLog main window capabilities",
+  "description": "BackLog main window capabilities. Exactly what src/main.ts calls, and nothing implied twice: core:default already contains core:event:default and core:window:default, and dialog:default would additionally grant message/ask/confirm/save when the frontend only ever calls open(). updater:default plus process:allow-restart are what the signed self-update flow needs; they are contained by minisign verification but are the widest grant here, so SECURITY.md must name them.",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "core:event:default",
-    "core:window:default",
-    "dialog:default",
+    "dialog:allow-open",
     "updater:default",
     "process:allow-restart"
   ]
