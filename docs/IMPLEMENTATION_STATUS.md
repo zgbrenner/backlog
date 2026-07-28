@@ -78,11 +78,11 @@ the current tree:
 | `cargo clippy --workspace --all-targets -- -D warnings` | 0 warnings |
 | `cargo fmt --all -- --check` | clean |
 | `npm run check` (`tsc --noEmit` + `vite build`) | passes |
-| `npm run harness:shots` | 13 scenarios, both themes, no console error |
+| `npm run harness:shots` | every scenario, both themes, 0 console errors |
 | `python -m pytest sidecar/tests models/tests` | 96 passed, 3 skipped |
 | `python power-automate/validate_examples.py` | passes |
 | `node .github/scripts/check-versions.mjs` | versions agree |
-| `node .github/scripts/check-troubleshooting-coverage.mjs` | 53 user-visible codes, all documented |
+| `node .github/scripts/check-troubleshooting-coverage.mjs` | every user-visible code is documented |
 | `node .github/scripts/check-troubleshooting-coverage.test.mjs` | the gate fails on 5 removed codes, as intended |
 | `node .github/scripts/check-stub-marker.mjs` | marker contract holds across 3 scripts |
 

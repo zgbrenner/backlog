@@ -450,7 +450,7 @@ const MAX_VISIBLE_TOASTS = 3;
 let toastsExpanded = false;
 
 function toastKey(kind: string, message: string, raw: string | null | undefined): string {
-  return `${kind} ${message} ${raw ?? ""}`;
+  return `${kind}\u001f${message}\u001f${raw ?? ""}`;
 }
 
 function dismissToast(toast: HTMLElement): void {
@@ -499,16 +499,17 @@ function showToast(message: string, opts: ToastOptions = {}): void {
   const key = toastKey(kind, message, opts.raw);
   // The same failure repeated — pressing Start on a machine that is still
   // misconfigured, a backfill hitting the same locked ledger on every file —
-  // is one message that happened N times, not N messages.
-  const existing = toastHost.querySelector<HTMLElement>(`.toast[data-key="${CSS.escape(key)}"]`);
+  // is one message that happened N times, not N messages. Keys are compared
+  // directly rather than through an attribute selector because they are whole
+  // error messages: quotes, parentheses, Windows backslashes and all.
+  const existing = Array.from(toastHost.querySelectorAll<HTMLElement>(".toast"))
+    .find((t) => t.dataset.key === key);
   if (existing) {
     const count = Number(existing.dataset.count ?? "1") + 1;
     existing.dataset.count = String(count);
     const badge = q<HTMLElement>(existing, ".toast-count");
     badge.textContent = `×${count}`;
     badge.hidden = false;
-    existing.hidden = false;
-    trimToasts();
     return;
   }
   const toast = el(
@@ -1422,7 +1423,9 @@ function buildFlagged(
   const seen = new Set<string>();
   const keep = (sha256: string, card: ReviewCard) => {
     reviewCards.set(sha256, card);
-    card.markKept();
+    // A card mid-approval already explains itself, in a strip with a countdown
+    // and an Undo button in it. A second note would just be noise.
+    if (!pendingApprovals.has(sha256)) card.markKept();
     cards.push(card.root);
     seen.add(sha256);
   };
@@ -1763,8 +1766,11 @@ function dropCard(card: ReviewCard): void {
     paintReviewFoot();
   });
   // The list is never paged forward over a set that shrinks underneath the
-  // reviewer; when the visible head is cleared, the next head is fetched.
-  if (view === "flagged" && reviewCards.size === 0) requestRender();
+  // reviewer; when nothing is left that they could act on, the next head is
+  // fetched. `every` over an empty map is true, which is the ordinary
+  // "cleared the screen" case.
+  const stuck = Array.from(reviewCards).every(([sha, held]) => isHeldCard(sha, held));
+  if (view === "flagged" && stuck) requestRender();
 }
 
 // --- evidence, timeline, date candidates ------------------------------------

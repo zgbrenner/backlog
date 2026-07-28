@@ -626,6 +626,15 @@ const CHECKS = [
     // pipeline was NOT stalled, and the cold-start line could never expire.
     name: "the activity bar goes stalled on the clock, with no events",
     async run(page) {
+      // Drive a fake clock rather than sleeping. The threshold is
+      // per_file_wall_clock_secs * 3 = 270s and the fixture stamps the job 262s
+      // in, so a real-time version has to sit out an 8s margin and trust that a
+      // headless page's setInterval is not being throttled — which it is, the
+      // moment this suite shares a machine with a cargo build. Installing the
+      // clock before boot() keeps the browser's Date.now() under our control;
+      // the fixture's own timestamp comes from Node and is unaffected, which is
+      // exactly the relationship the production code sees.
+      await page.clock.install();
       await boot(page, "stalling");
       const problems = [];
       const early = await page.locator("#activity").innerText();
@@ -633,9 +642,10 @@ const CHECKS = [
         problems.push(`the bar read ${JSON.stringify(early)} before the threshold`);
       }
       const before = await page.evaluate(() => window.__harness.invocations.length);
-      // No event is emitted here on purpose. The threshold is
-      // per_file_wall_clock_secs * 3 = 270s and the fixture starts 262s in.
-      await page.waitForTimeout(12_000);
+      // No event is emitted here on purpose: crossing the threshold is the only
+      // thing that may change the line. fastForward fires the intervening
+      // timers, so this exercises the real ticker rather than skipping it.
+      await page.clock.fastForward(30_000);
       const late = await page.locator("#activity").innerText();
       if (!/Stalled/.test(late)) {
         problems.push(`no stall indicator once the threshold passed: ${JSON.stringify(late)}`);

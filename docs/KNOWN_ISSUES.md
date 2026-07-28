@@ -23,7 +23,8 @@ depends on a human running `scripts/build-sidecar.ps1` and staging
 
 `scripts/verify-binaries.ps1` now refuses to package dev stubs, truncated files
 and non-PE images, and `scripts/dev-stubs.*` mark their output — so the
-"shipped a placeholder" failure is caught. Reproducibility is not solved: two
+"shipped a placeholder" failure is caught at the packaging gate (the *runtime*
+readiness gate still is not; see item 9). Reproducibility is not solved: two
 builds of `convertd` from the same lock are not byte-identical.
 
 ### 2. `sidecar/requirements.lock` is version-pinned but not hash-pinned
@@ -69,14 +70,14 @@ front now; the honest fix is either a torch-inclusive sidecar profile or
 removing the Settings field.
 
 ### 8. Screenshots are not committed, so a doc cannot embed one
-`npm run harness:shots` renders every screen from the real frontend (13
-scenarios, both themes, 44 PNGs) and exits non-zero on any console error — but
-it writes into `dist-harness/`, which is gitignored. `docs/USER_GUIDE.md`
-therefore describes the screens in words and contains no images. It also
-contains no instruction to run the harness: its second sentence promises the
-reader will never need a terminal, and a guide that breaks that promise on the
-one reader least able to notice is worse than a guide with no pictures. Anyone
-who *can* run it does so from here or from the Tests block in `README.md`:
+`npm run harness:shots` renders every screen from the real frontend, in both
+themes, and exits non-zero on any console error — but it writes into
+`dist-harness/`, which is gitignored. `docs/USER_GUIDE.md` therefore describes
+the screens in words and contains no images. It also contains no instruction to
+run the harness: its second sentence promises the reader will never need a
+terminal, and a guide that breaks that promise on the one reader least able to
+notice is worse than a guide with no pictures. Anyone who *can* run it does so
+from here or from the Tests block in `README.md`:
 
 ```
 npm run harness:shots     # → dist-harness/shots/<scenario>.<theme>[.full].png

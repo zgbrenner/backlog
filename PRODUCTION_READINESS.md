@@ -30,7 +30,7 @@ produce on this tree. `.github/workflows/ci.yml` runs all of them on every push.
 | Lints | `cargo clippy --workspace --all-targets -- -D warnings` | 0 warnings |
 | Formatting | `cargo fmt --all -- --check` | clean |
 | Frontend | `npm run check` (`tsc --noEmit` + `vite build`) | passes |
-| UI harness | `npm run harness:shots` | 13 scenarios, both themes, no console error |
+| UI harness | `npm run harness:shots` | every scenario, both themes, 0 console errors |
 | Python | `python -m pytest sidecar/tests models/tests` | 96 passed, 3 skipped |
 | Manifest contract | `python power-automate/validate_examples.py` | passes |
 

@@ -582,6 +582,9 @@ details.advanced .dim-note { margin-bottom: 12px; }
   max-height: calc(100vh - 96px); overflow-y: auto; pointer-events: none;
 }
 .toast-more {
+  /* Sticky, because the column scrolls once it is full: the way out of a pile
+   * of errors must not be the thing that scrolls away. */
+  position: sticky; top: 0; z-index: 1;
   pointer-events: auto; display: flex; gap: 8px; align-items: center;
   background: var(--panel); border: 1px solid var(--border); border-radius: 999px;
   padding: 4px 6px 4px 4px; box-shadow: var(--shadow);
