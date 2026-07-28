@@ -1,11 +1,12 @@
 # BackLog implementation status
 
-**Updated:** 2026-07-22
+**Updated:** 2026-07-28
 
 This branch consolidates the original prototype, the reliability implementation,
 and the independent reproducibility contribution.
 
-> **Status (this branch).** Built on the CI-free `backlog-core` foundation. The
+> **Status (this branch).** Built on the `backlog-core` foundation, which now
+> backs five Linux CI jobs (`.github/workflows/ci.yml`). The
 > licensing-clean model swap (Qwen3 / Lingua / RapidOCR, replacing LFM2.5 /
 > fastText / rapidocr-onnxruntime) described below **has landed on this
 > branch**. The runtime-preflight readiness check has now been ported too. The
@@ -32,8 +33,9 @@ and the independent reproducibility contribution.
 
 - separate content, physical-delivery, and manifest identities;
 - transactional, case-insensitive filename reservations;
-- stable delivery envelopes for manual and Power Automate intake;
-- manifest schema v2 with strict and Power Automate-compatible schemas;
+- manifest schema v3 (adds the `dismissed` status and a non-empty
+  `model_versions` requirement on `ok`) with strict and Power
+  Automate-compatible schemas;
 - checkpointed Flow 2 instructions and replay-safe Flow 1 instructions;
 - Unicode-safe harvesting and deterministic date-evidence validation;
 - pause-safe watcher behavior and bounded sidecar communication;
@@ -50,48 +52,52 @@ and the independent reproducibility contribution.
   distributable runtime;
 - model download and verification tooling that detects missing, changed,
   untracked, and unsafe paths;
-- locked npm inputs, pinned Rust 1.97.1 metadata, local build diagnostics, and a
-  hash-pinned Windows NSIS packaging workflow;
+- locked npm inputs, a pinned toolchain (`rust-toolchain.toml`), build
+  diagnostics, and a Windows NSIS packaging procedure (`RELEASING.md`) whose
+  binaries are gated by `scripts/verify-binaries.ps1`;
 - in-app, hash-verified downloader (and the equivalent `models/download_models.py`
   staging script) for the two Qwen3 GGUFs and `models.lock.json`, landing under
   the installed app's data directory (the slim, torch-free sidecar profile
   fetches no GLiClass/Granite snapshots -- see `docs/DEPENDENCY_COMPATIBILITY.md`);
-- dependency, security, pilot, release, and architecture-amendment documents.
+- documentation for each audience it has: `docs/USER_GUIDE.md` and
+  `docs/TROUBLESHOOTING.md` (the operator), `docs/PRIVACY.md` (the person whose
+  documents these are), `docs/SECURITY.md` and `NOTICE.md` (IT and legal),
+  `RELEASING.md` + `docs/RELEASE_CHECKLIST.md` (the releaser),
+  `docs/DECISIONS.md` and `docs/KNOWN_ISSUES.md` (the next engineer).
 
-## Locally executed validation
+## Automated validation
 
-The following validation runs without downloading model weights and has passed
-in the available execution environment:
+`.github/workflows/ci.yml` runs all of this on ubuntu-latest on every push,
+with no Windows, no sidecar binaries and no model weights. Fresh counts from
+the current tree:
 
-- 12 sidecar protocol, OCR-adapter, date, language-code, and packet tests;
-- 6 model-specification and model-lock integrity tests; and
-- Python bytecode compilation for the updated sidecar and model tooling.
+| Check | Result |
+|---|---|
+| `cargo test -p backlog-core` | 49 passed |
+| `cargo test --workspace --all-targets` | 199 passed (150 app + 49 core) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 0 warnings |
+| `cargo fmt --all -- --check` | clean |
+| `npm run check` (`tsc --noEmit` + `vite build`) | passes |
+| `npm run harness:shots` | 13 scenarios, both themes, no console error |
+| `python -m pytest sidecar/tests models/tests` | 96 passed, 3 skipped |
+| `python power-automate/validate_examples.py` | passes |
+| `node .github/scripts/check-versions.mjs` | versions agree |
 
-The full local validation set additionally includes the static frontend/Tauri
-command smoke contract, `npm run build`, `cargo fmt --manifest-path
-src-tauri/Cargo.toml --all -- --check`, `cargo clippy --manifest-path
-src-tauri/Cargo.toml --all-targets -- -D warnings`, the complete Rust test
-suite (`cargo test -p backlog-core` and `cargo test --workspace`), Python
-contract tests, `python power-automate/validate_examples.py`, and a source
-snapshot. This project does not use GitHub Actions (no CI minutes are
-available); every one of these commands must be run locally before a release
-is cut.
+## Remaining validation before release
 
-## Remaining local validation before release
-
-A fresh, successful local run of `cargo fmt`, `cargo clippy`, and `cargo test`
-against the exact release commit is required before packaging, since no
-automated CI run backstops the commit. The Windows workflow also still
-requires reviewed SHA-256 inputs for llama-server and the model-bundle ZIP.
-The release build itself is produced locally on a Windows machine and uploaded
-manually to a GitHub Release; it is not built by GitHub Actions.
+Everything CI cannot reach, because it needs Windows and real artifacts: the
+DPAPI key path, the NSIS bundle, install/repair/upgrade/uninstall, and an
+end-to-end run with the real sidecars and model weights. The release build is
+produced locally on a Windows machine and uploaded manually to a GitHub
+Release — see `RELEASING.md` and `docs/RELEASE_CHECKLIST.md`.
 
 ## Release gates that cannot be completed in source alone
 
 - produce and review `models/models.lock.json` from the final downloaded bundle;
 - generate a hash-pinned `sidecar/requirements.lock` for any signed release;
 - build, install, repair, upgrade, and uninstall the Windows NSIS package;
-- confirm the installed app resolves bundled model resources;
+- confirm the installed app resolves its app-data model paths, and that the
+  in-app downloader works from an empty models directory;
 - observe runtime network traffic with networking disabled and with a connection
   monitor;
 - build both Power Automate flows in the target tenant and force checkpoint

@@ -1,0 +1,24 @@
+# Dependencies for the OPTIONAL Ettin span-model bootstrap. None of this ships
+# in the installer, and none of it belongs in sidecar/requirements.txt — the
+# whole point of the slim sidecar profile is that torch is absent (see
+# docs/DECISIONS.md §3). Install into a SEPARATE venv:
+#
+#   python3.11 -m venv .venv-training
+#   .venv-training/bin/pip install -r training/requirements.txt
+#
+# Read training/README.md first: the shipped sidecar ignores whatever this
+# produces.
+#
+# Unpinned on purpose. This is a research script run by hand on one machine,
+# not a reproducible build input; pinning it would imply a support commitment
+# that does not exist. Pin it yourself if you intend to repeat a run.
+
+# train_ettin.py
+torch
+transformers
+datasets
+accelerate
+numpy
+
+# silver_label.py uses only the standard library (argparse, json, random, re,
+# sqlite3, pathlib) — but see the SQLCipher blocker in README.md.

@@ -1,0 +1,92 @@
+# Known issues
+
+What is genuinely open, as of the current tree. This file replaces the "What
+still needs attention" section of the retired `PRODUCTION_READINESS.md`, whose
+list had drifted so far from the code that it claimed "No auto-updater" about an
+app that ships a signed one.
+
+**Rule for this file: an item leaves it only when the code changes, not when a
+document says it did.** Every entry below was re-checked against the tree, not
+carried forward.
+
+Release-blocking gates that are simply *work to do on a Windows machine* live in
+`docs/RELEASE_CHECKLIST.md`, not here.
+
+---
+
+## Open
+
+### 1. The shipped sidecars are not built by anything reproducible
+`src-tauri/binaries/` is gitignored and empty on a fresh clone. A release
+depends on a human running `scripts/build-sidecar.ps1` and staging
+`llama-server` by hand on one specific Windows machine.
+
+`scripts/verify-binaries.ps1` now refuses to package dev stubs, truncated files
+and non-PE images, and `scripts/dev-stubs.*` mark their output — so the
+"shipped a placeholder" failure is caught. Reproducibility is not solved: two
+builds of `convertd` from the same lock are not byte-identical.
+
+### 2. `sidecar/requirements.lock` is version-pinned but not hash-pinned
+57 exact versions, no `--generate-hashes`. A compromised or yanked-and-replaced
+PyPI artifact at those versions would be installed without complaint.
+`docs/RELEASE_CHECKLIST.md` calls a hash-pinned lock mandatory for a *signed*
+release; today no release can honestly tick it.
+
+**Fix:** `pip-compile --generate-hashes` in a clean 64-bit Python 3.11 venv on
+Windows, commit the result.
+
+### 3. Dev-only npm advisory (esbuild via vite 5)
+`npm audit` reports an esbuild advisory reachable only through the Vite dev
+server. It does not affect the shipped Tauri bundle, which serves a static
+build. The fix is a Vite major bump (`vite@8`), deferred to avoid destabilising
+a verified build shortly before a pilot.
+
+### 4. No code-signing certificate
+The installer and the external executables are unsigned. Every user therefore
+sees a SmartScreen warning on install (documented in `docs/USER_GUIDE.md`) and
+some managed fleets will block it outright. The updater's *own* minisign
+signature chain is separate and does work — an update that fails signature
+verification is rejected client-side.
+
+### 5. Retention policy for the ledger `events` table
+The ledger is encrypted at rest and the events it stores are value-free codes,
+not document text. But nothing prunes them, so a multi-thousand-file backfill
+leaves a permanent per-file trail. That is an asset for an audit and a liability
+for a retention policy, and no one has chosen which.
+
+### 6. Manifests are unencrypted on disk between emission and pickup
+By necessity — Power Automate has to read them. They carry the proposed
+filename and the one-sentence description, never document text, and Flow 2
+deletes each one after committing. Worth stating explicitly in a security
+review rather than discovering.
+
+### 7. The Ettin span lane is inert in every shipped build
+`training/` can produce a fine-tuned span model, and Settings has a field to
+point at one, but the shipped slim sidecar has no `transformers`, so
+`op_ettin_spans` always returns `{"spans": []}` with `available: false`. Setting
+the field does nothing and reports no error. `training/README.md` says so up
+front now; the honest fix is either a torch-inclusive sidecar profile or
+removing the Settings field.
+
+### 8. Screenshots are not committed, so a doc cannot embed one
+`npm run harness:shots` renders every screen from the real frontend, in both
+themes, and exits non-zero on any console error — but it writes into
+`dist-harness/`, which is gitignored. `docs/USER_GUIDE.md` therefore describes
+the screens in words and tells the reader how to regenerate the images, rather
+than embedding them. Committing a screenshot set would make the guide better
+and would need a policy for keeping it current; nobody has chosen one.
+
+## Closed since `PRODUCTION_READINESS.md` was written
+
+Recorded because that document listed them as open and they are not, which is
+how it lost the reader's trust.
+
+| Was listed as open | Actually |
+|---|---|
+| "No auto-updater" | Ships one. `tauri.conf.json` declares `plugins.updater` with a minisign pubkey, `lib.rs` initialises the plugin, `src/main.ts` calls `check()` at startup, and `RELEASING.md` is an entire signed-release procedure. |
+| "Encryption at rest" | Done. SQLCipher whole-database encryption, key DPAPI-protected at `<data_dir>/ledger.key`, proven by `ledger::tests::ledger_db_is_encrypted_at_rest_and_key_persists`. |
+| "Async hygiene — blocking calls from async code" | Done. Convert/OCR/hash round-trips run under `tokio::task::spawn_blocking`; a `JoinError` folds into the same retry-then-flag path as any other failure. |
+| "In-flight claim" | Done. `Pipeline::inflight` is an in-memory `HashSet<PathBuf>` on top of the durable ledger claim, so a path enqueued by both the startup sweep and a filesystem event is driven once. |
+| "`binary()` PATH fallback" | Done. `resolve_binary` takes `cfg!(debug_assertions)`, so a release build never resolves a sidecar from `%PATH%`. |
+| "Real app icon" | Done. A 1024×1024 source and the generated platform set are committed. |
+| "No committed lockfiles" | Done. `Cargo.lock`, `package-lock.json` and `sidecar/requirements.lock` are all committed (see item 2 for the remaining gap). |

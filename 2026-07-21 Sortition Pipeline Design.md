@@ -1,6 +1,44 @@
 # Sortition: Local Document Naming and Indexing Pipeline
 **Design doc, v1. 2026-07-21.**
 
+> ## ⚠ HISTORICAL. Do not implement against this document.
+>
+> This is the original design rationale, kept because the *reasoning* is still
+> the best explanation of why the architecture is shaped the way it is. It has
+> been **superseded on models, error codes and Flow 2 behavior**. It is the
+> longest and most persuasive document in the repo, which is exactly why it
+> needs this banner: an engineer who trusts it builds against models that were
+> deliberately removed for licensing reasons.
+>
+> Specifically wrong, as of 2026-07-28:
+>
+> - **The model table in §0 is obsolete.** LFM2.5-VL-450M-Extract, fastText
+>   (`lid.176`), GLiClass, granite-small-r2 and LFM2.5-350M/1.2B have **all**
+>   been removed. The shipped stack is **Qwen3-0.6B primary / Qwen3-1.7B
+>   escalation** (both Apache-2.0), **Lingua** for language ID, and
+>   **RapidOCR 3** with an enhanced 600-DPI classical final retry instead of a
+>   VLM fallback. The doc-type and salience lanes are not shipped at all and
+>   degrade to deterministic fallbacks. See `docs/DEPENDENCY_COMPATIBILITY.md`.
+> - **The SLM is not GBNF-grammar-constrained.** It uses llama-server's
+>   `response_format: {"type": "json_schema"}` plus
+>   `chat_template_kwargs: {"enable_thinking": false}`. `resources/name.gbnf`
+>   survives as a fallback that is not currently wired in.
+> - **The error codes here do not exist.** `TYPE_MISMATCH`, `VALIDATION_FAIL`
+>   and `SCANNED_PENDING` are never emitted by any code path. The real
+>   vocabulary — every flag reason, checker code, soft flag and preflight code
+>   the app can actually produce — is `docs/TROUBLESHOOTING.md`.
+> - **Flow 2 does not move flagged files.** This doc describes a
+>   `/NeedsReview` folder move; `power-automate/FLOW2-commit.md` now explicitly
+>   forbids Flow 2 from copying or renaming a flagged file, because it is
+>   already in BackLog's local quarantine. Flow 2 writes a list row and stops.
+> - **The manifest is v3, not the shape sketched here** — `dismissed` status,
+>   non-empty `model_versions` on `ok`. `power-automate/manifest.schema.json`
+>   is the contract, and `validate_examples.py` fails CI if it drifts from
+>   `src-tauri/src/manifest.rs`.
+>
+> For what is current: the code, plus `README.md`, `docs/DECISIONS.md`
+> (why the load-bearing choices are what they are) and `docs/KNOWN_ISSUES.md`.
+
 Working name "Sortition" (drawing lots to assign names; rename it whatever you want). One Tauri app does all the thinking. Power Automate does dumb I/O at the edges. Nothing leaves the device except a manifest of results.
 
 ---

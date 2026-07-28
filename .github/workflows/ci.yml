@@ -1,0 +1,171 @@
+name: CI
+
+# Every job here runs on a Linux runner with no Windows, no sidecar binaries
+# and no GGUF weights, because that is the whole reason `backlog-core` was
+# extracted and the reason DPAPI is behind `cfg(windows)`. What CI cannot do is
+# build the NSIS installer or exercise the DPAPI key path — those stay manual
+# and are gated by docs/RELEASE_CHECKLIST.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A force-push should not leave two runs racing for the same cache.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI failure has to be readable from the log alone; there is no machine to
+  # attach a debugger to.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The product's actual guarantee. Deliberately first and deliberately cheap:
+  # it needs no system libraries, no sidecars and no icon, so a checker
+  # regression is reported in under a minute instead of behind a webkit install.
+  trust-core:
+    name: Trust core (checker + harvest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the channel and pulls rustfmt + clippy; rustup
+      # on the runner image honors it, so there is no toolchain action here to
+      # disagree with the file.
+      - name: Show toolchain
+        run: rustc --version && cargo --version && cargo clippy --version
+        working-directory: src-tauri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: trust-core
+      - name: Test
+        run: cargo test -p backlog-core --locked
+        working-directory: src-tauri
+      - name: Lint
+        run: cargo clippy -p backlog-core --all-targets --locked -- -D warnings
+        working-directory: src-tauri
+
+  # ---------------------------------------------------------------------------
+  workspace:
+    name: Workspace (app crate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The Tauri app crate links against webkit2gtk even on a test-only build,
+      # so these are required before `cargo test`, not just before `tauri build`.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: workspace
+      # tauri-build validates `externalBin` and the `bundle.resources` DLL glob
+      # at compile time, so without these placeholders the app crate does not
+      # reach a single test. They are marker-stamped, and preflight plus
+      # scripts/verify-binaries.ps1 both refuse a marked file — a stub can pass
+      # this job and still never pass a release.
+      - name: Stage dev stub sidecars
+        run: bash scripts/dev-stubs.sh
+      # verify-binaries.ps1 cannot run on a Linux runner, so this checks the
+      # one thing that can silently break it: the marker drifting apart across
+      # the three scripts that hardcode it.
+      - name: Check dev-stub marker contract
+        run: node .github/scripts/check-stub-marker.mjs
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+        working-directory: src-tauri
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        working-directory: src-tauri
+      # Last, so a formatting nit never masks a real failure above it.
+      - name: Format
+        run: cargo fmt --all -- --check
+        working-directory: src-tauri
+
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: Frontend (types, bundle, UI harness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Typecheck and build
+        run: npm run check
+      # The harness renders the real frontend against a mock Tauri IPC and
+      # exits non-zero on any console error, so it is the only automated proof
+      # that the UI still boots. It needs a browser; the repo ships none.
+      - name: Install Chromium for the harness
+        run: npx playwright install --with-deps chromium
+      - name: Render UI harness
+        run: npm run harness:shots
+      # Reviewing a UI change without looking at it is how the light/dark and
+      # tab-state gaps in the harness survived; make the pixels a click away.
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-harness-shots
+          path: dist-harness/shots
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  python:
+    name: Sidecar and tooling (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Exactly 3.11: onnxruntime and rapidocr publish no 3.13/3.14 wheels and
+      # scripts/build-sidecar.ps1 hard-throws on anything else, so testing on a
+      # newer interpreter would test something we cannot ship.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        # numpy is deliberately absent: the sidecar's classify/salience lanes
+        # promise `ok=true` with `available:false` on the slim, torch-free
+        # profile, and installing numpy here would hide a regression that only
+        # ever bites on a user's machine.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install -r power-automate/requirements-dev.txt
+      - name: Test
+        run: python -m pytest sidecar/tests models/tests
+      - name: Validate Power Automate manifest contract
+        run: python power-automate/validate_examples.py
+
+  # ---------------------------------------------------------------------------
+  version-drift:
+    name: Release version agreement
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check versions agree
+        run: node .github/scripts/check-versions.mjs
+      # Every failure path in this product ends at a person reading a code.
+      # A code with no entry in TROUBLESHOOTING.md is a dead end for someone
+      # who must never open a terminal.
+      - name: Check every user-visible code is documented
+        run: node .github/scripts/check-troubleshooting-coverage.mjs

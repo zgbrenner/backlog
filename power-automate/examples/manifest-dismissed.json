@@ -1,0 +1,13 @@
+{
+  "schema": 3,
+  "manifest_id": "4444444444444444444444444444444444444444444444444444444444444444",
+  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "status": "dismissed",
+  "original_name": "~WRD0001.tmp",
+  "original_relpath": "Scans/~WRD0001.tmp",
+  "flag_reason": "Dismissed by reviewer: Word crash artifact, not a document.",
+  "model_versions": {
+    "convertd": "0.2.0"
+  },
+  "processed_at": "2026-07-21T19:33:00Z"
+}
