@@ -74,11 +74,6 @@ impl SecretKey {
     /// low-entropy human passphrases; this key is already uniformly random
     /// 256-bit CSPRNG output, so deriving further from it would add cost
     /// with no security benefit.
-    // `allow(dead_code)` only until `ledger.rs::open` calls this instead of
-    // building the statement with `format!("… {}", hex::encode(key))`, which
-    // allocates a second, unscrubbed copy of the key. That file belongs to
-    // another workstream; this is the half that lives here.
-    #[allow(dead_code)]
     pub fn pragma_statement(&self) -> ZeroizingString {
         const PREFIX: &str = "PRAGMA key = \"x'";
         const SUFFIX: &str = "'\";";
@@ -118,13 +113,8 @@ impl Drop for SecretKey {
 /// A `String` whose bytes are overwritten before the allocation goes back to
 /// the allocator. Only grows through [`ZeroizingString::with_capacity`]'s
 /// reservation, so it never leaves a stale copy behind in a reallocation.
-///
-/// See the note on [`SecretKey::pragma_statement`] for why this is not yet
-/// constructed outside tests.
-#[allow(dead_code)]
 pub struct ZeroizingString(String);
 
-#[allow(dead_code)]
 impl ZeroizingString {
     fn with_capacity(capacity: usize) -> Self {
         Self(String::with_capacity(capacity))

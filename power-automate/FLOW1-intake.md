@@ -128,8 +128,8 @@ Add **Create file** from the OneDrive for Business connector.
   unmodified
 - File Content: output of `Get_file_content`
 
-The OneDrive connector creates missing folders in the path, so there is no
-separate "create folder" action.
+The OneDrive connector creates missing folders in the path, so the flow needs
+no separate folder-creation action of its own.
 
 In the action settings:
 

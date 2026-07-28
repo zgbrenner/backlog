@@ -558,11 +558,43 @@ function scenario(
   };
 }
 
+/** A flagged list that really shrinks. `resubmit`, `dismiss` and `reprocess`
+ *  all move the job out of JobState::Flagged in the real ledger (Emitted,
+ *  Dismissed and Ingested respectively), so the next `list_flagged` cannot
+ *  return it. A fixture that kept handing the same rows back would let a card
+ *  for an already-filed document screenshot clean — a state the backend cannot
+ *  produce, and the one that a manifest Power Automate has consumed sits
+ *  behind. */
+function shrinking(rows: Job[]): { live: Job[]; remove: (args?: unknown) => unknown } {
+  const live = [...rows];
+  const remove = (args?: unknown) => {
+    const sha = ((args ?? {}) as ShaArgs).sha256 ?? "";
+    const at = live.findIndex((row) => row["sha256"] === sha);
+    if (at === -1) return new Error("That file has already moved on.");
+    live.splice(at, 1);
+    return null;
+  };
+  return { live, remove };
+}
+
+/** The Needs Review screen against a list that empties as it is worked. */
+function reviewScenario(label: string, stats: Record<string, number>): Scenario {
+  const { live, remove } = shrinking(FLAGGED);
+  const s = scenario(label, READY_RUNTIME, stats, QUEUE, live, { view: "flagged" });
+  return {
+    ...s,
+    commands: {
+      ...s.commands,
+      get_stats: () => ({ ...stats, flagged: live.length }),
+      resubmit: remove,
+      dismiss: remove,
+      reprocess: remove,
+    },
+  };
+}
+
 /** A flagged backlog deeper than one fetch, backed by a list that really
- *  mutates. `dismiss` and `resubmit` remove the row from the ledger in the
- *  real backend (JobState::Dismissed / Emitted are both outside the flagged
- *  set), so a fixture that kept handing back the same rows would hide the
- *  entire class of bug where the reviewer never sees the middle of the list. */
+ *  mutates — see `shrinking`. */
 function reviewScale(count: number): Scenario {
   const rows: Job[] = Array.from({ length: count }, (_, i) =>
     job({
@@ -578,28 +610,23 @@ function reviewScale(count: number): Scenario {
       final_filename: null,
     })
   );
-  const remove = (args?: unknown) => {
-    const sha = ((args ?? {}) as ShaArgs).sha256 ?? "";
-    const at = rows.findIndex((row) => row["sha256"] === sha);
-    if (at === -1) return new Error("That file has already moved on.");
-    rows.splice(at, 1);
-    return null;
-  };
+  const { live, remove } = shrinking(rows);
   return {
     label: "60 files needing review",
     view: "flagged",
     commands: {
-      ...base(READY_RUNTIME, {}, rows, rows),
-      get_stats: () => ({ emitted: 940, flagged: rows.length, per_hour: 0 }),
-      list_flagged: (args?: unknown) => page(rows, args),
+      ...base(READY_RUNTIME, {}, live, live),
+      get_stats: () => ({ emitted: 940, flagged: live.length, per_hour: 0 }),
+      list_flagged: (args?: unknown) => page(live, args),
       count_jobs: (args?: unknown) => {
         const a = (args ?? {}) as ListArgs;
         const state = a.jobState ?? a.job_state ?? null;
-        if (state === "flagged") return rows.length;
-        return filtered(rows, args).length;
+        if (state === "flagged") return live.length;
+        return filtered(live, args).length;
       },
       dismiss: remove,
       resubmit: remove,
+      reprocess: remove,
     },
   };
 }
@@ -626,9 +653,7 @@ export const SCENARIOS: Record<string, Scenario> = {
   blocked: scenario("Preflight failed, models missing", BLOCKED_RUNTIME, STATS_EMPTY, [], []),
 
   /** The review backlog — the screen a user actually spends time in. */
-  review: scenario("Needs Review backlog", READY_RUNTIME, { ...STATS_BUSY, flagged: 4 }, QUEUE, FLAGGED, {
-    view: "flagged",
-  }),
+  review: reviewScenario("Needs Review backlog", { ...STATS_BUSY, flagged: 4 }),
 
   /** Backend is down: every list command rejects. */
   errors: {
@@ -676,8 +701,7 @@ export const SCENARIOS: Record<string, Scenario> = {
   },
 
   /** The evidence pane and the per-attempt diagnosis, both expanded. */
-  "review-detail": scenario("Review card, everything expanded", READY_RUNTIME,
-    { ...STATS_BUSY, flagged: 4 }, QUEUE, FLAGGED, { view: "flagged" }),
+  "review-detail": reviewScenario("Review card, everything expanded", { ...STATS_BUSY, flagged: 4 }),
 
   /** Several failures at once — the case where toasts used to land exactly on
    *  top of each other and only the last one was legible, and then (once they
@@ -745,6 +769,25 @@ export const SCENARIOS: Record<string, Scenario> = {
       FLAGGED
     ),
   },
+
+  /** The pipeline stops without the run button being touched: it crashed, the
+   *  ledger locked, or it was paused from somewhere other than this window.
+   *  `get_runtime_status` is the ONLY thing that can ever tell the UI, so this
+   *  scenario hands back running:true for the boot read and false for every
+   *  read after it — a UI that only re-reads on a button press stays stuck on
+   *  "Pause" over a dead pipeline for the rest of the session. */
+  "external-stop": (() => {
+    let reads = 0;
+    const status = () => ({ ...READY_RUNTIME, running: reads++ < 1 });
+    const s = scenario(
+      "Pipeline stopped from outside",
+      { ...READY_RUNTIME, running: true },
+      { ingested: 3, converted: 1, emitted: 41, flagged: 2, per_hour: 0 },
+      RUNNING_QUEUE,
+      FLAGGED
+    );
+    return { ...s, commands: { ...s.commands, get_runtime_status: status, run_preflight: status } };
+  })(),
 
   /** A 5,000-file backfill, to expose problems that only appear at size. */
   scale: scenario(

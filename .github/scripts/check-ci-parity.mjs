@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Fail if .github/workflows/ci.yml and scripts/ci-local.sh have drifted apart.
 //
-// GitHub Actions does not run for this repository (no minutes on the account —
-// see docs/KNOWN_ISSUES.md), so scripts/ci-local.sh is the copy that actually
-// executes and ci.yml is the copy that will execute the day that changes. Two
+// GitHub Actions does not run for this repository (every run fails in seconds
+// with no runner assigned — docs/KNOWN_ISSUES.md item 11), so ci-local.sh is
+// the copy that actually executes and ci.yml is the copy that will execute the
+// day that changes. Two
 // definitions of "the gates", only one of them ever run, is precisely how a
 // repo ends up with CI that passes locally and fails the moment it is switched
 // on. This makes the divergence a build failure instead of a surprise.
@@ -55,9 +56,15 @@ for (const job of localJobs) {
 // --- gate scripts -----------------------------------------------------------
 // Every node gate under .github/scripts must be invoked by both, or one side
 // is enforcing a rule the other does not.
+//
+// The character class includes `.` because gate names are dotted: a gate's own
+// self-test is `<gate>.test.mjs`. Without the dot, `[a-z0-9-]+` stops at the
+// first `.` and the whole filename matches nothing at all — so a `.test.mjs`
+// gate present in only one of the two files was invisible here, and this check
+// reported "parity holds" over precisely the drift it exists to catch.
 const gateScripts = (text) =>
   new Set(
-    [...text.matchAll(/\.github\/scripts\/([a-z0-9-]+\.mjs)/g)].map((m) => m[1]),
+    [...text.matchAll(/\.github\/scripts\/([a-z0-9.-]+\.mjs)/g)].map((m) => m[1]),
   );
 
 const workflowGates = gateScripts(workflow);
@@ -88,6 +95,10 @@ const ANCHORS = [
   ["python tests", "pytest"],
   ["Power Automate contract", "validate_examples.py"],
   ["locked dependency resolution", "--locked"],
+  // Redundant with the gate-script set above, on purpose: this is the one
+  // entry that survives someone narrowing the filename pattern back to
+  // `[a-z0-9-]+`, which is how the self-test came to run in only one file.
+  ["coverage gate self-test", "coverage.test.mjs"],
 ];
 
 for (const [label, needle] of ANCHORS) {

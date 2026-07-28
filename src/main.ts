@@ -460,7 +460,13 @@ function dismissToast(toast: HTMLElement): void {
 
 /** Keep at most MAX_VISIBLE_TOASTS on screen and fold the rest behind one row.
  *  The oldest are the ones that get folded: the newest message is the one the
- *  user's last action produced. */
+ *  user's last action produced.
+ *
+ *  The row itself stays mounted for as long as there is more than one message,
+ *  because it carries "Clear all" — the only control that empties a pile of
+ *  errors in one press, and errors never auto-dismiss. Removing the row the
+ *  moment the pile was expanded took that away at exactly the point it was
+ *  needed, leaving the 14px × on each toast as the only way out. */
 function trimToasts(): void {
   const toasts = Array.from(toastHost.querySelectorAll<HTMLElement>(".toast"));
   const folded = toastsExpanded ? 0 : Math.max(0, toasts.length - MAX_VISIBLE_TOASTS);
@@ -468,7 +474,7 @@ function trimToasts(): void {
     toast.hidden = i < folded;
   });
   let more = toastHost.querySelector<HTMLElement>(".toast-more");
-  if (folded === 0) {
+  if (toasts.length <= 1) {
     more?.remove();
     if (!toasts.length) toastsExpanded = false;
     return;
@@ -480,7 +486,7 @@ function trimToasts(): void {
         <button type="button" class="toast-clear">Clear all</button>
       </div>`);
     q<HTMLElement>(more, ".toast-more-show").addEventListener("click", () => {
-      toastsExpanded = true;
+      toastsExpanded = !toastsExpanded;
       trimToasts();
     });
     q<HTMLElement>(more, ".toast-clear").addEventListener("click", () => {
@@ -490,8 +496,18 @@ function trimToasts(): void {
   }
   // Always first, so the fold indicator sits above the messages it hides.
   toastHost.prepend(more);
-  q<HTMLElement>(more, ".toast-more-show").textContent =
-    `Show ${formatCount(folded)} earlier message${folded === 1 ? "" : "s"}`;
+  const show = q<HTMLElement>(more, ".toast-more-show");
+  if (folded > 0) {
+    show.hidden = false;
+    show.textContent = `Show ${formatCount(folded)} earlier message${folded === 1 ? "" : "s"}`;
+  } else if (toastsExpanded && toasts.length > MAX_VISIBLE_TOASTS) {
+    // Expanding is reversible; the pile is only there because it grew past what
+    // fits, so the way back has to be in the same place as the way in.
+    show.hidden = false;
+    show.textContent = "Show fewer";
+  } else {
+    show.hidden = true;
+  }
 }
 
 function showToast(message: string, opts: ToastOptions = {}): void {
@@ -510,6 +526,19 @@ function showToast(message: string, opts: ToastOptions = {}): void {
     const badge = q<HTMLElement>(existing, ".toast-count");
     badge.textContent = `×${count}`;
     badge.hidden = false;
+    // A repeat is a NEW event and has to read like one. Bumping a small grey
+    // badge on a toast that had already been folded out of sight produced no
+    // visible change at all — the user pressed the app's primary control, the
+    // screen stayed byte-identical, and that is precisely what makes them press
+    // it again. Moving the node re-enters it at the newest position (so it can
+    // never stay folded), and re-inserting a role=alert is also what gets it
+    // re-announced: a mutated-in-place alert is not.
+    existing.hidden = false;
+    toastHost.appendChild(existing);
+    trimToasts();
+    existing.classList.remove("repeat");
+    void existing.offsetWidth; // reflow, so the flash restarts on a repeat repeat
+    existing.classList.add("repeat");
     return;
   }
   const toast = el(
@@ -644,12 +673,15 @@ let updateTotalBytes = 0;
  *
  *  This is also the ONLY place running/paused come from. They used to be
  *  module-local mirrors that nothing ever synced, so reloading the webview
- *  while paused showed "Start" over a pipeline that was already up. */
-async function refreshRuntime(live: boolean): Promise<void> {
+ *  while paused showed "Start" over a pipeline that was already up.
+ *
+ *  `quiet` is for the polling caller: a status read that fails every five
+ *  seconds must not turn into a toast every five seconds. */
+async function refreshRuntime(live: boolean, quiet = false): Promise<void> {
   try {
     runtime = await invoke<RuntimeStatus>(live ? "run_preflight" : "get_runtime_status");
   } catch (e) {
-    showError(e);
+    if (!quiet) showError(e);
   }
 }
 
@@ -871,7 +903,19 @@ const ACTIVITY_TICK_MS = 5000;
 function syncActivityTicker(): void {
   if (runtime.running && !activityTicker) {
     activityTicker = window.setInterval(() => {
-      void loadStats().then(paintHeader);
+      void (async () => {
+        // running/paused are re-read here too, not just the counters. They can
+        // change from outside this window — the pipeline dies, the ledger locks,
+        // someone pauses from another copy — and until this tick did it, the
+        // only thing that ever refreshed them was the run button. The header
+        // then showed "Pause" over a dead pipeline, "Working on: <name>" over
+        // nothing, and counters that never moved, for the rest of the session.
+        // get_runtime_status is the cached read boot() already relies on: it
+        // never spawns the sidecar or touches disk.
+        await refreshRuntime(false, true);
+        await loadStats();
+        paintHeader();
+      })();
     }, ACTIVITY_TICK_MS);
   } else if (!runtime.running && activityTicker) {
     window.clearInterval(activityTicker);
@@ -958,11 +1002,21 @@ async function renderOnce(): Promise<void> {
   restoreFocus(focus);
 }
 
-/** A card that must survive a re-render: unsaved typing, an invoke in flight,
- *  or a deferred approval whose countdown and Undo are the only thing standing
- *  between the reviewer and an irreversible manifest. */
+/** A card that must survive a re-render: unsaved typing, an invoke in flight, a
+ *  deferred approval whose countdown and Undo are the only thing standing
+ *  between the reviewer and an irreversible manifest, or an open pane the
+ *  reviewer is reading in order to name the file. */
 function isHeldCard(sha256: string, card: ReviewCard): boolean {
-  return card.dirty || card.busy || pendingApprovals.has(sha256);
+  return card.dirty || card.busy || pendingApprovals.has(sha256) || isDisclosed(card);
+}
+
+/** "Document text" or "What happened" expanded. Rebuilding the card collapses
+ *  it, so any full render — the refresh chip, the run button, the error retry —
+ *  took away the document text mid-sentence while the reviewer was reading it
+ *  to work out what the file was. */
+function isDisclosed(card: ReviewCard): boolean {
+  return card.root.querySelector<HTMLElement>(".evidence")?.hidden === false
+    || card.root.querySelector<HTMLElement>(".timeline")?.hidden === false;
 }
 
 function requestRender(): void {
@@ -1165,7 +1219,12 @@ async function onRunButton(): Promise<void> {
         await invoke("start_pipeline");
       } catch (e) {
         coldStart = null;
-        showError(e, { label: "Open Settings", run: () => void navigate("settings") });
+        // Points at the CONTROL, not the view. The most common place this toast
+        // is read is Settings itself (the app boots there while unconfigured),
+        // where navigate("settings") returns early and the recovery button did
+        // nothing at all. goToPreflight scrolls to and focuses the check button
+        // wherever the user already is; the label is the button's own words.
+        showError(e, { label: "Check this computer", run: () => void goToPreflight() });
         // Same reason navigate() does it: nothing parked on an undo timer may
         // be abandoned on a screen the user is being moved away from.
         flushPendingApprovals();
@@ -1402,6 +1461,16 @@ type ReviewCard = {
 
 const reviewCards = new Map<string, ReviewCard>();
 
+/** Corrections typed but not yet filed, keyed by sha256 and held OUTSIDE the
+ *  DOM. Carrying the card *node* across a rebuild is enough only while the
+ *  reviewer stays on Needs Review: renderOnce clears the card map on every
+ *  render and buildView hands the survivors to the flagged branch alone, so one
+ *  click on Queue — or one ArrowRight while the tablist had focus — reverted a
+ *  half-typed name to the ledger's value with no warning. The values outlive
+ *  the node, so a correction now survives navigation, a re-read of the view and
+ *  the round trip back. */
+const dirtyEdits = new Map<string, { date: string; subject: string; description: string }>();
+
 function reasonCopy(raw: string | null): { title: string; why: string; next: string } {
   if (!raw) return UNKNOWN_REASON;
   return REASON_COPY[raw.split(":")[0].trim().toUpperCase()] ?? UNKNOWN_REASON;
@@ -1459,22 +1528,37 @@ function buildFlagged(
   return nodes;
 }
 
-/** No pager here on purpose. The flagged set SHRINKS as it is worked: filing or
- *  setting aside a file removes its row, so an offset carried to the next page
- *  skips exactly as many rows as were resolved on this one — 250 files becomes
- *  ~125 reviewed and the rest never rendered on any page, while the Needs
- *  Review pill still counts them. The reviewer always works the head of the
- *  queue instead, and `dropCard` refetches it when the screen empties. */
+/** No offset pager here on purpose. The flagged set SHRINKS as it is worked:
+ *  filing or setting aside a file removes its row, so an offset carried to the
+ *  next page skips exactly as many rows as were resolved on this one — 250
+ *  files becomes ~125 reviewed and the rest never rendered on any page, while
+ *  the Needs Review pill still counts them. The reviewer always works the head
+ *  of the queue instead, `dropCard` refetches it as the screen is emptied, and
+ *  the button below is the one control that does the same thing on demand and
+ *  is never hidden — unlike the refresh chip, which only appears when the
+ *  pipeline has changed something. */
 function buildReviewFoot(shown: number, total: number): HTMLElement {
-  const foot = el(`<div class="list-foot" id="review-foot"><span class="count"></span></div>`);
+  const foot = el(`
+    <div class="list-foot" id="review-foot">
+      <span class="count"></span>
+      <button type="button" class="ghost" id="review-more">Bring in more</button>
+    </div>`);
+  q<HTMLElement>(foot, "#review-more").addEventListener("click", () => {
+    pendingChanges = 0;
+    requestRender();
+  });
   paintReviewFootInto(foot, shown, total);
   return foot;
 }
 
 function paintReviewFootInto(foot: HTMLElement, shown: number, total: number): void {
+  // Says what the list actually is. `list_flagged` is ORDER BY updated_at DESC
+  // (ledger.rs::search_jobs), so this is the newest end of the backlog, not the
+  // oldest — and the refill in dropCard is what makes "more are brought in"
+  // true rather than aspirational.
   q<HTMLElement>(foot, ".count").textContent = total > shown
-    ? `Showing ${formatCount(shown)} of ${formatCount(total)} files that need review — `
-      + `as you file or set aside these, the rest move up.`
+    ? `Showing ${formatCount(shown)} of ${formatCount(total)} files that need review, most `
+      + `recently flagged first. More are brought in as you work through these.`
     : `Showing all ${formatCount(total)} file${total === 1 ? "" : "s"} that need review.`;
 }
 
@@ -1595,6 +1679,18 @@ function buildReviewCard(job: Job): ReviewCard {
     },
   };
   card.patch(job);
+  // Typing the reviewer has not filed outranks whatever the ledger says, even
+  // across a trip to another view and back. `dirty` is restored with it, so the
+  // card is held by the very next render rather than being rebuilt again.
+  const kept = dirtyEdits.get(job.sha256);
+  if (kept) {
+    dateInput.value = kept.date;
+    subjectInput.value = kept.subject;
+    descInput.value = kept.description;
+    card.dirty = true;
+    updateCounters();
+    card.markKept();
+  }
 
   // --- advisory counters ---------------------------------------------------
   // These never veto anything the checker would accept: for a human it does
@@ -1630,6 +1726,11 @@ function buildReviewCard(job: Job): ReviewCard {
   for (const input of [dateInput, subjectInput, descInput]) {
     input.addEventListener("input", () => {
       card.dirty = true;
+      dirtyEdits.set(card.job.sha256, {
+        date: dateInput.value,
+        subject: subjectInput.value,
+        description: descInput.value,
+      });
       updateCounters();
     });
   }
@@ -1677,14 +1778,20 @@ function buildReviewCard(job: Job): ReviewCard {
     const button = ev.currentTarget as HTMLButtonElement;
     button.disabled = true;
     button.textContent = "Putting it back…";
+    // `busy` is what holds the card across a render while this is in flight —
+    // disabling the button alone left the card rebuildable mid-invoke.
+    card.busy = true;
+    updateCounters();
     try {
       await invoke("reprocess", { sha256: card.job.sha256 });
       showSuccess(`${card.job.original_name} went back into the queue for another try.`);
       dropCard(card);
     } catch (e) {
       showError(e);
+      card.busy = false;
       button.disabled = false;
       button.textContent = "Try again";
+      updateCounters();
     }
   });
 
@@ -1704,15 +1811,19 @@ function buildReviewCard(job: Job): ReviewCard {
     }
     button.disabled = true;
     button.textContent = "Setting aside…";
+    card.busy = true;
+    updateCounters();
     try {
       await invoke("dismiss", { sha256: card.job.sha256, note: "left in quarantine by reviewer" });
       showSuccess(`${card.job.original_name} was set aside. The file stays in the Quarantine folder.`);
       dropCard(card);
     } catch (e) {
       showError(e);
+      card.busy = false;
       button.disabled = false;
       delete button.dataset.confirm;
       button.textContent = "Can't fix this";
+      updateCounters();
     }
   });
 
@@ -1738,6 +1849,31 @@ function buildReviewCard(job: Job): ReviewCard {
   return card;
 }
 
+/** Where the caret goes when the card holding it stops being editable: the next
+ *  card's date field, else the previous card's, else the view itself (#content
+ *  is tabindex="-1" for exactly this).
+ *
+ *  Never `document.body`. On the last card of a screenful `nextElementSibling`
+ *  is the footer, which has no date input, so the bare `next?.focus()` this
+ *  replaces was a silent no-op and the reviewer's next Tab restarted at the
+ *  brand. In the 200-file keyboard session this product exists for, that
+ *  happened at every screen boundary. */
+function focusNextReviewTarget(card: ReviewCard): void {
+  const seek = (dir: "nextElementSibling" | "previousElementSibling"): HTMLElement | null => {
+    for (let sib: Element | null = card.root[dir]; sib; sib = sib[dir]) {
+      const input = sib.querySelector<HTMLElement>('[name="date"]');
+      // A card parked on its undo countdown has its whole form hidden, and
+      // focusing into a hidden subtree lands back on <body>.
+      if (input && !input.closest("[hidden]")) return input;
+    }
+    return null;
+  };
+  const target = seek("nextElementSibling")
+    ?? seek("previousElementSibling")
+    ?? document.getElementById("content");
+  target?.focus();
+}
+
 function dropCard(card: ReviewCard): void {
   const sha256 = card.job.sha256;
   // A deferred approval commits ten seconds after the click, and a full render
@@ -1749,16 +1885,21 @@ function dropCard(card: ReviewCard): void {
   const live = reviewCards.get(sha256);
   const target = card.root.isConnected || !live?.root.isConnected ? card : live;
   reviewCards.delete(sha256);
+  // Whatever was typed into this card has been filed, set aside or sent back
+  // round; resurrecting it onto a later card for the same file would be worse
+  // than losing it.
+  dirtyEdits.delete(sha256);
 
   // Only move focus if it is inside the card that is going away. Approve is
   // deferred, so by the time this runs the reviewer is usually typing in a
   // different card — yanking the caret into a native date input mid-word
   // swallows everything typed after it. beginApproval already advanced focus
   // at the moment of the click, which is the case this was written for.
+  // The move happens BEFORE the removal so focus is never left inside a subtree
+  // that is about to leave the document.
   const stealing = target.root.contains(document.activeElement);
-  const next = target.root.nextElementSibling;
+  if (stealing) focusNextReviewTarget(target);
   target.root.remove();
-  if (stealing) next?.querySelector<HTMLElement>('[name="date"]')?.focus();
 
   paintReviewFoot();
   void loadStats().then(() => {
@@ -1766,11 +1907,12 @@ function dropCard(card: ReviewCard): void {
     paintReviewFoot();
   });
   // The list is never paged forward over a set that shrinks underneath the
-  // reviewer; when nothing is left that they could act on, the next head is
-  // fetched. `every` over an empty map is true, which is the ordinary
-  // "cleared the screen" case.
-  const stuck = Array.from(reviewCards).every(([sha, held]) => isHeldCard(sha, held));
-  if (view === "flagged" && stuck) requestRender();
+  // reviewer: the head is refetched instead. That has to happen while there is
+  // still work on screen. Refilling only once EVERY remaining card was held
+  // meant the footer promised that the rest would move up while, for the whole
+  // first half of a screenful, nothing ever did.
+  const workable = Array.from(reviewCards).filter(([sha, c]) => !isHeldCard(sha, c)).length;
+  if (view === "flagged" && workable < REVIEW_PAGE / 2) requestRender();
 }
 
 // --- evidence, timeline, date candidates ------------------------------------
@@ -1910,9 +2052,10 @@ function beginApproval(card: ReviewCard, fields: PendingApproval["fields"]): voi
     void commitApproval(pending);
   }, 1000);
   pendingApprovals.set(card.job.sha256, pending);
-  // Move on: the next card's date field is where the reviewer is going.
-  const next = card.root.nextElementSibling?.querySelector<HTMLElement>('[name="date"]');
-  next?.focus();
+  // Move on: the next card's date field is where the reviewer is going. Hiding
+  // the form has just blurred the submit button they pressed, so this is also
+  // the only thing standing between them and a focusless <body>.
+  focusNextReviewTarget(card);
 }
 
 function cancelApproval(card: ReviewCard): void {
@@ -1921,6 +2064,9 @@ function cancelApproval(card: ReviewCard): void {
   window.clearInterval(pending.timer);
   pendingApprovals.delete(card.job.sha256);
   card.busy = false;
+  // The dirtyEdits entry deliberately stays: Undo puts the reviewer back in
+  // front of their own typing, which is still unfiled, and dropping the entry
+  // here would mean the very next trip to another view reverted it.
   q<HTMLElement>(card.root, "form").hidden = false;
   q<HTMLElement>(card.root, ".undo-strip").hidden = true;
   q<HTMLInputElement>(card.root, '[name="subject"]').focus();
@@ -1948,6 +2094,9 @@ async function commitApproval(pending: PendingApproval): Promise<void> {
     q<HTMLInputElement>(card.root, '[name="date"]').value = fields.date;
     q<HTMLInputElement>(card.root, '[name="subject"]').value = fields.subject;
     q<HTMLInputElement>(card.root, '[name="description"]').value = fields.description;
+    // …and outside the DOM too, so it also survives a trip to another view.
+    card.dirty = true;
+    dirtyEdits.set(card.job.sha256, { ...fields });
     q<HTMLElement>(card.root, ".err").textContent = friendlyError(String(e)).message;
     showError(e);
   }
@@ -2404,15 +2553,20 @@ function applyJobUpdate(job: Job): void {
       if (job.state === "flagged") bumpPending();
       return;
     }
+    // Deliberately narrower than isHeldCard: patch() rewrites the card's text
+    // and inputs but leaves an expanded pane expanded, so reading the document
+    // text is not a reason to withhold a fresher flag reason.
     const held = card.dirty || card.busy || pendingApprovals.has(job.sha256);
     if (job.state !== "flagged") {
+      // Unfileable now, whatever was typed: never restore it onto a later card.
+      dirtyEdits.delete(job.sha256);
       if (held) {
         card.markStale("This file has moved on since you started editing it — your changes can no "
           + "longer be filed. Refresh to see where it went.");
       } else {
         card.root.remove();
         reviewCards.delete(job.sha256);
-            }
+      }
       return;
     }
     // A card the reviewer is working in is NEVER rewritten underneath them.

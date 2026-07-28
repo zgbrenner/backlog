@@ -1203,7 +1203,13 @@ pub fn run() {
             reprocess,
             set_paused,
             start_pipeline,
-            model_download::download_models
+            model_download::download_models,
+            // The webview is the only caller of these two, so leaving them out
+            // of this list made the Cancel button on a 2.4 GB download a
+            // no-op that reported an unknown-command error, and left the
+            // progress panel unable to re-sync after a view switch.
+            model_download::cancel_model_download,
+            model_download::model_download_status
         ])
         .build(tauri::generate_context!());
 

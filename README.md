@@ -55,8 +55,8 @@ Intake (SharePoint) --Flow 1--> Processing folder (OneDrive-synced)
   prerequisites](https://tauri.app/start/prerequisites/) for your OS. On Linux
   that is `libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev
   libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf`; see
-  `.github/workflows/ci.yml`, which installs exactly that list.
-- **Node 22** (the version CI and the release build use).
+  `.github/workflows/ci.yml`, which lists exactly that set.
+- **Node 22** (the version the gates and the release build use).
 - **Python 3.11, exactly.** Not "3.11 or newer":
   `scripts/build-sidecar.ps1` hard-throws on anything else, because onnxruntime
   and rapidocr publish no 3.13/3.14 wheels.
@@ -231,14 +231,18 @@ sidecar/                convertd (Python) + build instructions
 models/                 download script, lockfile, GBNF grammar copy
 training/               Ettin silver labeling + fine-tune (not shipped)
 power-automate/         Flow 1 and Flow 2 build sheets + manifest schemas
-scripts/                sidecar build, dev stubs, release binary verification
-.github/                CI (five Linux jobs) + release version-drift check
+scripts/                sidecar build, dev stubs, release binary verification,
+                        ci-local.sh (the five gates, and what actually runs them)
+.github/                the same five jobs as a workflow, for the day Actions works
 ```
 
 ## Tests
 
-`.github/workflows/ci.yml` runs everything below on every push, on Linux, with
-no Windows, no sidecar binaries and no model weights.
+`./scripts/ci-local.sh` runs everything below in one pass, on Linux, with no
+Windows, no sidecar binaries and no model weights. Run it before you push;
+`.github/workflows/ci.yml` describes the same five jobs but has never been
+assigned a runner, so nothing runs them for you (`docs/KNOWN_ISSUES.md` item
+11).
 
 ```
 cd src-tauri

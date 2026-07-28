@@ -284,7 +284,13 @@ impl Ledger {
         // stretch low-entropy human passphrases; our key is already a
         // uniformly random 256-bit CSPRNG output, so deriving further from
         // it would add cost with no security benefit.
-        conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(key)))?;
+        //
+        // The statement is built by `SecretKey::pragma_statement` rather than
+        // `format!` here: a `format!` allocates a second, unscrubbed copy of
+        // the key that stays legible in freed heap — and therefore in any
+        // crash dump, hibernation file or page file — for the life of the
+        // process. `ZeroizingString` overwrites its buffer on drop.
+        conn.execute_batch(&key.pragma_statement())?;
         // busy_timeout so a writer that briefly loses the file lock (WAL
         // checkpoint, an OS-level scanner) retries instead of surfacing
         // SQLITE_BUSY as a lost job update.

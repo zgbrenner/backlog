@@ -144,7 +144,12 @@ Then one of three buttons:
   or a temporary failure; pointless for a bad scan.
 - **Can't fix this** — set it aside. Use this for junk, sync artefacts and
   duplicates you do not want indexed. It is recorded as a decision you made,
-  not as work completed, so it never inflates the "done" count.
+  not as work completed, so it never inflates the "done" count. BackLog asks
+  **Set aside for good?** first, and it means it: **there is no undo.** The
+  card disappears and nothing in the app brings it back. The document itself is
+  left untouched in your Quarantine folder, so nothing is lost — but from there
+  it is yours to file by hand. If you are unsure, leave the card alone; it will
+  still be waiting tomorrow.
 
 ### Writing a good name
 

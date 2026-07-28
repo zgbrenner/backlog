@@ -30,7 +30,8 @@ person in the review pane.
 
 The corollary is the reason `backlog-core` is a separate crate: the trust core
 must be testable with no Tauri, no sidecar binaries, no icon and no GGUF, on a
-Linux CI runner, in seconds. Before the extraction, `tauri-build` aborted the
+plain Linux box, in seconds — which is what makes `./scripts/ci-local.sh
+trust-core` a thing anyone can run. Before the extraction, `tauri-build` aborted the
 whole compile when the sidecars were missing, so a fresh checkout could not run
 a single checker test. That is not a build-system nicety; a guarantee nobody can
 cheaply re-verify stops being a guarantee.

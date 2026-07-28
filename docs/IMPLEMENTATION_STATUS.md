@@ -6,7 +6,8 @@ This branch consolidates the original prototype, the reliability implementation,
 and the independent reproducibility contribution.
 
 > **Status (this branch).** Built on the `backlog-core` foundation, which now
-> backs five Linux CI jobs (`.github/workflows/ci.yml`). The
+> backs five Linux gate jobs (`./scripts/ci-local.sh`, mirrored in
+> `.github/workflows/ci.yml`). The
 > licensing-clean model swap (Qwen3 / Lingua / RapidOCR, replacing LFM2.5 /
 > fastText / rapidocr-onnxruntime) described below **has landed on this
 > branch**. The runtime-preflight readiness check has now been ported too. The
@@ -67,9 +68,11 @@ and the independent reproducibility contribution.
 
 ## Automated validation
 
-`.github/workflows/ci.yml` runs all of this on ubuntu-latest on every push,
-with no Windows, no sidecar binaries and no model weights. Fresh counts from
-the current tree:
+`./scripts/ci-local.sh` runs all of this in one pass, with no Windows, no
+sidecar binaries and no model weights, and is the copy that actually enforces
+anything: `.github/workflows/ci.yml` lists the same five jobs on ubuntu-latest
+but has never been assigned a runner (`docs/KNOWN_ISSUES.md` item 11). Fresh
+counts from the current tree:
 
 | Check | Result |
 |---|---|
@@ -83,12 +86,14 @@ the current tree:
 | `python power-automate/validate_examples.py` | passes |
 | `node .github/scripts/check-versions.mjs` | versions agree |
 | `node .github/scripts/check-troubleshooting-coverage.mjs` | every user-visible code is documented |
-| `node .github/scripts/check-troubleshooting-coverage.test.mjs` | the gate fails on 5 removed codes, as intended |
+| `node .github/scripts/check-troubleshooting-coverage.test.mjs` | the gate above still fails when a code leaves the page — checked once per source of its vocabulary, in isolation via `--source`, so deleting a source turns this red rather than being absorbed by the union |
+| `node .github/scripts/check-button-labels.mjs` | every button the docs tell a user to press is named as the app labels it |
+| `node .github/scripts/check-ci-parity.mjs` | ci.yml and ci-local.sh list the same jobs and gate scripts |
 | `node .github/scripts/check-stub-marker.mjs` | marker contract holds across 3 scripts |
 
 ## Remaining validation before release
 
-Everything CI cannot reach, because it needs Windows and real artifacts: the
+Everything the gates cannot reach, because it needs Windows and real artifacts: the
 DPAPI key path, the NSIS bundle, install/repair/upgrade/uninstall, and an
 end-to-end run with the real sidecars and model weights. The release build is
 produced locally on a Windows machine and uploaded manually to a GitHub

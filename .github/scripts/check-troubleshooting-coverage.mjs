@@ -28,6 +28,11 @@
 // set this one aside" for it and Flow 2 wrote it into the NeedsReview row.
 // Pass 2 catches exactly that class: if a human reads it in the app, it is in
 // the vocabulary regardless of which file produced it.
+//
+// The cost of two passes is that the result is a union: every code in the page
+// now has at least two providers, so deleting a whole source leaves the gate
+// green on the real page. `--source <label>` restricts the vocabulary to one
+// provider so that deletion is detectable; the self-test drives it.
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -72,8 +77,40 @@ const sources = [
   ["preflight.rs", "src-tauri/src/preflight.rs", SNAKE],
 ];
 
+// Pass 2: the codes the app has already written a user-facing sentence for.
+// These are what a person actually reads, so parity with the doc is the point.
+const COPY_TABLES = [
+  ["main.ts REASON_COPY", "REASON_COPY"],
+  ["main.ts SOFT_FLAG_COPY", "SOFT_FLAG_COPY"],
+];
+
+const arg = (name) => {
+  const at = process.argv.indexOf(name);
+  return at < 0 ? null : process.argv[at + 1];
+};
+
+// `--source <label>` narrows the vocabulary to exactly one entry of the two
+// lists above. It exists because the default run is a *union*: every code in
+// the page is supplied by at least two sources, so a whole source — or the
+// whole second pass — can be deleted and the gate stays green on the real
+// page. Under `--source` the gate can see only that one provider, which is
+// what lets check-troubleshooting-coverage.test.mjs prove each one is still
+// wired up. An unknown label is exit 2, not a silent empty run: that is the
+// failure mode being guarded against.
+const only = arg("--source");
+const labels = [...sources, ...COPY_TABLES].map(([label]) => label);
+if (only !== null && !labels.includes(only)) {
+  console.error(
+    `no source labelled "${only}". Known sources: ${labels.join(", ")}.\n` +
+      "A source was renamed or removed from the list — the vocabulary it " +
+      "contributed is no longer being extracted from anywhere."
+  );
+  process.exit(2);
+}
+const selected = (list) => list.filter(([label]) => only === null || label === only);
+
 const vocabulary = new Map(); // code -> file it comes from
-for (const [label, rel, pattern] of sources) {
+for (const [label, rel, pattern] of selected(sources)) {
   const source = withoutTests(read(rel));
   for (const match of source.matchAll(pattern)) {
     const code = match[1];
@@ -97,14 +134,9 @@ function objectKeys(source, name) {
   return [...source.slice(open, close).matchAll(/^ {2}([A-Z][A-Z0-9_]{2,}):/gm)].map((m) => m[1]);
 }
 
-// Pass 2: the codes the app has already written a user-facing sentence for.
-// These are what a person actually reads, so parity with the doc is the point.
 const frontend = read("src/main.ts");
-const copyKeys = [
-  ["main.ts REASON_COPY", objectKeys(frontend, "REASON_COPY")],
-  ["main.ts SOFT_FLAG_COPY", objectKeys(frontend, "SOFT_FLAG_COPY")],
-];
-for (const [label, keys] of copyKeys) {
+for (const [label, name] of selected(COPY_TABLES)) {
+  const keys = objectKeys(frontend, name);
   if (keys.length < 10) {
     console.error(
       `extracted only ${keys.length} keys from ${label}; the extraction has stopped matching. ` +
@@ -116,11 +148,20 @@ for (const [label, keys] of copyKeys) {
 }
 
 // A floor, not a target: if the regexes stop matching because a file changed
-// shape, this check must fail rather than quietly pass on nothing.
-if (vocabulary.size < 35) {
+// shape, this check must fail rather than quietly pass on nothing. Under
+// `--source` the union floor cannot apply — one source is not 35 codes — so
+// the equivalent guard is that the named source contributed anything at all.
+if (only === null && vocabulary.size < 35) {
   console.error(
     `extracted only ${vocabulary.size} codes; the regexes have stopped matching. ` +
       "Fix the extraction rather than lowering this floor."
+  );
+  process.exit(2);
+}
+if (only !== null && vocabulary.size === 0) {
+  console.error(
+    `"${only}" contributed no codes; it is listed but is no longer extracted from. ` +
+      "Fix the extraction rather than deleting the source."
   );
   process.exit(2);
 }
@@ -128,8 +169,7 @@ if (vocabulary.size < 35) {
 // `--doc <path>` exists so the check can be pointed at a deliberately broken
 // copy of the page; see check-troubleshooting-coverage.test.mjs. A gate nobody
 // has watched fail is a gate nobody knows is wired up.
-const docFlag = process.argv.indexOf("--doc");
-const docPath = docFlag < 0 ? "docs/TROUBLESHOOTING.md" : process.argv[docFlag + 1];
+const docPath = arg("--doc") ?? "docs/TROUBLESHOOTING.md";
 const doc = readFileSync(path.isAbsolute(docPath) ? docPath : path.join(ROOT, docPath), "utf8");
 const missing = [...vocabulary].filter(([code]) => !doc.includes(code));
 if (missing.length) {
@@ -142,4 +182,7 @@ if (missing.length) {
   process.exit(1);
 }
 
-console.log(`All ${vocabulary.size} user-visible codes are documented in ${docPath}.`);
+console.log(
+  `All ${vocabulary.size} user-visible codes${only === null ? "" : ` from ${only}`} ` +
+    `are documented in ${docPath}.`
+);

@@ -126,6 +126,15 @@ fn is_candidate(p: &Path) -> bool {
 
 /// A file is "stable" when its size stops changing across probes and it can
 /// be opened for read. Half-synced OneDrive files fail one of the two.
+///
+/// A file that settles at zero bytes is stable, not pending. Requiring
+/// `size > 0` meant a failed copy or an interrupted sync never stabilised at
+/// all: the probe loop ran out, logged one line nobody reads, and returned
+/// without ever enqueueing the file — so it produced no job row, no manifest,
+/// no quarantine and no Needs Review card, while
+/// `docs/TROUBLESHOOTING.md` documented `CORRUPT:zero-byte file` as the
+/// outcome the user should expect. Let it through and let routing classify it,
+/// which is the layer that owns that verdict.
 async fn wait_stable(path: &Path) -> bool {
     let mut last: Option<u64> = None;
     for _ in 0..STABILITY_PROBES * 10 {
@@ -133,7 +142,7 @@ async fn wait_stable(path: &Path) -> bool {
             Ok(m) => m.len(),
             Err(_) => return false, // vanished (moved by us or by sync)
         };
-        if last == Some(size) && std::fs::File::open(path).is_ok() && size > 0 {
+        if last == Some(size) && std::fs::File::open(path).is_ok() {
             return true;
         }
         last = Some(size);
@@ -159,4 +168,53 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed copy or an interrupted sync leaves a zero-byte file. It has to
+    /// reach the pipeline so routing can classify it and the user gets the
+    /// `CORRUPT:zero-byte file` card `docs/TROUBLESHOOTING.md` promises them.
+    /// The `size > 0` this replaces made such a file never stabilise, so it
+    /// was dropped silently: no job row, no manifest, no quarantine, no card.
+    #[tokio::test]
+    async fn a_zero_byte_file_is_stable_rather_than_pending_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failed-copy.pdf");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        // Bounded well under the probe loop's own budget: a regression here
+        // shows up as a timeout, not as a passing test that waited it out.
+        let stable = tokio::time::timeout(Duration::from_secs(10), wait_stable(&path))
+            .await
+            .expect("a settled zero-byte file must not exhaust the probe loop");
+        assert!(stable, "a zero-byte file that is not growing is stable");
+    }
+
+    /// The other half of the same rule: still-growing files must not be
+    /// enqueued mid-write, which is what the size comparison is actually for.
+    #[tokio::test]
+    async fn a_file_that_is_still_growing_is_not_stable_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("syncing.pdf");
+        std::fs::write(&path, b"partial").unwrap();
+
+        let writer = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                for n in 1..=6u8 {
+                    tokio::time::sleep(Duration::from_millis(STABILITY_INTERVAL_MS / 2)).await;
+                    let _ = std::fs::write(&path, vec![b'x'; 64 * n as usize]);
+                }
+            })
+        };
+        // While the size keeps changing the probe loop must keep waiting; it
+        // only settles once the writer stops.
+        let stable = wait_stable(&path).await;
+        writer.await.unwrap();
+        assert!(stable, "it settles once writing stops");
+    }
 }

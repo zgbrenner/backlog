@@ -1178,7 +1178,14 @@ impl Pipeline {
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();
-        let v = checker.check(&out, &h, &[date], &today, None)?;
+        // `check_human`, not `check`: this is a correction a person typed in
+        // the review pane after reading the document, so the model-style rules
+        // (word count, the forward-date ceiling) are theirs to overrule. Every
+        // safety rule still applies. Routing this through `check` applied the
+        // model's rules to the human's answer, which meant the one surface a
+        // user is left alone with could refuse the correct name and leave the
+        // file with no path forward.
+        let v = checker.check_human(&out, &h, &[date], &today, None)?;
 
         // ONE value for the file's identity, not two independent
         // reconstructions: the flagged manifest's id, its `original_relpath`,

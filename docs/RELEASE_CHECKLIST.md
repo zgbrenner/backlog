@@ -10,12 +10,21 @@ item below has fresh evidence attached to the release record.
 
 ## Source and automated validation
 
-`.github/workflows/ci.yml` runs all five of these jobs on every push, on
-ubuntu-latest. **Confirm the run is green on the exact release commit** — that
-is the item; the rest of this section says what it covers.
+`./scripts/ci-local.sh` runs all five jobs — trust core, workspace, frontend,
+python, version-drift — on one machine and exits non-zero on the first failure.
+**Run it on a clean checkout of the exact release commit** — that is the item;
+the rest of this section says what it covers, and each line is one step inside
+it.
 
-- [ ] CI is green on the release commit (five jobs: trust core, workspace,
-      frontend, python, version-drift).
+- [ ] `./scripts/ci-local.sh` passes on a clean checkout of the release commit,
+      and the run is attached to the release record.
+- [ ] ~~CI is green on the release commit.~~ **This is not satisfiable today.**
+      `.github/workflows/ci.yml` describes the same five jobs but has never
+      been assigned a runner (`docs/KNOWN_ISSUES.md` item 11), so no commit in
+      this repository has ever had a green Actions run and none can be produced
+      on demand. The local script above is the substitute, and
+      `node .github/scripts/check-ci-parity.mjs` — part of the version-drift
+      job — is what keeps it honest by failing if the two definitions drift.
 - [ ] `npm ci && npm run check` passes under Node 22.
       (`check` = `tsc --noEmit` then `vite build`.)
 - [ ] `npm run harness:shots` renders every scenario with no console error, and
@@ -179,7 +188,7 @@ only exists for air-gapped deployment.
 
 ## Release evidence
 
-- [ ] Record commit SHA, CI run URL, installer SHA-256, external binary
+- [ ] Record commit SHA, the `./scripts/ci-local.sh` output, installer SHA-256, external binary
       versions/hashes, model-lock SHA-256, config snapshot, Power Automate export
       versions, test results, and known limitations.
 - [ ] The release carries the installer, its `.sig`, **and** `latest.json` as

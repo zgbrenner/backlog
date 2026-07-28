@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Run every gate .github/workflows/ci.yml runs, on this machine.
 #
-# This exists because GitHub Actions does not run for this repository: 30 runs
-# in its history, 29 failed and 1 cancelled, none ever assigned a runner
-# (runner_id 0, no logs, ~10s to failure) — the account has no Actions minutes.
+# This exists because GitHub Actions does not run for this repository: every
+# run in ci.yml's history failed within seconds, none ever assigned a runner
+# (runner_id 0, empty runner_name, log download 404) — a private repo whose
+# account has no Actions allowance left. See docs/KNOWN_ISSUES.md item 11.
 # A CI file nobody can run is theatre, so the gates have to be executable
 # locally or they are not gates at all.
 #
@@ -79,6 +80,13 @@ step python "Power Automate manifest contract" python3 power-automate/validate_e
 # --- version-drift ----------------------------------------------------------
 step version-drift "versions agree" node .github/scripts/check-versions.mjs
 step version-drift "every code documented" node .github/scripts/check-troubleshooting-coverage.mjs
+# The gate above was green for a whole review cycle while DISMISSED was
+# undocumented. This proves it still fails, per source of the vocabulary.
+step version-drift "coverage gate self-test" node .github/scripts/check-troubleshooting-coverage.test.mjs
+# The other half of "the docs match the app": a row that tells the user to
+# press a button by the wrong name is a dead end on the screen they reach when
+# they are already stuck.
+step version-drift "button labels match the docs" node .github/scripts/check-button-labels.mjs
 step version-drift "ci.yml and ci-local.sh agree" node .github/scripts/check-ci-parity.mjs
 
 # --- summary ----------------------------------------------------------------

@@ -1,6 +1,15 @@
 name: CI
 
-# Every job here runs on a Linux runner with no Windows, no sidecar binaries
+# NOTE: this workflow has never actually executed. Actions is triggered on
+# every push and every run dies in seconds with no runner assigned, because the
+# account's allowance for this private repo is spent (docs/KNOWN_ISSUES.md item
+# 11). `scripts/ci-local.sh` runs the same five jobs and is the copy that
+# enforces anything today; check-ci-parity.mjs keeps the two identical so this
+# file is correct on the day Actions is switched on. Do not cite it as evidence
+# that a commit is green.
+#
+# Every job here is designed for a Linux runner with no Windows, no sidecar
+# binaries
 # and no GGUF weights, because that is the whole reason `backlog-core` was
 # extracted and the reason DPAPI is behind `cfg(windows)`. What CI cannot do is
 # build the NSIS installer or exercise the DPAPI key path — those stay manual
@@ -175,9 +184,15 @@ jobs:
       # list. This asserts the gate still fails when a code goes missing.
       - name: Check the coverage gate itself still fails
         run: node .github/scripts/check-troubleshooting-coverage.test.mjs
+      # The other half of "the docs match the app": TROUBLESHOOTING.md told the
+      # user to press "Create folder" for two reviews. The button is called
+      # "Create this folder for me".
+      - name: Check the docs name buttons as the app labels them
+        run: node .github/scripts/check-button-labels.mjs
       # scripts/ci-local.sh is the copy of these gates that actually runs today
-      # (this repo has no Actions minutes — docs/KNOWN_ISSUES.md). Two
-      # definitions of "the gates" with only one of them ever executed is how a
-      # repo ends up green locally and red the day CI is switched on.
+      # (no run of this workflow has ever been assigned a runner —
+      # docs/KNOWN_ISSUES.md item 11). Two definitions of "the gates" with only
+      # one of them ever executed is how a repo ends up green locally and red
+      # the day CI is switched on.
       - name: Check ci.yml and ci-local.sh agree
         run: node .github/scripts/check-ci-parity.mjs

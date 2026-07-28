@@ -21,7 +21,14 @@ wrong in a way you can check:
 ## Current verification, freshly run
 
 Not a claim carried forward. These are the commands, and the numbers they
-produce on this tree. `.github/workflows/ci.yml` runs all of them on every push.
+produce on this tree. `./scripts/ci-local.sh` runs all of them in one pass and
+is what any of these numbers should be re-derived from.
+
+`.github/workflows/ci.yml` describes the same five jobs but **has never
+executed** — every run dies in seconds with no runner assigned
+(`docs/KNOWN_ISSUES.md` item 11). Do not read a green badge into this table;
+read it as "someone ran the gates on a developer machine and these were the
+results".
 
 | Check | Command | Result |
 |---|---|---|

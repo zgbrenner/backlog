@@ -5,12 +5,17 @@ a **GitHub Release asset**. The NSIS bundle needs Windows, DPAPI and the real
 sidecars, so no runner produces it.
 
 Everything that *can* be checked without Windows is checked by
-`.github/workflows/ci.yml` on every push — the trust core, the whole Rust
-workspace, the frontend and UI harness, the Python sidecar tests, the manifest
-contract, and the version agreement between `package.json`,
-`tauri.conf.json` and `Cargo.toml`. **Do not cut a release from a commit whose
-CI run is not green;** it is the only thing standing between "it compiled on my
+`./scripts/ci-local.sh` — the trust core, the whole Rust workspace, the
+frontend and UI harness, the Python sidecar tests, the manifest contract, and
+the version agreement between `package.json`, `tauri.conf.json` and
+`Cargo.toml`. **Do not cut a release from a commit where that script has not
+been run and passed;** it is the only thing standing between "it compiled on my
 machine" and a signed installer.
+
+`.github/workflows/ci.yml` describes the same five jobs, but no run of it has
+ever been assigned a runner (`docs/KNOWN_ISSUES.md` item 11), so there is no
+green badge to defer to. Run the script yourself and attach the output to the
+release record.
 
 > If a change touches Rust, the frontend, or the sidecar, you must rebuild
 > locally and upload a fresh installer. CI does not produce one.
@@ -156,7 +161,7 @@ The models are **not** in the installer. They reach the machine one of two ways:
 
 ## Updating later
 1. Make the change; if it touches Rust / frontend / sidecar, it needs a rebuild.
-2. Confirm CI is green on the commit.
+2. Run `./scripts/ci-local.sh` on the commit and confirm every gate passes.
 3. Re-run Build steps 1–5 on a Windows machine (Build step 1 only if the sidecar
    changed).
 4. Follow "Cutting a release" below to sign and publish.
@@ -205,8 +210,9 @@ keep them distinct from the **Build steps** above.
    ```powershell
    node .github/scripts/check-versions.mjs
    ```
-   CI runs this too, so a mismatch fails the build rather than shipping an
-   update manifest whose version nothing agrees with.
+   `./scripts/ci-local.sh version-drift` runs this too, so a mismatch fails a
+   gate rather than shipping an update manifest whose version nothing agrees
+   with.
 2. Build with the signing key available to the CLI via environment variables
    (PowerShell):
    ```powershell

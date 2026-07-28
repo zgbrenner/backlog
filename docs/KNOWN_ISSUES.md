@@ -105,6 +105,58 @@ subsumes it. `preflight.rs`'s
 `binary_exists_rejects_zero_length_stubs_and_bare_names` needs the marker case
 added when it does.
 
+### 10. A dismissal cannot be undone from inside the app
+`Can't fix this` is behind a `Set aside for good?` confirmation, and that
+wording is honest — but only because nothing can reverse it, not because a
+reversal was considered and rejected. `transition_allowed` in
+`src-tauri/src/ledger.rs:136` freezes `(Dismissed, _) => false`, and the one
+statement that can reopen a job, `Ledger::reset_for_reprocess`, is reachable
+only through the `reprocess` command, which is wired only to the Needs Review
+card's **Try again** button. `src/main.ts`'s `applyJobUpdate` removes that card
+the moment the state leaves `flagged`, `list_flagged` never returns dismissed
+jobs, and `fillQueueRow` gives queue rows no buttons at all — so once the
+confirmation lands, the affordance is gone.
+
+Re-delivery is not a workaround either. `Pipeline::ingest_one` returns silently
+for a resolved job at the same normalized relpath, and at a *different* relpath
+emits a duplicate manifest — a stray `… (2)` row in DocumentIndex rather than a
+corrected one.
+
+The document itself is never at risk: it stays in Quarantine untouched, so the
+recovery is manual filing. `docs/TROUBLESHOOTING.md` and `docs/USER_GUIDE.md`
+now say exactly this rather than promising reversibility.
+
+**Fix:** either a `Dismissed` filter in the queue whose rows carry a **Try
+again** that calls `reset_for_reprocess`, or an `undismiss` command with the
+matching `(Dismissed, Ingested)` transition allowed. Both need a decision about
+what Flow 2 does with the already-indexed dismissed row.
+
+### 11. GitHub Actions has never executed; `scripts/ci-local.sh` is the enforcing copy
+`.github/workflows/ci.yml` is committed, is syntactically valid and is
+triggered on every push — and has never run a single step. Every run in the
+workflow's history is `conclusion: failure` within 2–17 seconds of creation,
+every job in every run reports `runner_id: 0` with an empty `runner_name`, and
+the log download for any of them is an HTTP 404 because no log was ever
+produced. That is the signature of a run that is created and then never
+assigned a runner. `zgbrenner/backlog` is a **private** repository, so it draws
+on the account's free Actions allowance rather than the unmetered public pool,
+and the allowance is spent.
+
+Consequence, and the reason this is an item rather than a footnote: **"CI is
+green" is not a fact anyone can obtain about this repository today.** The gates
+in `ci.yml` are enforced only by `scripts/ci-local.sh`, which runs the same five
+jobs on a developer's machine. `.github/scripts/check-ci-parity.mjs` exists to
+keep the two in lockstep, so that the day Actions is switched on the workflow
+does not fail on drift accumulated while nobody could see it.
+
+`docs/RELEASE_CHECKLIST.md` therefore gates on `./scripts/ci-local.sh` and marks
+its CI-green box explicitly unsatisfiable, in the same way as the hash-pinned
+lock in item 2.
+
+**Fix:** enable billing for Actions on the account, or make the repository
+public. Either resolves it without a code change; until one of them happens,
+the honest statement is the one above.
+
 ## Closed since `PRODUCTION_READINESS.md` was written
 
 Recorded because that document listed them as open and they are not, which is
