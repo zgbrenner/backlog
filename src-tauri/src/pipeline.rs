@@ -1480,6 +1480,13 @@ mod tests {
     }
 
     struct Harness {
+        /// Read only by the `#[cfg(unix)]` tests below, but load-bearing on
+        /// every platform: `TempDir` deletes its directory on drop, so this
+        /// field is what keeps the config's `processing_dir` and friends alive
+        /// for as long as the harness is. Dropping it would delete the tree the
+        /// pipeline is pointed at. `allow` rather than `expect` because on unix
+        /// it *is* read and `expect` would then fire in the other direction.
+        #[allow(dead_code)]
         dir: tempfile::TempDir,
         pipeline: Arc<Pipeline>,
     }
@@ -1580,6 +1587,11 @@ mod tests {
     /// round-trip, one naming rung. `wall_clock_cap` is deliberately the SUM of
     /// the stage timeouts it wraps, so a test shrinks those rather than
     /// shrinking the cap out from under them.
+    ///
+    /// Gated to match its callers: both tests that use it drive a shell-script
+    /// stand-in for convertd and are themselves `#[cfg(unix)]`, so on Windows
+    /// this is genuinely unreachable rather than merely unused.
+    #[cfg(unix)]
     fn tiny_cap(cfg: &mut Config) {
         cfg.per_file_wall_clock_secs = 1;
         cfg.sidecar_timeout_secs = 1;

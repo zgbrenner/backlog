@@ -64,20 +64,30 @@ try {
     $useUv = [bool](Get-Command uv -ErrorAction SilentlyContinue)
     $lock = Join-Path $SidecarDir "requirements.lock"
     Write-Host "Installing sidecar dependencies..." -ForegroundColor Cyan
+    # $ErrorActionPreference = "Stop" does not apply to native commands, so every
+    # install below is checked explicitly. A resolution failure here used to be
+    # ignored: the run continued with only PyInstaller installed, --collect-all
+    # logged twelve "not a package" warnings, and PyInstaller happily produced a
+    # convertd.exe with no document parsers in it. The smoke test in step 4 caught
+    # that one, but a build must not depend on a later gate to notice that its
+    # dependencies were never installed.
     if (Test-Path $lock) {
         # requirements.lock is a fully-pinned (==) freeze for reproducibility.
         if ($useUv) { uv pip install --python $VenvPy -r $lock }
         else { & $VenvPy -m pip install -r $lock }
+        if ($LASTEXITCODE -ne 0) { throw "Dependency install from $lock failed. The lock must resolve on Windows/Python 3.11 -- a lock produced on Linux can pin a set that is unsatisfiable here." }
     }
     else {
         Write-Warning "requirements.lock absent; installing from reviewed pins in requirements.txt and writing a fresh lock."
         if ($useUv) { uv pip install --python $VenvPy -r requirements.txt }
         else { & $VenvPy -m pip install -r requirements.txt }
+        if ($LASTEXITCODE -ne 0) { throw "Dependency install from requirements.txt failed." }
         & $VenvPy -m pip freeze | Out-File -Encoding utf8 $lock
         Write-Host "Wrote reproducible lock: $lock" -ForegroundColor Green
     }
     if ($useUv) { uv pip install --python $VenvPy "pyinstaller>=6.11,<7" }
     else { & $VenvPy -m pip install "pyinstaller>=6.11,<7" }
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller install failed." }
 
     # 3. Freeze convertd.py. --collect-all pulls the data files PyInstaller
     #    otherwise misses (model loaders, native libs, version metadata).
@@ -116,6 +126,19 @@ try {
     #    rapidocr+onnxruntime (scanned png). All four requests go through ONE
     #    process, which is also how the app uses it.
     Write-Host "Smoke-testing the built sidecar on real fixtures..." -ForegroundColor Cyan
+
+    # The request stream has to reach convertd as BOM-less UTF-8. PowerShell
+    # encodes a native command's stdin with [Console]::InputEncoding -- whatever
+    # the host console happens to be set to. When that is UTF-8 *with* a
+    # preamble (a `chcp 65001` console, or any non-interactive host that sets
+    # it), a 3-byte BOM is glued to the front of the first request, convertd
+    # rejects it with `JSONDecodeError: Unexpected UTF-8 BOM`, its reply carries
+    # `"id": null`, and this gate then reports "no response for request 1" --
+    # blaming the binary for the harness's encoding. Pin it rather than inherit
+    # it. (Restored in the outer finally.)
+    $PreviousInputEncoding = [Console]::InputEncoding
+    [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false
+
     $Fixtures = Join-Path $SidecarDir "fixtures"
     $requests = @(
         @{ id = 1; op = "versions" },
@@ -164,5 +187,6 @@ try {
     Write-Host "  Now stage llama-server (see RELEASING.md step 2) and run 'npm run tauri build'."
 }
 finally {
+    if ($null -ne $PreviousInputEncoding) { [Console]::InputEncoding = $PreviousInputEncoding }
     Pop-Location
 }

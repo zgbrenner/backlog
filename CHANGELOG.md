@@ -15,7 +15,143 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
-## [Unreleased]
+## [0.3.0] — the release procedure, actually executed end to end
+
+Everything below the "Build and release" heading was found by running
+`RELEASING.md` from a bare clone on a clean Windows 11 box rather than by
+reading it. Four of the five defects were in the build and packaging path, not
+in the app: the shipped Rust, TypeScript and Python code needed no correction,
+and every gate that could be run passed on the first honest attempt once the
+scripts themselves would run.
+
+### Build and release
+
+**Fixed — `sidecar/requirements.lock` could not be installed on Windows at
+all.** It pinned `magika==0.6.3` alongside `onnxruntime==1.28.0`, but magika
+0.6.3's own metadata caps `onnxruntime<=1.20.1` on `win32`. The lock had been
+resolved on Linux, where that marker does not apply, and committed as "the
+reproducible lock" for a product that only ships on Windows. Any resolving
+installer rejects it outright. Repinned to `magika==0.6.2`, resolved on
+Windows/Python 3.11, which is the only difference between the committed lock
+and a fresh Windows resolution.
+
+**Fixed — `scripts/build-sidecar.ps1` shipped a sidecar with no document
+parsers in it when the dependency install failed.** `$ErrorActionPreference =
+"Stop"` does not apply to native commands, so the `uv pip install` failure
+above was ignored: the run continued with only PyInstaller installed, logged
+twelve `--collect-all ... is not a package` warnings, and produced a
+`convertd.exe` containing none of MarkItDown, RapidOCR, ONNX Runtime or
+pdfminer. Every install step now checks `$LASTEXITCODE`, matching what the
+script already did for PyInstaller itself. The fixture smoke test did catch
+this build — but a build must not rely on a later gate to notice its
+dependencies were never installed.
+
+**Fixed — the sidecar smoke test blamed the binary for its own encoding.**
+PowerShell encodes a native command's stdin with `[Console]::InputEncoding`.
+Where that is UTF-8 *with* a preamble, a 3-byte BOM was glued to the first
+request, convertd correctly answered `JSONDecodeError: Unexpected UTF-8 BOM`
+with `"id": null`, and the gate reported `no response for request 1` — pointing
+at the sidecar rather than at the harness. The encoding is now pinned for the
+duration of the test and restored afterwards. The shipped Rust client was never
+affected: `sidecar.rs` writes `serde_json::to_string` bytes, which carry no BOM.
+
+**Fixed — `scripts/verify-binaries.ps1` could not run on Windows PowerShell.**
+`$BinDir` defaulted to `Join-Path $PSScriptRoot ...` inside the `param()`
+block; 5.1 binds parameters before `$PSScriptRoot` is populated, so the gate
+died on its own first line with `Cannot bind argument to parameter 'Path'`.
+Resolved in the body instead, `-BinDir` still overridable. Both this and the
+BOM defect were invisible because every script is documented as `pwsh`, and
+pwsh 7 happens to paper over both.
+
+**Documented — `npm run tauri build` hangs after bundling, waiting for a
+password this key does not have.** The CLI prints `Decrypting updater signing
+key, expect a prompt for password` and blocks on stdin even for an
+empty-password key, so in any shell without a console the build stops with the
+installer written and no `.sig` next to it. `$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""`
+is not a workaround — PowerShell deletes a variable assigned the empty string.
+`RELEASING.md` now says so and gives the separate `signer sign` step, which is
+how 0.3.0 was signed.
+
+**Fixed — two `RELEASING.md` commands that cannot work as written.** The
+signing-key command uses `-p ""`, and PowerShell drops an empty-string argument
+before it reaches the executable, so the CLI exits 2 demanding the value that
+was just supplied; it is now marked as the one command in that document to run
+from a POSIX shell. Build step 4 also told you to pin `llama-server.exe` to the
+SHA-256 recorded in Build step 2, which is the hash of the *zip* and can never
+match the extracted binary.
+
+### Gates that had never run on Windows
+
+`scripts/ci-local.sh` runs the five jobs on Linux, and
+`.github/workflows/ci.yml` has never been assigned a runner
+(`docs/KNOWN_ISSUES.md` item 11). Two of those jobs turn out to have been
+failing the whole time on the only platform this product ships on. Both are now
+fixed and both gates pass on Windows.
+
+**Fixed — `cargo test --workspace` could not start on Windows at all.** The test
+harness binary died with `STATUS_ENTRYPOINT_NOT_FOUND` (0xC0000139) before
+reaching `main`, which cargo surfaces as `test exited abnormally` with no test
+having run. Cause: the harness links tao/wry and so inherits their static
+imports of `TaskDialogIndirect`, `RemoveWindowSubclass` and `DefSubclassProc`
+— ComCtl32 **v6** exports. `System32\comctl32.dll` is v5.82 and exports only
+`SetWindowSubclass`; v6 is reachable only via the side-by-side
+`Microsoft.Windows.Common-Controls` assembly, which needs an application
+manifest. `tauri_build::build()` embeds one through `rustc-link-arg-bins` —
+bins only — so the harness had no `.rsrc` section whatsoever. `build.rs` now
+declares that dependency with `cargo:rustc-link-arg`. The scoped
+`rustc-link-arg-tests` would have been the narrower tool but covers only
+integration tests under `tests/`, which this crate has none of; cargo rejects
+it with "does not have a test target", and the harness at issue is built from
+the *lib* target, which has no scoped instruction of its own. This never
+affected the shipped `BackLog.exe`, which is a bin and always had its manifest;
+and `cargo test -p backlog-core` passed throughout because the trust core links
+none of this, which is precisely the property it was separated out for.
+
+**Fixed — the log scrubber could be defeated by a path arriving in fragments,
+which on Windows was every path it was meant to redact.** `SharedSink::write`
+scrubbed each `write` call as it came, justified by a comment asserting that
+"env_logger formats a whole record and hands it over in one call, so scrubbing
+here … cannot be defeated by a sensitive path straddling two writes". That
+holds for env_logger and for nothing else. `fmt::write` calls back once per
+format fragment, and `std`'s `Debug for OsStr` escapes its input with
+`f.write_char(c)` — one character per call — so a `{path:?}` argument reaches
+the sink as about a hundred single-byte writes, and no root can be matched
+inside a one-byte haystack. `SharedSink` now reassembles complete lines before
+scrubbing, so the guarantee holds whatever the caller's write granularity is
+instead of resting on an undocumented detail of one dependency's
+`Target::Pipe`. The same buffering fixes a second defect in the same line:
+`String::from_utf8_lossy` over one-byte slices turned every byte of a
+multi-byte character into U+FFFD, so non-ASCII filenames were being mangled on
+the way into the log.
+
+The two `logging` tests that assert this — which is to say, the tests that
+assert the claim `docs/PRIVACY.md` makes about the log file — were correct and
+failing; nothing was wrong with them. A regression test now pins the
+fragmentation itself, since it originates in `std` and would not survive being
+rediscovered by accident.
+
+Reachability, stated plainly: in a shipped build every line goes through
+env_logger, which does hand over whole records, so no released version is known
+to have written a document path to disk. The defect was that the product's
+central privacy promise held by coincidence rather than by construction, and
+any second writer into that sink would have silently turned the log into the
+plaintext index of HR filenames the encrypted ledger exists to prevent.
+
+**Fixed — `cargo clippy --workspace --all-targets -- -D warnings` failed on
+Windows.** `pipeline.rs`'s `tiny_cap` and `Harness::dir` are reachable only
+from `#[cfg(unix)]` tests (there are five of those and no `cfg(windows)`
+counterpart), so on Windows both are dead code and `-D warnings` rejects the
+build. `tiny_cap` is now `#[cfg(unix)]` to match its only callers. `Harness::dir`
+is `#[allow(dead_code)]` instead, because it is not really unused: it is a
+`TempDir` whose drop deletes the very tree the pipeline is pointed at, so the
+field is load-bearing on every platform even where nothing reads it.
+
+**Changed — the updater signing key was rotated.** The keypair that signed
+0.1.0 and 0.2.0 was not on the build machine and is not recoverable, so 0.3.0
+is signed by a new one and `plugins.updater.pubkey` was replaced to match.
+Installed 0.1.0 and 0.2.0 copies verify against the old pubkey baked into them
+and will therefore reject 0.3.0 silently, by design; they need one manual
+install. From 0.3.0 forward the chain is intact. See `RELEASING.md`.
 
 ### Added
 - `.github/workflows/ci.yml`: five Linux jobs (trust core, workspace, frontend

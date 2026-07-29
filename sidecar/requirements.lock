@@ -22,7 +22,7 @@ huggingface-hub==1.25.1
 idna==3.18
 lingua-language-detector==2.1.1
 lxml==6.1.1
-magika==0.6.3
+magika==0.6.2
 mammoth==1.11.0
 markdownify==1.2.3
 markitdown==0.1.6

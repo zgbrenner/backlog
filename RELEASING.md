@@ -126,11 +126,22 @@ zero-byte files, anything that is not a valid PE image, and a leftover
 `_placeholder.dll`. Pass the recorded hashes to pin them:
 
 ```powershell
+# -Expected takes a hashtable, so this needs `-Command` (or a `pwsh` session).
+# `powershell -File` passes every argument as a string and the hashtable
+# arrives as the literal text "System.Collections.Hashtable".
 pwsh scripts\verify-binaries.ps1 -Expected @{
-  "llama-server-x86_64-pc-windows-msvc.exe" = "<SHA-256 from Build step 2>"
+  "llama-server-x86_64-pc-windows-msvc.exe" = "<SHA-256 of the staged .exe -- NOT the zip>"
   "convertd-x86_64-pc-windows-msvc.exe"     = "<SHA-256 printed by Build step 1>"
 }
 ```
+
+> **Pin the `.exe`, not the archive.** Build step 2 records the SHA-256 of
+> `llama-b10091-bin-win-cpu-x64.zip`, which is the right thing to check the
+> *download* against and can never match the extracted `llama-server.exe`.
+> Take the staged binary's own hash — `verify-binaries.ps1` prints it as an
+> unpinned `note` on the first run, so run it once bare and paste the value
+> back in. For release b10091 that binary is
+> `78af9cfb34f346b0de1e4f9c1577061cb3d55e8be55c8d540fde878e56bd0fe2`.
 
 ### Build step 5. Build the installer
 ```powershell
@@ -177,10 +188,19 @@ a minisign keypair before install: the public half is embedded in
 `src-tauri/tauri.conf.json` (`plugins.updater.pubkey`), and the private half
 signs each build.
 
-The keypair for this pilot was generated once with:
-```powershell
-npx tauri signer generate -w C:/Users/zgbre/.backlog-signing/backlog-updater.key --ci -p ""
+The keypair is generated once with:
+
+```bash
+# Git Bash / any POSIX shell — NOT PowerShell. See the note below.
+npx @tauri-apps/cli signer generate -w /c/Users/zgbre/.backlog-signing/backlog-updater.key --ci -p ""
 ```
+
+> **Do not run this in PowerShell.** PowerShell drops an empty-string argument
+> before it reaches the executable, so `-p ""` arrives as no value at all and
+> the CLI exits 2 with `a value is required for '--password <PASSWORD>' but
+> none was supplied`. Every other command in this document is PowerShell; this
+> one is the exception.
+
 It lives **outside the repo**, at `C:/Users/zgbre/.backlog-signing/` on the
 build machine (`backlog-updater.key` + `backlog-updater.key.pub`), was
 generated with an **empty password**, and must never be committed. Back it
@@ -188,6 +208,18 @@ up somewhere durable (a password manager or encrypted archive) — if it's
 lost, no future release can be signed to match the pubkey already embedded in
 installed copies of the app, and users would need a fresh (unsigned-chain)
 manual install to move to a new keypair.
+
+> **The key was rotated at 0.3.0, because that is exactly what happened.** The
+> keypair that signed 0.1.0 and 0.2.0 was not on the build machine and is not
+> recoverable, so 0.3.0 is signed by a new keypair
+> (`minisign public key: F6BB6D5A6C3954C6`) and `plugins.updater.pubkey` in
+> `tauri.conf.json` was replaced to match. The consequence is the one described
+> above and it is not reversible: an installed 0.1.0 or 0.2.0 copy verifies
+> against the **old** pubkey baked into it, so it will reject 0.3.0 as
+> unsigned-by-a-stranger and stay where it is, silently — `checkForUpdates` in
+> `src/main.ts` swallows the failure by design. Those machines need one manual
+> install of the 0.3.0 installer; from 0.3.0 forward the chain is intact again.
+> Back this key up now rather than after the next release.
 
 ## Cutting a release
 
@@ -224,6 +256,26 @@ keep them distinct from the **Build steps** above.
    Because `bundle.createUpdaterArtifacts` is `true` in `tauri.conf.json`,
    this run emits a **`.sig` detached signature** for the installer next to
    the NSIS installer under `src-tauri/target/release/bundle/nsis/`.
+
+   > **This step blocks on a password prompt in a non-interactive shell.**
+   > After `Finished 1 bundle at: …` the CLI prints `Info Decrypting updater
+   > signing key, expect a prompt for password` and waits on stdin — even
+   > though this pilot's key has an empty password. Under CI, a background
+   > job, or any shell without a console, the build hangs there with the
+   > installer already written and no `.sig` beside it. Setting
+   > `$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""` does not help: PowerShell
+   > *deletes* an environment variable assigned the empty string rather than
+   > setting it empty.
+   >
+   > If it hangs, the installer is fine — just sign it as a separate step from
+   > a POSIX shell, which passes the empty password through correctly:
+   > ```bash
+   > npx @tauri-apps/cli signer sign \
+   >   -f /c/Users/zgbre/.backlog-signing/backlog-updater.key -p "" \
+   >   src-tauri/target/release/bundle/nsis/BackLog_X.Y.Z_x64-setup.exe
+   > ```
+   > That writes the same `BackLog_X.Y.Z_x64-setup.exe.sig` the build would
+   > have, over the identical bytes, so step 3 proceeds unchanged.
 
    > **GOTCHA — `latest.json` is NOT regenerated by the build.** The Tauri
    > CLI writes the `.sig` but leaves any existing

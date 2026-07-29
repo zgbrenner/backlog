@@ -40,10 +40,19 @@
 [CmdletBinding()]
 param(
     [hashtable] $Expected = @{},
-    [string] $BinDir = (Join-Path $PSScriptRoot "..\src-tauri\binaries")
+    [string] $BinDir = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+# Resolved here rather than as a param() default because Windows PowerShell 5.1
+# binds parameters before $PSScriptRoot is populated, so the default expression
+# saw an empty string and the script died on its own first line with
+# "Cannot bind argument to parameter 'Path'". pwsh 7 populates it earlier and
+# the param-block form worked there -- which is how a gate documented as
+# `pwsh scripts/verify-binaries.ps1` came to be unrunnable on the shell that
+# ships with Windows.
+if (-not $BinDir) { $BinDir = Join-Path $PSScriptRoot "..\src-tauri\binaries" }
 
 # Kept byte-identical in scripts/dev-stubs.sh and scripts/dev-stubs.ps1.
 $StubMarker = "BACKLOG-DEV-STUB-DO-NOT-SHIP"

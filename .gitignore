@@ -47,5 +47,10 @@ Thumbs.db
 .claude/
 sidecar/*.spec
 
+# PyInstaller's intermediate build tree. `dist/` above already covers
+# sidecar/dist; this is the other half that scripts/build-sidecar.ps1 leaves
+# behind (analysis caches, the frozen PKG, warn-convertd.txt).
+sidecar/build/
+
 # Browser UI harness output (screenshots + built bundle)
 dist-harness/

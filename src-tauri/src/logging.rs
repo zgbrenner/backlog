@@ -65,10 +65,29 @@ pub fn add_sensitive_roots<I: IntoIterator<Item = PathBuf>>(paths: I) {
         // A one- or two-character "root" (an empty or `/` path) would match
         // every line in the file; a folder that shallow is not a real config.
         let key = normalized(&path.to_string_lossy());
-        if key.len() < 4 || roots.iter().any(|(existing, _)| existing == &key) {
+        if key.len() < 4 {
             continue;
         }
-        roots.push((key, redact_path(&path)));
+        let redacted = redact_path(&path);
+        // Every site that logs a path formats it with `{path:?}`, and `Debug`
+        // escapes a backslash as two. So on Windows one folder reaches a log
+        // line in two shapes -- `C:\Dir` from `Display`, `C:\\Dir` from `Debug`
+        // -- which `normalized` turns into `c:/dir` and `c://dir`. Only the
+        // first was registered, so the `{:?}` form matched nothing and every
+        // path logged that way went to disk in full, filename included. That is
+        // the shape `watcher.rs` and `pipeline.rs` actually use, and it is
+        // invisible on Linux, where separators are `/` and `Debug` leaves them
+        // alone -- so the two `logging` tests that assert this pass there and
+        // fail here.
+        //
+        // Registering both shapes fixes it inside the existing machinery: the
+        // longest-first sort below still orders them, and `root.len()` still
+        // advances the cursor past whichever one matched.
+        for variant in [key.replace('/', "//"), key] {
+            if !roots.iter().any(|(existing, _)| existing == &variant) {
+                roots.push((variant, redacted.clone()));
+            }
+        }
     }
     // Longest first: a cache dir nested inside the Processing root must be
     // reported as itself rather than as its parent.
@@ -215,28 +234,71 @@ impl Write for RotatingFile {
     }
 }
 
-struct SharedSink(Arc<Mutex<RotatingFile>>);
+/// Scrubs on the way to `RotatingFile`, assembling whole lines first.
+///
+/// The buffering is the load-bearing part. This used to scrub each `write` as
+/// it arrived, on the reasoning that "env_logger formats a whole record and
+/// hands it over in one call". That is true of env_logger, and false of
+/// `write!`/`writeln!` into this sink directly: `fmt::write` calls back once
+/// per format fragment, and `Debug` for `OsStr` escapes its input with
+/// `f.write_char(c)` — **one character per call**. A `{path:?}` argument
+/// therefore arrives as ~100 single-byte writes, and a root can never be
+/// matched inside a one-byte haystack, so the whole path went to the file in
+/// clear. Scrubbing per complete line makes the guarantee hold whatever the
+/// caller's write granularity is, rather than resting on a detail of one
+/// dependency's `Target::Pipe`.
+///
+/// Buffering also fixes the UTF-8 half of the same bug: `from_utf8_lossy` on a
+/// one-byte slice turns every byte of a multi-byte character into U+FFFD, so
+/// non-ASCII filenames were being mangled on the way in.
+struct SharedSink {
+    file: Arc<Mutex<RotatingFile>>,
+    /// Bytes since the last newline. Held back until the line is complete, so
+    /// `scrub` always sees a whole record and never a split character.
+    pending: Vec<u8>,
+}
+
+impl SharedSink {
+    fn new(file: Arc<Mutex<RotatingFile>>) -> Self {
+        Self {
+            file,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Scrub `bytes` and put them in the file. A panic anywhere in the app
+    /// poisons this lock and the panic hook then wants to log — recover
+    /// through the poison rather than take the process down for a log line.
+    fn emit(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let scrubbed = scrub(&String::from_utf8_lossy(bytes));
+        self.file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write_all(scrubbed.as_bytes())
+    }
+}
 
 impl Write for SharedSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // env_logger formats a whole record and hands it over in one call, so
-        // scrubbing here sees complete lines and cannot be defeated by a
-        // sensitive path straddling two writes.
-        let scrubbed = scrub(&String::from_utf8_lossy(buf));
-        // A panic anywhere in the app poisons this lock, and the panic hook
-        // then wants to log — recover through the poison rather than take the
-        // process down for the sake of a log line.
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .write_all(scrubbed.as_bytes())?;
+        self.pending.extend_from_slice(buf);
+        if let Some(last) = self.pending.iter().rposition(|b| *b == b'\n') {
+            let complete: Vec<u8> = self.pending.drain(..=last).collect();
+            self.emit(&complete)?;
+        }
         // Report the caller's byte count, not the redacted one: a short write
         // would send `write_all` round again with an offset into a buffer that
         // no longer corresponds to what was written.
         Ok(buf.len())
     }
+
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).flush()
+        // A record without a trailing newline — a panic payload cut short, or
+        // the last line before shutdown — must still reach the file, scrubbed.
+        if !self.pending.is_empty() {
+            let rest = std::mem::take(&mut self.pending);
+            self.emit(&rest)?;
+        }
+        self.file.lock().unwrap_or_else(|e| e.into_inner()).flush()
     }
 }
 
@@ -257,7 +319,9 @@ pub fn init(app_data_dir: &Path, version: &str) -> PathBuf {
         // depends on anyone being able to set it.
         .parse_env("RUST_LOG")
         .format_timestamp_secs()
-        .target(env_logger::Target::Pipe(Box::new(SharedSink(sink.clone()))));
+        .target(env_logger::Target::Pipe(Box::new(SharedSink::new(
+            sink.clone(),
+        ))));
     if builder.try_init().is_err() {
         return path;
     }
@@ -383,6 +447,54 @@ mod tests {
         assert!(tail(&dir.path().join("absent.log"), 10).is_empty());
     }
 
+    /// A path formatted with `{:?}` reaches the sink one character at a time,
+    /// so scrubbing has to reassemble the line before matching. Asserted here
+    /// as a property of the sink rather than only as an outcome of the two
+    /// tests below, because the fragmentation comes from `std`'s `Debug` for
+    /// `OsStr` and no amount of scrubber tuning would survive losing it.
+    #[test]
+    fn a_debug_formatted_path_reaches_the_sink_in_fragments_and_is_still_scrubbed() {
+        let dir = tempfile::tempdir().unwrap();
+        let processing = dir.path().join("OneDrive").join("2024 Terminations");
+        add_sensitive_roots([processing.clone()]);
+        let doc = processing.join("Jane Roe Termination Letter.pdf");
+
+        // `write!` calls back once per format fragment, and `Debug` for `OsStr`
+        // escapes with `write_char`, so this is ~100 one-byte writes.
+        let mut widths = Vec::new();
+        struct Widths<'a>(&'a mut Vec<usize>);
+        impl Write for Widths<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.push(buf.len());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        write!(Widths(&mut widths), "{doc:?}").unwrap();
+        assert!(
+            widths.iter().filter(|w| **w == 1).count() > 20,
+            "expected Debug to fragment into single bytes, got {widths:?}"
+        );
+
+        let path = dir.path().join("logs").join("fragmented.log");
+        let sink = Arc::new(Mutex::new(RotatingFile::open(path.clone(), MAX_LOG_BYTES)));
+        let mut shared = SharedSink::new(sink.clone());
+        writeln!(shared, "[INFO] ignoring {doc:?}: reserved prefix").unwrap();
+        shared.flush().unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("Terminations") && !written.contains("Jane Roe"),
+            "a fragmented path leaked: {written}"
+        );
+        assert!(
+            written.contains("reserved prefix"),
+            "the non-sensitive remainder of the line was lost: {written}"
+        );
+    }
+
     /// The whole point of persisting the log: the file that lands in
     /// `%APPDATA%` must not become a plaintext index of HR document names on a
     /// product that encrypts its ledger for exactly that reason.
@@ -394,7 +506,7 @@ mod tests {
 
         let path = dir.path().join("logs").join("backlog.log");
         let sink = Arc::new(Mutex::new(RotatingFile::open(path.clone(), MAX_LOG_BYTES)));
-        let mut shared = SharedSink(sink.clone());
+        let mut shared = SharedSink::new(sink.clone());
 
         // The three real shapes: watcher.rs's Debug-quoted path, an unquoted
         // path inside a sidecar error, and slm.rs's quoted raw model output.
