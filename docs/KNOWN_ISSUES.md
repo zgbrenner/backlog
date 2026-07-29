@@ -16,6 +16,40 @@ Release-blocking gates that are simply *work to do on a Windows machine* live in
 
 ## Open
 
+### 0. The undated-document fallback depends on the model volunteering "none"
+`README.md`'s behavior guarantees say "**Undated documents fall back to the file
+modified date** with `date_source: metadata` and a `DATE_FROM_FILE_MTIME` note".
+That is implemented and tested — but the trigger is narrower than the sentence
+suggests. `checker.rs` substitutes the mtime only when the model returns
+`date: "none"` *and* `date_source: "none"`
+(`checker::tests::undated_falls_back_to_metadata`). Nothing reaches the fallback
+if the model proposes a date instead.
+
+On genuinely undated tax paperwork it usually proposes one. The pages are dense
+with years ("Tax Year 2022", "Year Acquired"), so a 0.6B/1.7B model offers a
+plausible date rather than declining; `DateNotInEvidence` then correctly refuses
+it, the retry ladder re-asks, and the document ends as
+`SLM_FAIL:no valid output after escalation` in quarantine — never having reached
+the fallback that exists for exactly this case.
+
+Measured on a synthetic corpus whose undated fixtures contain **no date-shaped
+text at all**: **0 of 3 undated documents were named**; all three were flagged.
+By contrast the fallback does fire on documents that do carry a date the model
+missed, which is how it has been seen working.
+
+The refusal is not wrong — the checker is doing its job, and quarantine plus a
+`NeedsReview` row is the safe outcome. What is wrong is the documented promise,
+which reads as a property of undated documents when it is really a property of
+models that decline to guess.
+
+**Fix:** either make the fallback deterministic — when the evidence harvest
+found no dates anywhere and the model's proposal fails `DateNotInEvidence`,
+prefer the mtime over a rejection — or reword the guarantee to say it depends on
+the model returning `none`. The first is a change to the trust core and wants
+its own test pass over a real corpus; the second is honest today. Deliberately
+not fixed in 0.4.0 rather than changing `checker.rs` on the strength of a
+14-document sample.
+
 ### 1. The shipped sidecars are not built by anything reproducible
 `src-tauri/binaries/` is gitignored and empty on a fresh clone. A release
 depends on a human running `scripts/build-sidecar.ps1` and staging

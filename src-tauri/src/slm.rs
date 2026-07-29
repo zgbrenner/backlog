@@ -24,6 +24,19 @@ use std::time::{Duration, Instant};
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long one `/v1/chat/completions` call may take before the client gives up.
+///
+/// Must stay at or above `Config::per_file_wall_clock_secs` (default 90), which
+/// is what `pipeline.rs`'s `wall_clock_cap` budgets for a single naming rung.
+/// This was 60s against that 90s budget, so the two disagreed about who gets to
+/// end a slow request — and the tighter one silently won. That never showed up
+/// on a workstation, where naming takes seconds; it matters on the 8 GB, no-GPU
+/// laptops this ships to, where the whole point of the wall-clock budget is to
+/// tolerate a slow-but-succeeding document. Losing the race turns such a file
+/// into `SLM_FAIL:no valid output after escalation` — a message that blames the
+/// model for a deadline the HTTP client imposed.
+const NAMING_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// How far above the configured base port `reserve_port` will look for a free
 /// one before giving up.
 const PORT_SCAN_RANGE: u16 = 20;
@@ -121,7 +134,7 @@ impl SlmLane {
             primary: Mutex::new(None),
             escalation: Mutex::new(None),
             http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
+                .timeout(NAMING_HTTP_TIMEOUT)
                 // Localhost only; the app makes zero outbound calls at runtime.
                 .no_proxy()
                 .build()
@@ -181,8 +194,18 @@ impl SlmLane {
     /// by a message that named the port and nothing else — and every later
     /// call paid the same 60 seconds against the same dead child forever.
     async fn ensure_up(&self, tier: Tier) -> anyhow::Result<u16> {
+        // When both tiers name the same weights, escalation is a second pass
+        // over a wider evidence bundle rather than a bigger model, so it runs
+        // on the server that is already up. Standing a second llama-server on a
+        // second port over the same GGUF would double the resident cost — and
+        // the KV cache, not the weights, is the expensive half — to buy
+        // nothing. This is the configuration an 8 GB machine ships in: the
+        // installer carries only the 0.6B, `Config::normalize` points both
+        // tiers at it, and the escalation rung still happens.
+        let collapse = tier == Tier::Escalation && self.escalation_gguf == self.primary_gguf;
         let (slot, gguf, preferred_port) = match tier {
             Tier::Primary => (&self.primary, &self.primary_gguf, self.primary_port),
+            Tier::Escalation if collapse => (&self.primary, &self.primary_gguf, self.primary_port),
             Tier::Escalation => (
                 &self.escalation,
                 &self.escalation_gguf,

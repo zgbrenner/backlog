@@ -75,7 +75,7 @@ impl Default for Config {
             // non-standard model license.
             slm_primary_gguf: PathBuf::from("models/Qwen3-0.6B-Q8_0.gguf"),
             slm_escalation_gguf: PathBuf::from("models/Qwen3-1.7B-Q8_0.gguf"),
-            slm_parallel: 4,
+            slm_parallel: default_slm_parallel(),
             evidence_token_budget: 1500,
             ettin_model_dir: String::new(),
             convert_workers: default_convert_workers(),
@@ -133,6 +133,90 @@ fn default_convert_workers() -> usize {
         .unwrap_or(2)
 }
 
+/// Total physical RAM in GiB, or `None` if the OS will not say.
+#[cfg(windows)]
+fn total_ram_gib() -> Option<u64> {
+    // GlobalMemoryStatusEx, declared inline rather than pulling in a
+    // system-info crate for one number.
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    // SAFETY: `status.length` is set to the struct's own size, which is the
+    // documented contract, and the pointer is to a live local.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return None;
+    }
+    Some(status.total_phys / (1024 * 1024 * 1024))
+}
+
+#[cfg(not(windows))]
+fn total_ram_gib() -> Option<u64> {
+    None
+}
+
+/// How many naming slots to give llama-server, chosen from installed RAM.
+///
+/// This is a memory knob wearing a concurrency knob's name. `slm.rs` derives
+/// `--ctx-size` as `4096 * slm_parallel`, and llama.cpp preallocates the whole
+/// KV cache at startup, so the cost is linear and large: Qwen3 (28 layers,
+/// 8 KV heads, head_dim 128, F16) needs 112 KiB per token, i.e. **448 MiB per
+/// parallel slot**. Measured on Windows for Qwen3-0.6B: 590 MB private commit
+/// at 1, 1,040 MB at 2, 1,938 MB at 4.
+///
+/// The escalation tier makes that worst case double. `SlmLane` keeps `primary`
+/// and `escalation` in separate slots and the 1.7B server "remains resident for
+/// the batch" once a third naming attempt wakes it, so a long run ends up
+/// holding both. Measured together at the old flat default of 4: 6,078 MB of
+/// working set for the two servers alone, which does not fit beside Windows,
+/// the app and convertd on an 8 GB machine.
+///
+/// A flat 4 was therefore right for the workstation it was written on and
+/// wrong for the laptops this ships to. Per-slot context is `4096` either way
+/// (total is `4096 * n` across `n` slots), so lowering this costs no evidence
+/// headroom — only cross-file naming overlap, which is rarely the bottleneck
+/// because `Sidecar` serializes every conversion through one process anyway.
+fn default_slm_parallel() -> u8 {
+    slm_parallel_for_ram(total_ram_gib())
+}
+
+/// The decision itself, split from reading the machine so it can be tested.
+///
+/// The 8 GB branch is the entire reason this function exists and it is the one
+/// branch the build machine can never exercise, so it is covered by
+/// `slm_parallel_is_chosen_from_installed_ram` rather than by hoping.
+fn slm_parallel_for_ram(gib: Option<u64>) -> u8 {
+    match gib {
+        Some(g) if g <= 9 => 1,  // 8 GB class: ~448 MiB of KV cache per server
+        Some(g) if g <= 17 => 2, // 16 GB class
+        Some(_) => 4,
+        // Unknown RAM is not a reason to gamble on behalf of the smaller machine.
+        None => 2,
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Self {
         let mut cfg = match std::fs::read_to_string(path) {
@@ -143,7 +227,46 @@ impl Config {
             Err(_) => Self::default(),
         };
         cfg.normalize();
+        cfg.clamp_slm_parallel_to_ram();
         cfg
+    }
+
+    /// Lower `slm_parallel` to what installed RAM can hold, and say so.
+    ///
+    /// `default_slm_parallel` only decides what a *fresh* install writes, and
+    /// `backlog.config.json` is persistent — so an 8 GB laptop upgrading from a
+    /// build whose default was a flat 4 would keep 4 forever and thrash through
+    /// its whole backfill, having never chosen that number. This is the upgrade
+    /// path for that machine.
+    ///
+    /// Deliberately one-directional: a value at or below the RAM-derived
+    /// ceiling is left exactly as configured, because someone lowering it knows
+    /// something about their machine that this does not. Only an
+    /// overcommitment is corrected, and never silently — at 4 on 8 GB the two
+    /// model servers alone want ~6.1 GB of working set, which is not a slow
+    /// run, it is a wedged one.
+    #[cfg(test)]
+    fn clamp_slm_parallel_for_test(&mut self, gib: Option<u64>) {
+        let ceiling = slm_parallel_for_ram(gib);
+        if self.slm_parallel > ceiling {
+            self.slm_parallel = ceiling;
+        }
+    }
+
+    fn clamp_slm_parallel_to_ram(&mut self) {
+        let ceiling = default_slm_parallel();
+        if self.slm_parallel > ceiling {
+            log::warn!(
+                "slm_parallel {} exceeds what {} GiB of RAM supports; using {} for this run \
+                 (set it explicitly lower to silence this, or see docs/SIZING.md)",
+                self.slm_parallel,
+                total_ram_gib()
+                    .map(|g| g.to_string())
+                    .unwrap_or_else(|| "an unknown amount of".into()),
+                ceiling
+            );
+            self.slm_parallel = ceiling;
+        }
     }
 
     /// Clean every operator-supplied value in place. Called on load and again
@@ -162,6 +285,32 @@ impl Config {
             *dir = normalize_path(dir);
         }
         self.ettin_model_dir = normalize_path_text(&self.ettin_model_dir);
+        self.collapse_missing_escalation_model();
+    }
+
+    /// Fall back to the primary weights when the escalation GGUF is not there.
+    ///
+    /// The installer carries one model. Both GGUFs together are 2.4 GB, which
+    /// is over GitHub's per-asset ceiling and more than an 8 GB machine wants
+    /// resident anyway, so the 1.7B is an optional extra rather than a
+    /// prerequisite. Without this, its absence is not a degraded mode but a
+    /// cliff: `spawn_server` refuses a GGUF that is not a file, so the third
+    /// naming attempt fails outright and the document ends in
+    /// `SLM_FAIL:no valid output after escalation` — blaming the model for a
+    /// file that was never installed. Pointing both tiers at the same weights
+    /// keeps the escalation rung meaningful (it retries against a wider
+    /// evidence bundle, per `pipeline.rs`'s `rung`), keeps preflight's "Backup
+    /// model file is present" row honest, and lets `SlmLane::ensure_up` reuse
+    /// the running server instead of starting a second one.
+    ///
+    /// Drop the 1.7B beside the 0.6B and this stops firing on the next launch;
+    /// an explicit path that exists is always honored.
+    fn collapse_missing_escalation_model(&mut self) {
+        let escalation_missing =
+            self.slm_escalation_gguf.as_os_str().is_empty() || !self.slm_escalation_gguf.is_file();
+        if escalation_missing && self.slm_primary_gguf.is_file() {
+            self.slm_escalation_gguf = self.slm_primary_gguf.clone();
+        }
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -326,5 +475,89 @@ mod tests {
         let cfg = Config::load(&path);
         assert_eq!(cfg.processing_dir, PathBuf::from("C:\\Processing"));
         assert_eq!(cfg.outbox_dir, PathBuf::from("C:\\Outbox"));
+    }
+
+    /// `slm_parallel` is a memory knob: `slm.rs` derives `--ctx-size` as
+    /// `4096 * slm_parallel` and llama.cpp preallocates the whole KV cache, at
+    /// 448 MiB per slot per server — doubled once the escalation tier wakes and
+    /// stays resident. Measured, both servers at 4: 6,078 MB of working set,
+    /// which does not fit on an 8 GB machine beside Windows and convertd.
+    ///
+    /// The 8 GB row is the reason this logic exists and is the one row a
+    /// 62 GB build machine can never produce, so it is asserted here.
+    #[test]
+    fn slm_parallel_is_chosen_from_installed_ram() {
+        for (gib, expected) in [
+            (4u64, 1u8),
+            (8, 1),
+            (9, 1),
+            (12, 2),
+            (16, 2),
+            (17, 2),
+            (32, 4),
+        ] {
+            assert_eq!(
+                slm_parallel_for_ram(Some(gib)),
+                expected,
+                "{gib} GiB should give {expected}"
+            );
+        }
+        // Unknown RAM must not gamble on behalf of the smaller machine.
+        assert_eq!(slm_parallel_for_ram(None), 2);
+    }
+
+    /// `backlog.config.json` outlives the installer, so a machine that ran an
+    /// older build keeps whatever it wrote. An 8 GB laptop upgrading from the
+    /// flat default of 4 would otherwise thrash through its whole backfill
+    /// having never chosen that number.
+    #[test]
+    fn a_persisted_slm_parallel_is_clamped_down_but_never_up() {
+        let mut cfg = Config {
+            slm_parallel: 4,
+            ..Default::default()
+        };
+        cfg.clamp_slm_parallel_for_test(Some(8));
+        assert_eq!(cfg.slm_parallel, 1, "8 GB must not inherit 4");
+
+        // One-directional: someone who lowered it knows their machine.
+        let mut cfg = Config {
+            slm_parallel: 1,
+            ..Default::default()
+        };
+        cfg.clamp_slm_parallel_for_test(Some(64));
+        assert_eq!(cfg.slm_parallel, 1, "a deliberate 1 must survive on 64 GB");
+    }
+
+    /// The installer ships one model; both GGUFs are 2.4 GB against GitHub's
+    /// 2 GiB asset ceiling. A missing escalation model must be a degraded mode,
+    /// not a cliff — `spawn_server` refuses a GGUF that is not a file, so
+    /// without this every third naming attempt fails outright.
+    #[test]
+    fn a_missing_escalation_model_falls_back_to_the_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("Qwen3-0.6B-Q8_0.gguf");
+        std::fs::write(&primary, b"not really a gguf").unwrap();
+
+        let mut cfg = Config {
+            slm_primary_gguf: primary.clone(),
+            slm_escalation_gguf: dir.path().join("Qwen3-1.7B-Q8_0.gguf"),
+            ..Default::default()
+        };
+        cfg.normalize();
+        assert_eq!(
+            cfg.slm_escalation_gguf, primary,
+            "an absent escalation model must point at the primary"
+        );
+
+        // An escalation model that exists is left exactly alone.
+        let escalation = dir.path().join("Qwen3-1.7B-Q8_0.gguf");
+        std::fs::write(&escalation, b"also not really a gguf").unwrap();
+        let mut cfg = Config {
+            slm_primary_gguf: primary,
+            slm_escalation_gguf: escalation.clone(),
+            ..Default::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.slm_escalation_gguf, escalation);
     }
 }

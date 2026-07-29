@@ -23,6 +23,9 @@ env/
 
 # Downloaded model weights (lockfile IS committed; weights are not)
 models/**/*.gguf
+# The copy the installer bundles. Staged by the release build from the verified
+# app-data set; hash-pinned in models/models.lock.json like every other copy.
+src-tauri/resources/models/*.gguf
 models/**/*.safetensors
 models/**/*.bin
 models/**/*.onnx

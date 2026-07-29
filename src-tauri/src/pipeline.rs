@@ -1583,6 +1583,252 @@ mod tests {
         }
     }
 
+    /// A real batch, through the real binaries, against real folders.
+    ///
+    /// `#[ignore]` because it needs things no gate can assume: the built
+    /// sidecars, ~2.5 GB of GGUF weights, and minutes of CPU. It is not part of
+    /// the five gates and never runs in `cargo test`. It exists because
+    /// everything above this line drives the orchestrator against stubs, so
+    /// nothing in the suite could answer "does a thousand tax PDFs actually
+    /// come out the other end, and what does it cost in RAM and wall clock" —
+    /// which is the only question a pilot deployment cares about.
+    ///
+    /// Every path comes from the environment so this is not wired to one
+    /// machine:
+    ///
+    /// ```powershell
+    /// $env:BACKLOG_E2E_PROCESSING = "C:\...\Processing"
+    /// $env:BACKLOG_E2E_OUTBOX     = "C:\...\Outbox"
+    /// $env:BACKLOG_E2E_QUARANTINE = "C:\...\Quarantine"
+    /// $env:BACKLOG_E2E_CONVERTD   = "C:\...\convertd.exe"
+    /// $env:BACKLOG_E2E_LLAMA      = "C:\...\llama-server.exe"
+    /// $env:BACKLOG_E2E_PRIMARY    = "C:\...\Qwen3-0.6B-Q8_0.gguf"
+    /// $env:BACKLOG_E2E_ESCALATION = "C:\...\Qwen3-1.7B-Q8_0.gguf"   # optional
+    /// $env:BACKLOG_E2E_PARALLEL   = "2"                              # optional
+    /// $env:BACKLOG_E2E_WORKERS    = "3"                              # optional
+    /// cargo test -p backlog --lib --release e2e_real_batch -- --ignored --nocapture
+    /// ```
+    ///
+    /// It prints a per-file outcome table and a summary; it asserts only that
+    /// every file reached a terminal state and that nothing vanished, because
+    /// the naming quality of a local model on synthetic paperwork is a judgment
+    /// call for a human reading the table, not something to encode as a
+    /// threshold that would make this fail for the wrong reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs real sidecars, real GGUF weights and minutes of CPU; run explicitly"]
+    async fn e2e_real_batch() {
+        fn env_path(key: &str) -> PathBuf {
+            PathBuf::from(
+                std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set for this test")),
+            )
+        }
+        fn env_num(key: &str, default: usize) -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+
+        let processing = env_path("BACKLOG_E2E_PROCESSING");
+        let outbox = env_path("BACKLOG_E2E_OUTBOX");
+        let quarantine = env_path("BACKLOG_E2E_QUARANTINE");
+        let convertd_exe = env_path("BACKLOG_E2E_CONVERTD");
+        let llama_exe = env_path("BACKLOG_E2E_LLAMA");
+        let primary = env_path("BACKLOG_E2E_PRIMARY");
+        // Falling back to the primary is the supported 8 GB shape: the
+        // escalation rung still runs, just against the model already resident,
+        // instead of standing a second llama-server up beside it.
+        let escalation = std::env::var("BACKLOG_E2E_ESCALATION")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| primary.clone());
+        let parallel = env_num("BACKLOG_E2E_PARALLEL", 2);
+        let workers = env_num("BACKLOG_E2E_WORKERS", 3);
+
+        let work = std::env::temp_dir().join("backlog-e2e");
+        let cache_dir = work.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        for d in [&outbox, &quarantine] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        let cfg = Config {
+            processing_dir: processing.clone(),
+            outbox_dir: outbox.clone(),
+            quarantine_dir: quarantine.clone(),
+            cache_dir,
+            slm_primary_gguf: primary,
+            slm_escalation_gguf: escalation,
+            slm_parallel: parallel as u8,
+            convert_workers: workers,
+            manifest_emit_per_min: 0,
+            ..Default::default()
+        };
+        cfg.validate()
+            .expect("the three folders must be distinct and non-nested");
+
+        let ledger = Arc::new(Ledger::open(&work.join("ledger.db")).unwrap());
+        let sidecar = Arc::new(
+            Sidecar::with_timeout(
+                convertd_exe,
+                std::time::Duration::from_secs(cfg.sidecar_timeout_secs),
+            )
+            .with_models_dir(cfg.slm_primary_gguf.parent().unwrap().to_path_buf()),
+        );
+        let grammar =
+            std::fs::read_to_string(std::env::var("BACKLOG_E2E_GRAMMAR").unwrap_or_default())
+                .unwrap_or_default();
+        let slm = Arc::new(SlmLane::new(
+            llama_exe,
+            grammar,
+            cfg.slm_primary_gguf.clone(),
+            cfg.slm_escalation_gguf.clone(),
+            cfg.llama_port,
+            cfg.slm_parallel,
+        ));
+        let model_versions = sidecar.versions().unwrap_or_else(|_| json!({}));
+        assert!(
+            model_versions.get("convertd").is_some(),
+            "convertd did not answer `versions`; a manifest cannot carry provenance without it: {model_versions}"
+        );
+
+        let pipeline = Arc::new(Pipeline {
+            convert_slots: Arc::new(Semaphore::new(cfg.convert_workers.max(1))),
+            slm_slots: Arc::new(Semaphore::new(cfg.slm_parallel.max(1) as usize)),
+            ingest_slots: Arc::new(Semaphore::new(
+                (cfg.convert_workers.max(1) * 4).clamp(8, 64),
+            )),
+            inflight: Arc::new(Mutex::new(HashSet::new())),
+            pacer: Arc::new(Pacer::new(cfg.manifest_emit_per_min)),
+            cfg,
+            ledger: ledger.clone(),
+            sidecar,
+            slm,
+            app: None,
+            paused: Arc::new(AtomicBool::new(false)),
+            model_versions,
+        });
+
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&processing)
+            .expect("Processing folder must exist")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no files in {}", processing.display());
+        let total = files.len();
+        eprintln!(
+            "\n=== e2e: {total} files, slm_parallel={parallel}, convert_workers={workers} ==="
+        );
+
+        let started = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for path in files {
+            let p = pipeline.clone();
+            handles.push(tokio::spawn(async move {
+                let t = std::time::Instant::now();
+                p.process_file(path.clone()).await;
+                (path, t.elapsed())
+            }));
+        }
+        let mut per_file = Vec::new();
+        for h in handles {
+            per_file.push(h.await.expect("no worker may panic"));
+        }
+        let wall = started.elapsed();
+
+        // Outcome comes from the ledger, not from guessing at the filesystem.
+        let manifests = std::fs::read_dir(outbox.join("_manifests"))
+            .map(|d| d.flatten().filter(|e| e.path().is_file()).count())
+            .unwrap_or(0);
+        let quarantined = std::fs::read_dir(&quarantine)
+            .map(|d| d.flatten().filter(|e| e.path().is_file()).count())
+            .unwrap_or(0);
+        let left = std::fs::read_dir(&processing)
+            .map(|d| d.flatten().filter(|e| e.path().is_file()).count())
+            .unwrap_or(0);
+
+        // Statuses come from the manifests, which are the contract Flow 2 reads.
+        let mut ok = 0usize;
+        let mut flagged = 0usize;
+        let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
+        if let Ok(entries) = std::fs::read_dir(outbox.join("_manifests")) {
+            for e in entries.flatten() {
+                let Ok(bytes) = std::fs::read(e.path()) else {
+                    continue;
+                };
+                let Ok(m) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue;
+                };
+                match m.get("status").and_then(|s| s.as_str()) {
+                    Some("ok") => ok += 1,
+                    Some(_) => {
+                        flagged += 1;
+                        let reason = m
+                            .get("flag_reason")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("(none)")
+                            .to_string();
+                        *reasons.entry(reason).or_default() += 1;
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        let mut slowest: Vec<_> = per_file.iter().collect();
+        slowest.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
+        eprintln!("\n--- ten slowest ---");
+        for (path, d) in slowest.iter().take(10) {
+            eprintln!(
+                "  {:>7.1}s  {}",
+                d.as_secs_f64(),
+                path.file_name().unwrap().to_string_lossy()
+            );
+        }
+        let secs = wall.as_secs_f64();
+        eprintln!("\n--- flag reasons ---");
+        for (reason, n) in &reasons {
+            eprintln!("  {n:>4}  {reason}");
+        }
+        eprintln!(
+            "\n=== {total} files in {:.1}s ({:.2} s/file) ===",
+            secs,
+            secs / total as f64
+        );
+        eprintln!(
+            "=== named ok {ok}/{total} ({:.0}%) | flagged {flagged} | manifests {manifests} | quarantined {quarantined} | left in Processing {left} ===",
+            100.0 * ok as f64 / total as f64
+        );
+        eprintln!(
+            "=== extrapolated to 1,000 files: {:.1} hours ===\n",
+            (secs / total as f64) * 1000.0 / 3600.0
+        );
+
+        // The invariant is one manifest per file, not one *outcome* per file: a
+        // flagged document produces a manifest **and** a quarantine copy, so
+        // `manifests + quarantined` double-counts every failure. Asserting that
+        // sum is how this test first "failed" against a pipeline that was
+        // behaving exactly as designed.
+        assert_eq!(
+            manifests, total,
+            "every file must produce exactly one manifest: {manifests} for {total} files"
+        );
+        assert_eq!(
+            ok + flagged,
+            total,
+            "every manifest must be ok or flagged: {ok} ok + {flagged} flagged != {total}"
+        );
+        assert_eq!(
+            quarantined, flagged,
+            "every flagged file must be in quarantine and nothing else should be: {quarantined} quarantined vs {flagged} flagged"
+        );
+        assert_eq!(
+            left, ok,
+            "an ok file stays in Processing for Flow 2 to move; a flagged one must not: {left} left vs {ok} ok"
+        );
+    }
+
     /// The smallest honest cap this config can express: one second per sidecar
     /// round-trip, one naming rung. `wall_clock_cap` is deliberately the SUM of
     /// the stage timeouts it wraps, so a test shrinks those rather than

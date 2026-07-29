@@ -15,6 +15,107 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.4.0] — sized for the machine it actually runs on
+
+0.3.0 proved the release procedure worked. This release is what happened when
+the product was pointed at its real workload — a thousand tax PDFs and Word
+documents on an 8 GB laptop with no GPU — and measured instead of assumed. New
+in `docs/SIZING.md`: every number below, how it was obtained, and how to
+reproduce it.
+
+### The defaults could not run on 8 GB
+
+**Fixed — `slm_parallel` defaulted to 4 on every machine, which needs ~6 GB for
+the language models alone.** `slm.rs` derives `--ctx-size` as
+`4096 * slm_parallel` and llama.cpp preallocates the entire KV cache at startup.
+Qwen3's attention shape (28 layers, 8 KV heads, head_dim 128, F16) costs
+112 KiB/token, so **each parallel slot is 448 MiB** — and the weights are the
+cheap half. Measured, both model servers resident:
+
+| `slm_parallel` | Working set | Private commit |
+|---|---|---|
+| 4 (old default) | 6,078 MB | 3,904 MB |
+| 1 (new 8 GB default) | 3,385 MB | 1,207 MB |
+
+Both tiers *are* resident on any real batch: `SlmLane` keeps `primary` and
+`escalation` in separate slots, and the 1.7B server stays up for the rest of the
+run once any document reaches a third naming attempt. So 6 GB was the
+steady state, before Windows, the app and convertd. On 8 GB that is not a slow
+run, it is a thrashing one.
+
+`default_slm_parallel()` now reads installed RAM (`GlobalMemoryStatusEx`,
+declared inline rather than adding a system-info dependency): <=9 GiB gives 1,
+<=17 GiB gives 2, above that 4, and unknown gives 2 rather than gambling on the
+smaller machine. Lowering it costs no naming quality — per-slot context is 4,096
+tokens either way, since the total is `4096 * n` shared across `n` slots.
+
+**Fixed — the persisted config kept the unsafe value across upgrades.**
+`backlog.config.json` outlives the installer, so an 8 GB machine that had ever
+run an earlier build would keep `slm_parallel: 4` forever, having never chosen
+it. `Config::load` now clamps to what RAM supports, one-directionally: a value
+at or below the ceiling is left exactly as configured, because someone lowering
+it knows something this does not. Overcommitment is corrected and logged, never
+silently.
+
+**Fixed — the naming HTTP timeout and the wall-clock budget disagreed, and the
+tighter one silently won.** `slm.rs` hardcoded a 60-second client timeout while
+`pipeline.rs`'s `wall_clock_cap` budgets `per_file_wall_clock_secs` (90) for the
+same request. On a workstation naming takes seconds and this never surfaced; on
+the CPU-only laptops this ships to it turns a slow-but-succeeding document into
+`SLM_FAIL:no valid output after escalation` — blaming the model for a deadline
+the HTTP client imposed. Now 120s, with the coupling to the config value stated
+at the constant.
+
+### One download, good to go
+
+**Added — the installer carries the primary model.** A fresh machine can name
+its first document without the 2.4 GB in-app fetch. On first launch the bundled
+GGUF is *relocated* into the app-data models folder rather than pointed at in
+place: per-user installs share a volume with app-data, so the move is instant
+and free, and keeping one canonical models dir is what stops a later "Download
+models" from writing back into the install tree and being orphaned by the next
+upgrade.
+
+Both Q8_0 weights together are 2.4 GB and GitHub caps a release asset at 2 GiB,
+so the 1.7B ships as a separate optional asset. That is a real quality
+trade-off, not a packaging detail — see the table below. The official Qwen
+repositories publish only Q8_0, so a smaller quantisation would mean
+third-party weights and would break the provenance `NOTICE.md` documents.
+
+**Added — the escalation tier degrades instead of failing when the 1.7B is
+absent.** `Config::normalize` points both tiers at the primary when the
+escalation GGUF is missing, and `SlmLane::ensure_up` then reuses the running
+server instead of standing a second one up over identical weights. Without this,
+a missing optional model was not a degraded mode but a cliff: `spawn_server`
+refuses a GGUF that is not a file, so every third naming attempt failed outright.
+
+### Measured behaviour
+
+`pipeline.rs`'s `e2e_real_batch` is a new `#[ignore]`d load harness that drives
+the real sidecars and real weights against real folders, parameterised by
+environment variables. It is not one of the five gates and never runs in
+`cargo test`. Everything else in the suite exercises the orchestrator against
+stubs, so nothing could previously answer what a batch costs.
+
+Measured on a mixed synthetic tax corpus, `slm_parallel: 1`:
+
+| Tiers | Per file | Named `ok` |
+|---|---|---|
+| 0.6B only | 23.9 s | 2/12 (17%) |
+| 0.6B + 1.7B | 34.3 s | 7/12 (58%) |
+
+Extrapolated to 1,000 files: **6.6–9.5 hours**. The bottleneck is not the naming
+lane — `Sidecar::call` holds one mutex for a whole request/response round trip,
+so conversion is one-at-a-time app-wide and `convert_workers` buys queue depth
+rather than parallelism. That is recorded in `docs/SIZING.md` as a known
+characteristic, not fixed here.
+
+Roughly a third to a half of a real tax batch lands in Needs Review. Much of
+that is correct — an ambiguous `04/05/2023` must go to a human, and `checker.rs`
+refuses any date it cannot prove against the document text. `docs/SIZING.md`
+separates the genuine misses from the designed refusals rather than reporting a
+single success rate.
+
 ## [0.3.0] — the release procedure, actually executed end to end
 
 Everything below the "Build and release" heading was found by running

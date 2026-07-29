@@ -19,6 +19,7 @@ app ever makes are a one-time model download and a startup update check; see
 | Every message it can show you | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) |
 | What it does with your documents | [`docs/PRIVACY.md`](docs/PRIVACY.md) · [`docs/SECURITY.md`](docs/SECURITY.md) |
 | Why it is built this way | [`docs/DECISIONS.md`](docs/DECISIONS.md) |
+| What it needs from the machine, measured | [`docs/SIZING.md`](docs/SIZING.md) |
 | What is not finished | [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) |
 | Cutting a release | [`RELEASING.md`](RELEASING.md) · [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) |
 | Third-party components | [`NOTICE.md`](NOTICE.md) · [`LICENSE`](LICENSE) |

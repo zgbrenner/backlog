@@ -1101,6 +1101,50 @@ pub fn run() {
                 &cfg.slm_escalation_gguf,
                 model_download::ESCALATION_GGUF_NAME,
             );
+            // The installer ships the primary GGUF so a fresh machine can name
+            // its first document without the 2.4 GB download.
+            //
+            // Relocate it into app-data rather than pointing the config at the
+            // install directory. Keeping one canonical models dir is what makes
+            // the rest of the system coherent: `download_models` writes to the
+            // configured path, `BACKLOG_MODELS_DIR` hands that dir to convertd,
+            // and preflight reports on it. A config pointing into the install
+            // tree would send a later "Download models" *back into the install
+            // tree*, and would be silently orphaned by the next upgrade.
+            //
+            // `rename` first because per-user installs land under the same
+            // `%LOCALAPPDATA%`/`%APPDATA%` volume as app-data, making this
+            // instant and free rather than a 639 MB copy. Copy is the
+            // cross-volume fallback; if both fail the model simply is not there
+            // and preflight says so, which is the same state as before.
+            for (path, name) in [
+                (&mut cfg.slm_primary_gguf, model_download::PRIMARY_GGUF_NAME),
+                (
+                    &mut cfg.slm_escalation_gguf,
+                    model_download::ESCALATION_GGUF_NAME,
+                ),
+            ] {
+                if path.is_file() {
+                    continue;
+                }
+                let bundled = resource(app.handle(), &format!("models/{name}"));
+                if !bundled.is_file() {
+                    continue;
+                }
+                let dest = models_dir.join(name);
+                if std::fs::rename(&bundled, &dest).is_ok() {
+                    log::info!("installed the bundled {name} into the models folder");
+                    *path = dest;
+                } else if std::fs::copy(&bundled, &dest).is_ok() {
+                    log::info!("copied the bundled {name} into the models folder");
+                    *path = dest;
+                } else {
+                    log::warn!("could not place the bundled {name} into the models folder");
+                }
+            }
+            // After the bundled step, so a machine that received only the
+            // primary still gets a usable escalation rung pointed at it.
+            cfg.normalize();
             cfg.save(&cfg_path).ok();
             register_sensitive_paths(&cfg);
 
