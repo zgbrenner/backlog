@@ -48,6 +48,13 @@ jobs:
           python-version: "3.11"
       - name: Install pinned Rust
         run: rustup show
+      - name: Select native Windows build tools
+        run: |
+          $nasmVersion = "2.16.03"
+          $nasmHash = "3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6"
+          Invoke-WebRequest -Uri "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm.zip"
+          Get-FileHash nasm.zip
+          Expand-Archive nasm.zip
       - name: Install locked dependencies
         run: npm ci
       - name: Validate frontend
@@ -293,6 +300,14 @@ test("a changed primary model hash is rejected", () => {
   assert.match(
     validateReleaseWorkflow(validWorkflow, changed).join("\n"),
     /primary model SHA-256/,
+  );
+});
+
+test("a changed NASM hash is rejected", () => {
+  const changed = validWorkflow.replace("3ee47822", "00000000");
+  assert.match(
+    validateReleaseWorkflow(changed, validStageScript).join("\n"),
+    /exact NASM archive/,
   );
 });
 

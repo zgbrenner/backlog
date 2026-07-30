@@ -88,10 +88,25 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $nasmVersion = "2.16.03"
+          $nasmHash = "3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6"
+          $nativeRoot = Join-Path $env:RUNNER_TEMP "backlog-native-tools"
+          $nasmArchive = Join-Path $nativeRoot "nasm-$nasmVersion-win64.zip"
+          New-Item -ItemType Directory -Path $nativeRoot -Force | Out-Null
+          Invoke-WebRequest `
+            -Uri "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm-$nasmVersion-win64.zip" `
+            -OutFile $nasmArchive
+          $actualNasmHash = (Get-FileHash -LiteralPath $nasmArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualNasmHash -ne $nasmHash) {
+            throw "NASM archive hash mismatch: expected $nasmHash, got $actualNasmHash"
+          }
+          Expand-Archive -LiteralPath $nasmArchive -DestinationPath $nativeRoot -Force
+          $nasmDir = Join-Path $nativeRoot "nasm-$nasmVersion"
+
           $nativePaths = @(
             "C:\Strawberry\perl\bin",
             "C:\Strawberry\c\bin",
-            "C:\Program Files\NASM"
+            $nasmDir
           )
           foreach ($path in $nativePaths) {
             if (-not (Test-Path $path)) { throw "Required build tool path is missing: $path" }
@@ -100,8 +115,10 @@ jobs:
           }
           perl --version | Select-Object -First 2
           if ($LASTEXITCODE -ne 0) { throw "native Perl is unavailable" }
-          nasm -v
-          if ($LASTEXITCODE -ne 0) { throw "NASM is unavailable" }
+          $actualNasm = nasm -v
+          if ($LASTEXITCODE -ne 0 -or $actualNasm -notmatch "^NASM version $([regex]::Escape($nasmVersion))(\s|$)") {
+            throw "Expected NASM $nasmVersion, got $actualNasm"
+          }
 
       - name: Install locked dependencies
         shell: pwsh
