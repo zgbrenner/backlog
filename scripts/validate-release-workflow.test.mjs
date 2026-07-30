@@ -18,6 +18,9 @@ on:
     branches: [main]
 permissions:
   contents: read
+concurrency:
+  group: release-v0.5.0
+  cancel-in-progress: true
 env:
   RELEASE_SHA: \${{ github.event.workflow_run.head_sha }}
 jobs:
@@ -184,6 +187,17 @@ test("a manual dispatch path that bypasses exact successful CI provenance is rej
   assert.match(
     validateReleaseWorkflow(manual, validStageScript).join("\n"),
     /must not expose a manual CI bypass/,
+  );
+});
+
+test("a newer tested main commit cancels superseded release packaging", () => {
+  const wasteful = validWorkflow.replace(
+    "  cancel-in-progress: true",
+    "  cancel-in-progress: false",
+  );
+  assert.match(
+    validateReleaseWorkflow(wasteful, validStageScript).join("\n"),
+    /cancel superseded packaging work/,
   );
 });
 
