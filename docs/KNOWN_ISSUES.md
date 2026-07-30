@@ -440,10 +440,13 @@ lock in item 2.
 `resources/models/.gitkeep.gguf` would satisfy the glob without shipping
 weights, at the cost of a file that exists only to appease a build script — or
 build that job with the resource glob disabled. Both are code changes on a job
-that has never gated anything, which is why neither has been made. The
-workflows are currently **disabled at the repository level** (`gh workflow
-enable ci.yml` reverses it) so that a permanently-red job does not read as a
-broken build.
+that has never gated anything, which is why neither has been made.
+
+Until one of them is, **a red X on `Workspace (app crate)` is the expected
+state**, and the other four jobs are the signal. Whether the workflows are
+enabled at any given moment is a repository setting rather than a property of
+this tree — check it with `gh workflow list`, and do not trust a sentence in a
+file to tell you, which is the mistake this item spent four releases making.
 
 ## Closed since `PRODUCTION_READINESS.md` was written
 

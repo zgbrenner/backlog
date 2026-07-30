@@ -2,8 +2,8 @@
 # The fast gates, on every commit. Currently ~1.5s.
 #
 # GitHub Actions runs for this repository and costs nothing (it is public), but
-# one of its five jobs can never pass and the workflows are disabled for that
-# reason (docs/KNOWN_ISSUES.md item 11). Nothing enforces
+# one of its five jobs can never pass without the model weights, so a green tick
+# there is not obtainable (docs/KNOWN_ISSUES.md item 11). Nothing enforces
 # .github/workflows/ci.yml, so these hooks are the enforcement. Install once:
 #   pwsh scripts/install-hooks.ps1      # or: bash scripts/install-hooks.sh
 #

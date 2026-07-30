@@ -57,8 +57,8 @@ works.
   are not billed. The accurate statement is narrower: four of the five jobs
   pass, and `Workspace (app crate)` cannot, because `tauri-build` resolves
   `bundle.resources` and `resources/models/*.gguf` matches nothing on a runner
-  that has no 2.4 GB of weights. The workflows are disabled at the repository
-  level so a permanently-red job does not read as a broken build.
+  that has no 2.4 GB of weights. A red X on that job is the expected state
+  rather than a broken build, and the other four jobs are the signal.
 
 ## [0.4.3] — the filename says whose document it is
 

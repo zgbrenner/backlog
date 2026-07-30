@@ -2,9 +2,9 @@
 # Every gate, before anything leaves this machine. ~3 minutes.
 #
 # GitHub Actions runs but cannot be the authority here: one of its five jobs can
-# never pass without the 2.4 GB of model weights, so the workflows are disabled
-# (docs/KNOWN_ISSUES.md item 11). This hook is the replacement, not a supplement
-# to it — and it is free either way, the repository being public. It
+# never pass without the 2.4 GB of model weights, so "CI is green" is not
+# obtainable (docs/KNOWN_ISSUES.md item 11). This hook is the replacement, not a
+# supplement to it — and it is free either way, the repository being public. It
 # runs scripts/ci-local.sh, which runs the same five jobs .github/workflows/ci.yml
 # declares — trust-core, workspace, frontend, python, version-drift — and exits
 # non-zero naming every gate that failed. This is the last point at which a
