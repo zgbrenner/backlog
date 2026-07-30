@@ -596,15 +596,21 @@ impl Pipeline {
             .await
         };
         let mut validated = match validated {
-            Some(v) => v,
-            None => {
-                self.flag(
-                    &sha,
-                    &path,
-                    "SLM_FAIL:no valid output after escalation".into(),
-                    &clock,
-                )
-                .await;
+            Ok(v) => v,
+            Err(last_code) => {
+                // Keep the documented prefix — `docs/TROUBLESHOOTING.md` lists it
+                // and Flow 2 matches on it — and append which rule actually
+                // refused. Without that, every naming failure in the index reads
+                // identically whether the model invented a date, wrote a subject
+                // of nine words, or never answered at all, and the only way to
+                // tell them apart was to decrypt the ledger.
+                let reason = match last_code {
+                    Some(code) => {
+                        format!("SLM_FAIL:no valid output after escalation ({code})")
+                    }
+                    None => "SLM_FAIL:no valid output after escalation".to_string(),
+                };
+                self.flag(&sha, &path, reason, &clock).await;
                 return;
             }
         };
@@ -799,8 +805,13 @@ impl Pipeline {
         meta_dates: &[String],
         modified_iso: &str,
         ettin_date: Option<&str>,
-    ) -> Option<crate::checker::Validated> {
+        // `Err` carries the code of the last rule that rejected, so the flag
+        // reason can name it. `None` inside the `Err` means the ladder never got
+        // a parseable proposal at all — a model or transport failure rather than
+        // a validation one.
+    ) -> Result<crate::checker::Validated, Option<&'static str>> {
         let mut violation: Option<String> = None;
+        let mut last_code: Option<&'static str> = None;
         // No classifier ran means no type to declare; saying so beats naming a
         // type the sidecar never actually decided on.
         let doc_type_hint = ev.doc_type.as_deref().unwrap_or("unknown");
@@ -852,19 +863,29 @@ impl Pipeline {
                                 ) {
                                     if !v2.soft_flags.iter().any(|f| f.starts_with("SPAN_MISMATCH"))
                                     {
-                                        return Some(v2);
+                                        return Ok(v2);
                                     }
                                 }
                             }
                             v.soft_flags.push("SPAN_MISMATCH_PERSISTED".into());
                         }
                         let _ = self.advance(sha, JobState::Named);
-                        return Some(v);
+                        return Ok(v);
                     }
                     Err(ce) => {
                         // Full message (with the offending text) drives the
                         // on-device re-prompt; the persisted log gets the code.
                         violation = Some(ce.to_string());
+                        last_code = Some(ce.code());
+                        // The code alone, to the app log as well as the ledger.
+                        // Rejections used to go only to the ledger, which is
+                        // encrypted — so an operator looking at a third of a
+                        // backfill sitting in Needs Review had no way to learn
+                        // whether it was the subject rule or the date rule
+                        // without decrypting a database. The code carries no
+                        // document text, which is why it is the part that is safe
+                        // to put here (see `CheckError::code`).
+                        log::warn!("name attempt {attempt} rejected: {}", ce.code());
                         let _ = self.ledger.log_event(
                             sha,
                             "validate",
@@ -890,7 +911,7 @@ impl Pipeline {
                 }
             }
         }
-        None
+        Err(last_code)
     }
 
     async fn handle_duplicate(
@@ -1580,6 +1601,130 @@ mod tests {
                 .collect();
             names.sort();
             names
+        }
+    }
+
+    /// What the model actually proposes, and what the checker says about it.
+    ///
+    /// `#[ignore]`, and it prints rather than asserts: the point is to see the
+    /// raw proposal beside the rule that refused it. A flagged document's
+    /// manifest carries only a code, deliberately — `CheckError::code` exists
+    /// precisely so a rejection can be persisted without the document-derived
+    /// text — so this is the sanctioned place to look at the text itself, in a
+    /// developer's terminal on fixtures, never in a log or an index.
+    ///
+    /// Same environment variables as `e2e_real_batch`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "diagnostic: needs real sidecars and weights; prints, does not assert"]
+    async fn e2e_what_the_model_proposes() {
+        fn env_path(key: &str) -> PathBuf {
+            PathBuf::from(std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set")))
+        }
+        let processing = env_path("BACKLOG_E2E_PROCESSING");
+        let primary = env_path("BACKLOG_E2E_PRIMARY");
+        let escalation = std::env::var("BACKLOG_E2E_ESCALATION")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| primary.clone());
+
+        let cfg = Config {
+            slm_primary_gguf: primary,
+            slm_escalation_gguf: escalation,
+            slm_parallel: 1,
+            ..Default::default()
+        };
+        let sidecar = Sidecar::with_timeout(
+            env_path("BACKLOG_E2E_CONVERTD"),
+            std::time::Duration::from_secs(cfg.sidecar_timeout_secs),
+        )
+        .with_models_dir(cfg.slm_primary_gguf.parent().unwrap().to_path_buf());
+        let slm = SlmLane::new(
+            env_path("BACKLOG_E2E_LLAMA"),
+            String::new(),
+            cfg.slm_primary_gguf.clone(),
+            cfg.slm_escalation_gguf.clone(),
+            cfg.llama_port,
+            cfg.slm_parallel,
+        );
+        let checker = crate::checker::Checker::new(cfg.max_filename_len);
+
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&processing)
+            .expect("Processing folder must exist")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        files.sort();
+
+        for path in files {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let conv = match sidecar.convert(&path.to_string_lossy(), 10, 3) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("\n### {name}\n  convert failed: {e}");
+                    continue;
+                }
+            };
+            let outcome = match filter::build_evidence(
+                &sidecar,
+                &conv.markdown,
+                conv.doc_meta_dates.clone(),
+                false,
+                cfg.evidence_token_budget,
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("\n### {name}\n  evidence failed: {e}");
+                    continue;
+                }
+            };
+            let ev = outcome.evidence;
+            let (fs_dates, modified_iso) = crate::checker::fs_metadata_dates(&path);
+            let mut meta_dates = outcome.doc_meta_dates;
+            meta_dates.extend(fs_dates);
+            meta_dates.dedup();
+
+            eprintln!("\n### {name}");
+            eprintln!(
+                "  harvested dates: {} | thin: {}",
+                ev.harvest.dates.len(),
+                ev.thin
+            );
+            match slm
+                .name_document(
+                    crate::slm::Tier::Primary,
+                    &ev.bundle,
+                    ev.doc_type.as_deref().unwrap_or("unknown"),
+                    &ev.language,
+                    None,
+                )
+                .await
+            {
+                Ok(out) => {
+                    let words = out
+                        .subject
+                        .split([' ', '-', '_', '/'])
+                        .filter(|w| !w.is_empty())
+                        .count();
+                    eprintln!(
+                        "  subject ({words} words, {} chars): {:?}",
+                        out.subject.chars().count(),
+                        out.subject
+                    );
+                    eprintln!(
+                        "  description ({} chars): {:?}",
+                        out.description.chars().count(),
+                        out.description
+                    );
+                    eprintln!("  date: {:?} source: {:?}", out.date, out.date_source);
+                    match checker.check(&out, &ev.harvest, &meta_dates, &modified_iso, None) {
+                        Ok(v) => {
+                            eprintln!("  ACCEPTED -> {:?} flags={:?}", v.base_name, v.soft_flags)
+                        }
+                        Err(ce) => eprintln!("  REJECTED [{}] {}", ce.code(), ce),
+                    }
+                }
+                Err(e) => eprintln!("  SLM error: {e}"),
+            }
         }
     }
 

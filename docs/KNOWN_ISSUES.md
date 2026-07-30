@@ -74,6 +74,40 @@ both into one list before handing it over. Splitting them is a signature change
 across ~15 call sites for a case that is already honestly labelled, so it is
 recorded here rather than rushed.
 
+### 0b. The file's own mtime validates a model that proposes today's date
+`README.md`'s guarantee is that a model-proposed date must appear "verbatim in
+the document text **or in the file's metadata**", and `pipeline.rs` builds that
+metadata list by extending the document's embedded dates with
+`fs_metadata_dates` — the file's mtime and ctime, in both local and UTC
+readings. So a model that ignores "Do NOT use today's date" and proposes today
+is validated against the file's own timestamp, and the name ships with
+`date_source: "metadata"` and a `DATE_SOURCE_CORRECTED:document->metadata` soft
+flag. It is honestly labelled and, for a document that does carry a real date,
+wrong.
+
+Measured on a 40-document stratified run: 25 of 29 completed documents carried
+`DATE_SOURCE_CORRECTED`, most of them named `2026-07-29` — the day of the run.
+Names like `2026-07-29 Return prepared and filed on 08 12 2022 - …` show the
+shape of it plainly: the model *read* the real date into its own description and
+still proposed today for the date field.
+
+**How much of that is the test rig.** The fixtures were copied into the watched
+folder immediately before the run, so every mtime was that day and every lazy
+answer matched. On a real OneDrive backfill files keep their true mtimes, which
+are usually nearer the document's own date, so both the frequency and the size
+of the error will be lower. It is not an artefact, though — only amplified.
+
+**Fix, and why it is not done here.** Stop treating filesystem timestamps as
+evidence: pass the document's *embedded* metadata dates as the evidence list and
+leave mtime to the explicit fallback, which already receives it separately as
+`file_modified_iso`. A model proposing today would then be refused, re-asked
+with the violation quoted, and would usually find the real date. That is close
+to a one-line change in `pipeline.rs`, and it is not made here because it
+narrows a guarantee `README.md` states in those words — file metadata *is*
+advertised as valid evidence. Narrowing it is a product decision about what
+"metadata" ought to mean, not a bug fix to slip into a patch release, and it
+wants its own measured run over a corpus with realistic mtimes.
+
 ### 1. The shipped sidecars are not built by anything reproducible
 `src-tauri/binaries/` is gitignored and empty on a fresh clone. A release
 depends on a human running `scripts/build-sidecar.ps1` and staging

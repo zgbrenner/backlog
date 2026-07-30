@@ -15,7 +15,89 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
-## [0.4.1] — the two things 0.4.0 measured and left broken
+## [0.4.1] — the things 0.4.0 measured and left broken
+
+### Documents stopped being quarantined for obeying their own schema
+
+**Fixed — the JSON schema capped `subject` and `description` at exactly the
+checker's own limits, so llama.cpp's grammar stopped generation mid-word.**
+`maxLength` is enforced by refusing to emit another character, so every proposal
+came back at exactly the cap: subjects ending `"Cobalt Ridge Analyt,"` and
+`"Taxpayer / "`, descriptions ending `"...supporting worksheets. The return was "`.
+That trailing fragment then failed the "exactly one sentence" rule the model had
+been told to satisfy. The document was quarantined for a limit the schema
+imposed, and the manifest blamed the model.
+
+`description` now has real headroom (200 to 320) so the model finishes its
+sentence. `subject` went the other way, to 64: its constraint is a word count the
+schema cannot express, and the model uses whatever room it is given — raising it
+to 140 produced an over-long subject on **39 of 40** documents, every one then
+trimmed. The cap had stopped being a constraint and become a target. 64
+characters is about the checker's ten words.
+
+The prompt now also states the two rules it never stated: that the description
+must end in a single full stop and must not run to a second sentence, and that
+the subject should name one document type and one party rather than a
+comma-separated list.
+
+**Added — deterministic, recorded repair for a mechanically-fixable answer.**
+Rejecting a whole proposal over punctuation spends a person's attention on
+nothing.
+
+- A description that runs past one sentence, or that was cut off after one, is
+  trimmed to its first complete sentence and flagged
+  `DESCRIPTION_TRIMMED_TO_ONE_SENTENCE`. The trimmed result is re-validated like
+  any other input, so a first sentence too short to stand alone is still a
+  rejection, and no complete sentence at all still is too.
+- A subject over ten words keeps its first ten — the form number and the party,
+  which is what a filename is for — and is flagged `SUBJECT_TRUNCATED`, with any
+  dangling separator removed. Too *few* words cannot be repaired by trimming and
+  remains a rejection.
+
+Both are trims, never additions: they can drop a tail, not invent content. Three
+existing tests encoded the old reject-only contract and now assert the repair
+instead; the guarantee they protect is unchanged — what ships is still at most
+ten words and exactly one sentence.
+
+**Fixed — a validation rejection was invisible outside the encrypted ledger.**
+The code went only to `Ledger::log_event`, and the manifest carried the generic
+`SLM_FAIL:no valid output after escalation`, so an operator looking at a third of
+a backfill in Needs Review could not tell a subject problem from a date problem
+without decrypting a database. The code now also reaches the app log, and the
+flag reason names the rule that refused — `SLM_FAIL:no valid output after
+escalation (BAD_SUBJECT)` — keeping the documented prefix that
+`docs/TROUBLESHOOTING.md` lists and Flow 2 matches on. Only the code, never the
+offending text: that is what `CheckError::code` exists for.
+
+### Measured effect
+
+Same eight genuinely-undated documents, across the three fixes:
+
+| | named |
+|---|---|
+| before any of this | 0 of 3 |
+| after the date fallback | 5 of 8 |
+| after the schema and repair fixes | **8 of 8** |
+
+And on a 40-document stratified sample spanning all five fixture shapes:
+**40 of 40 named, 10.6 s/file** — against 34.3 s/file before. Throughput
+improved because a rejection is expensive: each one burns three naming attempts,
+so removing false rejections did far more for wall clock than pooling conversion
+did. **1,000 files goes from roughly 9.5 hours to under 3.**
+
+### Still open, and recorded rather than papered over
+
+`docs/KNOWN_ISSUES.md` item 0b: a model that proposes today's date is validated
+against the file's own mtime, because `pipeline.rs` puts filesystem timestamps in
+the evidence list and `README.md` advertises file metadata as valid evidence. On
+the 40-document run, 25 of 29 completed documents carried
+`DATE_SOURCE_CORRECTED` and most were named with the day of the run. The rig
+amplifies it — fixtures were copied in immediately before, so every mtime was
+that day — but it is real. The fix is close to one line, and it narrows a
+guarantee the README states in those words, so it is a product decision rather
+than something to slip into a patch release.
+
+### Pooling and the undated fallback (same release)
 
 ### Undated documents are named again
 

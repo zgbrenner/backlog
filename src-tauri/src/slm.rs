@@ -297,15 +297,45 @@ impl SlmLane {
                     "type": "string",
                     "enum": ["document", "metadata", "none"]
                 },
+                // Headroom above what `checker.rs` accepts, on purpose.
+                //
+                // llama.cpp's grammar enforces `maxLength` by refusing to emit
+                // another character, so a cap set *at* the checker's limit stops
+                // the model mid-word and hands the checker a fragment. Measured
+                // with subject capped at 80 and description at 200: every
+                // proposal came back at exactly the cap — subjects ending
+                // `"Cobalt Ridge Analyt,"` and `"Taxpayer / "`, descriptions
+                // ending `"The return was "`. The second sentence-fragment then
+                // failed the very "exactly one sentence" rule the model had been
+                // told to satisfy, so the document was quarantined for obeying
+                // its own schema.
+                //
+                // With room to finish, the model produces a whole last word and a
+                // whole last sentence, and `checker.rs` trims to its own limits at
+                // a safe boundary — a word break for the subject, a sentence end
+                // for the description — which it can only do if nothing was
+                // already lost mid-token.
+                // Sized to the checker's ten-word ceiling, not above it.
+                //
+                // The subject and the description want opposite things here. A
+                // description cut mid-word breaks the "one sentence" rule, so it
+                // needs headroom. A subject has no such rule — its limit is a
+                // word count the schema cannot express — and the model will use
+                // whatever room it is given. Raising this to 140 produced a
+                // 13-plus-word subject on 39 of 40 documents, every one of them
+                // then trimmed back: the cap had stopped being a constraint and
+                // become a target. 64 characters is about ten words of ordinary
+                // English, so the schema now enforces roughly what the checker
+                // does and `SUBJECT_TRUNCATED` goes back to being the exception.
                 "subject": {
                     "type": "string",
                     "minLength": 8,
-                    "maxLength": 80
+                    "maxLength": 64
                 },
                 "description": {
                     "type": "string",
                     "minLength": 15,
-                    "maxLength": 200
+                    "maxLength": 320
                 }
             }
         })
@@ -385,8 +415,8 @@ impl SlmLane {
              Rules:\n\
              - date: extract the date written IN the document body (for example a letter date, filing date, or effective date), formatted YYYY-MM-DD. Do NOT use today's date. Use none only if the body contains no date at all.\n\
              - date_source: use document when the date appears in the body text; use metadata only when the body has no date of its own; use none when no date exists.\n\
-             - subject: 3 to 8 specific words naming the document type and key party or matter. Never use generic names such as Document or Scan.\n\
-             - description: exactly one sentence, 15 to 200 characters, adding useful information beyond the subject.\n\
+             - subject: 3 to 8 specific words naming the document type and key party or matter. Never use generic names such as Document or Scan. Do not list several things separated by commas or slashes; name one document type and one party.\n\
+             - description: exactly ONE sentence, 15 to 200 characters, adding useful information beyond the subject. It must end with a single full stop. Do not write a second sentence, and do not stop mid-sentence.\n\
              Never invent dates, parties, or facts."
         );
         if let Some(violation) = violation_note {

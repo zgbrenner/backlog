@@ -394,7 +394,7 @@ impl Checker {
         }
 
         // ---- description ---------------------------------------------------
-        let description = Self::validate_description(&out.description, &subject)?;
+        let description = Self::validate_description(&out.description, &subject, &mut soft_flags)?;
 
         // ---- compose -------------------------------------------------------
         let base_name = format!("{date_iso} {subject}");
@@ -541,9 +541,29 @@ impl Checker {
                 )));
             }
         } else {
-            let words = subject_words(&s);
+            let mut words = subject_words(&s);
             if words.is_empty() {
                 return Err(CheckError::BadSubject(format!("no word characters: '{s}'")));
+            }
+            // Too many words is a fixable overshoot; too few is not.
+            //
+            // A subject's leading words are the informative ones — the form
+            // number and the party — so keeping the first `SUBJECT_MAX_WORDS` of
+            // an over-long answer preserves what a filename is for. Quarantining
+            // a document because the model listed one entity too many spends a
+            // human's attention on nothing. Too *few* words cannot be repaired by
+            // trimming, so that stays a rejection.
+            //
+            // Only for `Source::Model`: a human who types a long subject in the
+            // review pane means it.
+            if source == Source::Model && words.len() > SUBJECT_MAX_WORDS {
+                let trimmed = truncate_to_words(&s, SUBJECT_MAX_WORDS);
+                let retained = subject_words(&trimmed);
+                if retained.len() >= SUBJECT_MIN_WORDS {
+                    flags.push("SUBJECT_TRUNCATED".into());
+                    s = trimmed;
+                    words = subject_words(&s);
+                }
             }
             if source == Source::Model
                 && !(SUBJECT_MIN_WORDS..=SUBJECT_MAX_WORDS).contains(&words.len())
@@ -563,9 +583,50 @@ impl Checker {
         Ok((s, flags))
     }
 
-    fn validate_description(raw: &str, subject: &str) -> Result<String, CheckError> {
+    /// The input up to and including its first sentence-ending mark, or `None`
+    /// when there is no complete sentence in it at all.
+    ///
+    /// Operates on the same masked form `validate_description` counts with, so
+    /// an abbreviation's full stop (`Inc.`, `e.g.`) is not mistaken for the end
+    /// of the sentence. The mask is byte-length preserving, so an offset found in
+    /// it indexes the original unchanged.
+    fn first_sentence(d: &str) -> Option<String> {
+        let masked = mask_non_terminals(d);
+        let end = RE_SENTENCE_END.find(&masked)?.end();
+        Some(d[..end].to_string())
+    }
+
+    fn validate_description(
+        raw: &str,
+        subject: &str,
+        flags: &mut Vec<String>,
+    ) -> Result<String, CheckError> {
         let d = raw.trim().replace(['\n', '\r'], " ");
         let d = RE_MULTISPACE.replace_all(&d, " ").to_string();
+
+        // Keep the first whole sentence when the model wrote past one.
+        //
+        // A model that runs on into a second sentence, or that is cut off
+        // mid-sentence by the generation cap, has still said something true and
+        // useful in its first sentence. Rejecting the whole answer for that
+        // quarantines a document over punctuation. Trimming is deterministic,
+        // recorded, and re-validated below like any other input — it cannot
+        // invent content, only drop the tail.
+        //
+        // Measured cause: the JSON schema capped `description` at exactly the
+        // checker's own 200-character limit, so llama.cpp's grammar stopped
+        // generation mid-word and produced a trailing fragment
+        // (`"...supporting worksheets. The return was "`). The schema now leaves
+        // headroom so the model finishes its sentences; this handles what is
+        // left, including a genuine two-sentence answer.
+        let d = match Self::first_sentence(&d) {
+            Some(trimmed) if trimmed != d => {
+                flags.push("DESCRIPTION_TRIMMED_TO_ONE_SENTENCE".into());
+                trimmed
+            }
+            _ => d,
+        };
+
         let n = d.chars().count();
         // An unspaced script says as much in 8 characters as English does in 15.
         let min = if unspaced_script_majority(&d) { 8 } else { 15 };
@@ -624,6 +685,37 @@ fn unspaced_script_majority(s: &str) -> bool {
 
 /// Split on whitespace and on the joiners a filename-derived title uses, so
 /// "2026-07-20_Termination_Notice_Smith" is not counted as a single word.
+/// Keep at most `max` words of `s`, cutting at a word boundary in the original
+/// text and dropping whatever separator or punctuation the cut left dangling.
+///
+/// Splits on the same characters as [`subject_words`], so the count this produces
+/// agrees with the count that is checked. Returns the input unchanged when it
+/// already has `max` words or fewer.
+fn truncate_to_words(s: &str, max: usize) -> String {
+    let is_sep = |c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/';
+    let mut words = 0usize;
+    let mut in_word = false;
+    let mut cut = s.len();
+    for (offset, ch) in s.char_indices() {
+        if is_sep(ch) {
+            in_word = false;
+            continue;
+        }
+        if !in_word {
+            in_word = true;
+            words += 1;
+            if words > max {
+                cut = offset;
+                break;
+            }
+        }
+    }
+    // A cut mid-list leaves things like "Service, " or "Entity / " behind.
+    s[..cut]
+        .trim_end_matches(|c: char| is_sep(c) || matches!(c, ',' | ';' | ':' | '.' | '&' | '('))
+        .to_string()
+}
+
 fn subject_words(s: &str) -> Vec<&str> {
     s.split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/')
         .filter(|w| w.chars().any(char::is_alphanumeric))
@@ -1398,10 +1490,12 @@ mod tests {
                 "Notice of Proposed Rulemaking on Wage and Hour Compliance Rules",
                 Some("Notice of Proposed Rulemaking on Wage and Hour Compliance Rules"),
             ), // 10
+            // 11 words: trimmed to the first 10 rather than refused. The
+            // guarantee is the ceiling, not that the model hits it exactly.
             (
                 "Notice of Proposed Rulemaking on Wage and Hour Compliance Rules Today",
-                None,
-            ), // 11
+                Some("Notice of Proposed Rulemaking on Wage and Hour Compliance Rules"),
+            ),
             // C14: unspaced scripts can never reach 2 whitespace words, so they
             // are judged by character count instead.
             ("終止僱傭通知書", Some("終止僱傭通知書")),
@@ -1414,10 +1508,11 @@ mod tests {
                 "Invoice from 株式会社 Acme Trading Company Limited Group Holdings",
                 Some("Invoice from 株式会社 Acme Trading Company Limited Group Holdings"),
             ),
-            // Mostly-Latin must not escape the word count via one CJK glyph.
+            // Mostly-Latin must not escape the word count via one CJK glyph —
+            // it is judged as English and trimmed to ten words like any other.
             (
                 "Alpha Beta Gamma Delta Epsilon Zeta Eta Theta Iota Kappa 株",
-                None,
+                Some("Alpha Beta Gamma Delta Epsilon Zeta Eta Theta Iota Kappa"),
             ),
         ];
         for (raw, want) in cases {
@@ -1429,14 +1524,116 @@ mod tests {
         }
     }
 
+    /// One word is unrepairable and stays a rejection. Too many is an overshoot
+    /// the leading words survive, so it is truncated rather than quarantined —
+    /// the guarantee is that no filename carries more than `SUBJECT_MAX_WORDS`,
+    /// not that the model must hit the ceiling exactly.
     #[test]
     fn word_count_boundaries() {
         let c = Checker::new(200);
-        for n in 1..=12usize {
+        for n in 1..=14usize {
             let subject = vec!["Alpha"; n].join(" ");
-            let ok = c.sanitize_subject(&subject).is_ok();
-            assert_eq!(ok, (2..=10).contains(&n), "{n} words: {subject}");
+            let got = c.sanitize_subject(&subject);
+            if n < 2 {
+                assert!(got.is_err(), "{n} words must be rejected: {subject}");
+                continue;
+            }
+            let kept = got.unwrap_or_else(|e| panic!("{n} words should be usable: {e}"));
+            let words = subject_words(&kept).len();
+            assert!(
+                words <= 10,
+                "{n} words must be trimmed to at most 10, got {words}: {kept:?}"
+            );
+            if n <= 10 {
+                assert_eq!(kept, subject, "{n} words must pass through unchanged");
+            } else {
+                assert_eq!(words, 10, "an over-long subject keeps the first 10 words");
+            }
         }
+    }
+
+    /// The guarantee the description rule makes is that what ships is exactly one
+    /// sentence — not that the model must produce exactly one unaided. Where a
+    /// complete first sentence exists, keeping it satisfies the guarantee and
+    /// saves the document; where none exists there is nothing to keep, so it
+    /// stays a rejection. This pins both halves and the flag that records it.
+    #[test]
+    fn a_multi_sentence_description_is_trimmed_and_flagged() {
+        let c = Checker::new(200);
+        let h = harvest_with(&["2026-07-20"]);
+        let mut out = ok_out();
+        out.description = "This document contains the payroll worksheets. The return was ".into();
+        let v = c
+            .check(&out, &h, &[], "2026-07-21", None)
+            .expect("a trailing fragment must not quarantine the document");
+        assert_eq!(
+            v.description,
+            "This document contains the payroll worksheets."
+        );
+        assert!(
+            v.soft_flags
+                .contains(&"DESCRIPTION_TRIMMED_TO_ONE_SENTENCE".to_string()),
+            "the trim must be recorded: {:?}",
+            v.soft_flags
+        );
+
+        // Nothing to keep: no complete sentence anywhere, so still refused.
+        let mut out = ok_out();
+        out.description = "there is no terminal punctuation anywhere in this one".into();
+        assert_eq!(
+            c.check(&out, &h, &[], "2026-07-21", None)
+                .unwrap_err()
+                .code(),
+            "BAD_DESCRIPTION"
+        );
+
+        // A first sentence too short to stand alone is not a repair either.
+        let mut out = ok_out();
+        out.description = "Ok. Then a much longer trailing fragment that got cut".into();
+        assert_eq!(
+            c.check(&out, &h, &[], "2026-07-21", None)
+                .unwrap_err()
+                .code(),
+            "BAD_DESCRIPTION",
+            "trimming must not produce a description under the 15-char floor"
+        );
+    }
+
+    /// The truncation is recorded, so a shortened name is auditable rather than
+    /// quietly different from what the model proposed.
+    #[test]
+    fn an_over_long_subject_is_truncated_and_flagged() {
+        let c = Checker::new(200);
+        let mut out = ok_out();
+        out.subject =
+            "Wage and Tax Statement, Form W-2, Internal Revenue Service, Elena Hutchins, 2023"
+                .into();
+        let v = c
+            .check(
+                &out,
+                &harvest_with(&["2026-07-20"]),
+                &[],
+                "2026-07-21",
+                None,
+            )
+            .expect("an over-long subject must not quarantine the document");
+        assert!(
+            v.soft_flags.contains(&"SUBJECT_TRUNCATED".to_string()),
+            "truncation must be recorded: {:?}",
+            v.soft_flags
+        );
+        assert!(subject_words(&v.subject).len() <= 10, "got {:?}", v.subject);
+        // The informative head survives, and no dangling separator with it.
+        assert!(
+            v.subject.starts_with("Wage and Tax Statement"),
+            "{:?}",
+            v.subject
+        );
+        assert!(
+            !v.subject.ends_with(',') && !v.subject.ends_with('/'),
+            "a cut must not leave a dangling separator: {:?}",
+            v.subject
+        );
     }
 
     #[test]
@@ -1786,15 +1983,26 @@ mod tests {
                 "Report on the 3.5.2 release of the payroll system for staff.",
                 true,
             ),
+            // Two sentences are trimmed to the first rather than refused: the
+            // rule exists so a filename's description is one sentence, and
+            // keeping the first one satisfies that. The dropped tail is recorded
+            // as DESCRIPTION_TRIMMED_TO_ONE_SENTENCE.
             (
                 "This is one sentence. This is another complete sentence.",
-                false,
+                true,
             ),
-            ("First sentence. Second sentence. Third one here.", false),
+            // Trimmed to the first sentence, same as the two-sentence case. Note
+            // the first sentence must still clear the 15-character floor on its
+            // own — "First sentence." does, barely.
+            ("First sentence. Second sentence. Third one here.", true),
+            // No terminal anywhere means there is no complete sentence to keep,
+            // so there is nothing to repair and this stays a rejection.
             ("no terminal punctuation at all here sadly", false),
+            // The shape observed in production: a complete first sentence, then
+            // a fragment where generation stopped. The first sentence is kept.
             (
                 "Ends mid-sentence. Then trails off with no closing mark",
-                false,
+                true,
             ),
             ("Too short.", false),
             // 15-char floor, exactly.
