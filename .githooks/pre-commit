@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# The fast gates, on every commit. Currently ~1.5s.
+#
+# GitHub Actions has never executed for this repository: every run dies in
+# seconds with no runner assigned, because the account's allowance for this
+# private repo is spent (docs/KNOWN_ISSUES.md item 11). Nothing enforces
+# .github/workflows/ci.yml, so these hooks are the enforcement. Install once:
+#   pwsh scripts/install-hooks.ps1      # or: bash scripts/install-hooks.sh
+#
+# What lives here is decided by the clock, not by importance. A pre-commit hook
+# that takes minutes gets bypassed with --no-verify and then guards nothing, so
+# this holds only gates that finish in about a second: `cargo fmt --check`, and
+# the node gates that read files and exit. Everything that compiles, bundles or
+# launches a browser — cargo test, cargo clippy, npm run check, the UI harness,
+# the Python suite — belongs in .githooks/pre-push, which runs the whole of
+# scripts/ci-local.sh. Do not move those up here; a commit hook nobody lets run
+# is worth less than no commit hook at all.
+#
+# Bypass, when you mean it (a WIP commit on a scratch branch, or a machine with
+# no Rust toolchain):
+#   BACKLOG_SKIP_HOOKS=1 git commit ...
+#   git commit --no-verify
+
+set -uo pipefail
+
+if [ "${BACKLOG_SKIP_HOOKS:-0}" != "0" ]; then
+  echo "pre-commit: skipped (BACKLOG_SKIP_HOOKS=$BACKLOG_SKIP_HOOKS)."
+  exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+# Colour only when attached to a terminal, so a redirected log stays readable.
+if [ -t 1 ]; then
+  bold=$'\033[1m'; red=$'\033[31m'; green=$'\033[32m'; dim=$'\033[2m'; off=$'\033[0m'
+else
+  bold=''; red=''; green=''; dim=''; off=''
+fi
+
+failed=()
+started=$(date +%s)
+
+gate() { # gate <label> <command...>
+  local label="$1"; shift
+  local out
+  # Output is captured and shown only on failure: a hook that prints six
+  # paragraphs of green is a hook people stop reading.
+  if out="$("$@" 2>&1)"; then
+    printf '   %sok%s      %s\n' "$green" "$off" "$label"
+  else
+    printf '   %s%sFAILED%s  %s\n' "$red" "$bold" "$off" "$label"
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/      /'
+    failed+=("$label")
+  fi
+}
+
+printf '%spre-commit%s %sfast gates: the full suite runs on push%s\n' \
+  "$bold" "$off" "$dim" "$off"
+
+# Byte-identical to the invocation in scripts/ci-local.sh's workspace job, so a
+# pass here is a pass there.
+gate "cargo fmt --check" \
+  cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+# The node gates: no toolchain, no network, no build — they read files and exit,
+# which is the only reason they can afford to run on every commit.
+gate "versions agree" \
+  node .github/scripts/check-versions.mjs
+gate "every code documented" \
+  node .github/scripts/check-troubleshooting-coverage.mjs
+gate "button labels match the docs" \
+  node .github/scripts/check-button-labels.mjs
+gate "ci.yml and ci-local.sh agree" \
+  node .github/scripts/check-ci-parity.mjs
+# Needs src-tauri/binaries to exist; on a fresh clone run `bash
+# scripts/dev-stubs.sh` first (README Setup step 1), which is required to
+# compile the app crate anyway.
+gate "dev-stub marker contract" \
+  node .github/scripts/check-stub-marker.mjs
+
+elapsed=$(( $(date +%s) - started ))
+
+if [ ${#failed[@]} -ne 0 ]; then
+  printf '\n%s%s%d gate(s) failed%s in %ss:\n' "$bold" "$red" "${#failed[@]}" "$off" "$elapsed"
+  printf '  - %s\n' "${failed[@]}"
+  cat <<'EOF'
+
+Fix them, or commit anyway on purpose:
+  BACKLOG_SKIP_HOOKS=1 git commit ...
+  git commit --no-verify
+EOF
+  exit 1
+fi
+
+printf '%s%sFast gates passed%s in %ss. %s(full suite: ./scripts/ci-local.sh)%s\n' \
+  "$bold" "$green" "$off" "$elapsed" "$dim" "$off"
+
+# A repo-local core.hooksPath supersedes a global one, so any machine-wide hook
+# of this name stopped running here the moment install-hooks pointed git at
+# .githooks. Hand off to it rather than silently disabling it. No-op on a
+# machine with no global core.hooksPath, which is every fresh clone.
+global_hooks="$(git config --global --get core.hooksPath || true)"
+if [ -n "$global_hooks" ]; then
+  global_hook="$global_hooks/$(basename "$0")"
+  if [ -x "$global_hook" ] && ! [ "$global_hook" -ef "$0" ]; then
+    exec "$global_hook" "$@"
+  fi
+fi

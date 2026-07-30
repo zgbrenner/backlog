@@ -315,22 +315,35 @@ impl SlmLane {
                 // a safe boundary — a word break for the subject, a sentence end
                 // for the description — which it can only do if nothing was
                 // already lost mid-token.
-                // Sized to the checker's ten-word ceiling, not above it.
+                // `subject` gets the same headroom, and 0.4.2 shipped without it
+                // by reasoning that a character cap could stand in for a word
+                // count. It cannot, and the paragraph above says why: a cap set
+                // where the answer wants to end cuts mid-word.
                 //
-                // The subject and the description want opposite things here. A
-                // description cut mid-word breaks the "one sentence" rule, so it
-                // needs headroom. A subject has no such rule — its limit is a
-                // word count the schema cannot express — and the model will use
-                // whatever room it is given. Raising this to 140 produced a
-                // 13-plus-word subject on 39 of 40 documents, every one of them
-                // then trimmed back: the cap had stopped being a constraint and
-                // become a target. 64 characters is about ten words of ordinary
-                // English, so the schema now enforces roughly what the checker
-                // does and `SUBJECT_TRUNCATED` goes back to being the exception.
+                // 0.4.1 lowered this to 64 to stop `SUBJECT_TRUNCATED` firing on
+                // 39 of 40 documents, on the grounds that "64 characters is about
+                // ten words of ordinary English". Measured on the 0.4.2 run, that
+                // trade was the wrong way round: **18 of 40 subjects came back at
+                // exactly 64 characters**, cut mid-word — `"... for Yolanda Bea"`
+                // (Beaumont), `"... - Internal 11"`, and
+                // `"Tax Return - Supplemental Income and Loss (Rental Real
+                // Estate) -"`, where the party was next and never arrived. None
+                // of them carried a flag, because the word count was still under
+                // ten so the checker's trimmer never engaged. A silent mid-word
+                // cut on 45% of documents is strictly worse than a flagged trim
+                // at a word boundary, which is all `SUBJECT_TRUNCATED` ever was.
+                //
+                // 95 is not a guess: it is the whole filename budget. `compose`
+                // builds `"YYYY-MM-DD " + subject` and needs
+                // `FILENAME_TAIL_RESERVE` on top, so with `max_filename_len` at
+                // 120 the subject can be 120 - 11 - 14 = 95 characters and still
+                // never hit `TooLong`. The word ceiling in `checker.rs` is what
+                // actually constrains the answer now; this is the backstop that
+                // keeps a pathological one composable.
                 "subject": {
                     "type": "string",
                     "minLength": 8,
-                    "maxLength": 64
+                    "maxLength": 95
                 },
                 "description": {
                     "type": "string",
@@ -408,6 +421,33 @@ impl SlmLane {
         let port = self.ensure_up(tier).await?;
         let today = chrono::Utc::now().date_naive().format("%Y-%m-%d");
 
+        // The two `subject` rules below are the measured shape, and the length of
+        // this prompt is a throughput decision as much as a quality one.
+        //
+        // Three configurations over the same 40 documents, scoring the party in
+        // the filename against the document's own `Taxpayer / Entity:` line:
+        //
+        //   subject rule            party exact   named ok   s/file
+        //   0.4.2 (one bullet)         18 of 40     40/40      9.58
+        //   four explicit bullets      37 of 40     39/40     22.95
+        //   these two bullets          38 of 40     40/40     11.61
+        //
+        // The four-bullet version stated every prohibition separately and read as
+        // the safer prompt. It cost 2x the wall clock for no gain in party
+        // accuracy — it was slightly better on dates (11 run-dated against 14, and
+        // 6 of 8 deep dates against 4) and slightly worse on everything else. A
+        // longer system prompt is re-sent on every naming attempt and every
+        // escalation, so prompt words are not free here.
+        //
+        // Worth knowing before rewriting this: judging the four-bullet version on
+        // its first ten documents said it was clearly better, and scoring all 40
+        // said the opposite. Re-run `e2e_real_batch` over the whole sample and
+        // compare the party buckets; ten documents will mislead you.
+        //
+        // Known noise this leaves behind: `SUBJECT_TRUNCATED` fires on 35 of 40,
+        // because the model writes past eight words and the checker trims at a
+        // word boundary. That is the flagged, clean outcome replacing a silent
+        // mid-word cut, but it is loud. See docs/KNOWN_ISSUES.md item 0h.
         let mut system = format!(
             "You name business and legal documents from evidence excerpts.\n\
              Today's date: {today}. Document language: {language}. Classified type: {doc_type}.\n\
@@ -415,7 +455,8 @@ impl SlmLane {
              Rules:\n\
              - date: extract the date written IN the document body (for example a letter date, filing date, or effective date), formatted YYYY-MM-DD. Do NOT use today's date. Use none only if the body contains no date at all.\n\
              - date_source: use document when the date appears in the body text; use metadata only when the body has no date of its own; use none when no date exists.\n\
-             - subject: 3 to 8 specific words naming the document type and key party or matter. Never use generic names such as Document or Scan. Do not list several things separated by commas or slashes; name one document type and one party.\n\
+             - subject: exactly `<short form> - <party>`, at most 8 words, for example `Form 8829 - Marcus Alvarez`. Use the short identifier (Form 8829, Schedule E, K-1, W-2, 941, 1120S), never the form's full legal title. Name the one party the document belongs to, once, and never omit it.\n\
+             - subject: add nothing else — no tax year, no EIN, no address, no generic word such as Document or Scan, and never the labels Taxpayer or Entity.\n\
              - description: exactly ONE sentence, 15 to 200 characters, adding useful information beyond the subject. It must end with a single full stop. Do not write a second sentence, and do not stop mid-sentence.\n\
              Never invent dates, parties, or facts."
         );

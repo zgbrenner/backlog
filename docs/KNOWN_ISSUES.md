@@ -105,14 +105,34 @@ all, where the mtime is the correct answer, plus six whose date sits past the
 harvest window — see item 0c. Those six are the only genuine misses left on this
 sample.
 
-### 0c. The harvest cannot see a date in the middle of a long document
+### 0c. The harvest cannot see a date in the middle of a long document — much relieved in 0.4.3, not fixed
 `harvest::harvest` scans the first 6,000 and last 2,500 characters. A date on page
 three of a nine-page document falls in neither, so nothing downstream can prefer
-it: measured, only 2 of 8 documents whose date sits deep in the body were named
-from it, against 16 of 16 when the date is on page one.
+it: measured on 0.4.2, only 2 of 8 documents whose date sits deep in the body were
+named from it, against 16 of 16 when the date is on page one.
 
-The window, not the page number, is what decides it — which is why this is worth
-fixing rather than accepting. Against the corpus generator's ground truth, both
+**0.4.3 took that to 4 of 8 without touching the harvest at all**, which is worth
+recording because it was not predicted. The subject fix in item 0d changed only the
+schema cap and the naming prompt, yet `dated_deep` doubled and
+`DATE_PREFERRED_FROM_DOCUMENT` fell from 21 to 9. The most likely reading is that
+the evidence bundle already contained the date and the model was the bottleneck, not
+the window — one no longer spending its output budget on a severed form title picks
+the right date out of what it was already shown.
+
+**How much of this ceiling is really the window is now an open question.** The
+intermediate four-bullet prompt described in 0d reached **6 of 8** on the same
+fixtures at twice the wall clock. If the window were the binding constraint, no
+prompt could have got there, because the date is not in the bundle to be found. So
+some of these documents do have their date reachable and the model is simply missing
+it, and the split between "outside the window" and "inside but overlooked" is not
+established. Anyone attempting the fix below should measure that split first: it
+decides whether widening the harvest is worth anything at all.
+
+The paragraph that follows was written against the 0.4.2 run, when all six failures
+were outside the window. It is kept because the page positions are still facts about
+the fixtures, but the six is now four.
+
+Against the corpus generator's ground truth, both
 `dated_deep` documents that succeeded have their date on page 3 or earlier, and
 all six that failed have it on pages 4 to 7 of 6- to 12-page files. The single
 apparent exception (a failure whose date is on page 3) is in a 9-page file whose
@@ -133,51 +153,130 @@ change to how evidence positions are computed, and it wants its own measured run
 rather than being bundled into a release already carrying three date-handling
 changes.
 
-### 0d. Three in ten filenames do not name the party at all
-Measured on the 40-document sample, scoring each new filename against the
-document's own `Taxpayer / Entity:` line: 18 name the party exactly, 8 name a
-correct prefix cut short, 2 garble it, and **12 do not contain it at all**.
+### 0d. ~~Three in ten filenames do not name the party at all~~ — fixed in 0.4.3
+**Fixed, and the diagnosis recorded here first was wrong in an instructive way.**
+The original entry called this "a budget problem, not a reading problem" — the
+subject capped at ten words, and the model spending them on the form's full legal
+title. That was half of it. The other half, which the entry attributed to
+`compose` trimming to `max_filename_len` (see the old 0e), was really the **JSON
+schema's `maxLength: 64` on `subject`**.
 
-This is a budget problem, not a reading problem. `SUBJECT_MAX_WORDS` is ten, and
-`Form 8829 - Expenses for Business Use of Your Home` is exactly ten words, so a
-model that leads with the form's full legal title has nothing left for the party.
-The date is right and the document type is right; the filename simply does not
-say whose it is, which is half of why anyone renames a file.
+llama.cpp enforces `maxLength` by refusing to emit another character, so the cap
+did not shorten the answer, it *severed* it. Measured on the 0.4.2 run, **18 of
+40 subjects came back at exactly 64 characters**, mid-word:
+`"... for Yolanda Bea"` (Beaumont), `"... - Internal 11"`, and
+`"Tax Return - Supplemental Income and Loss (Rental Real Estate) -"` where the
+party was the next thing to be written and never arrived. None of them carried a
+flag, because the word count was still under ten so the checker's trimmer never
+engaged. This is the same defect 0.4.1 fixed for `description` and introduced for
+`subject` in the same change, on the reasoning that "64 characters is about ten
+words of ordinary English" — a character cap cannot stand in for a word count.
 
-**Fix:** state in the naming prompt that the party outranks the form's full
-title — `Form 8829 - Marcus Alvarez` over
-`Form 8829 - Expenses for Business Use of Your Home`. Cheap to try, but it moves
-the one instruction the model follows most literally, so it needs its own
-measured 40-document run rather than being folded into a release whose changes
-were all in the checker. Not attempted here.
+Two changes, and the measurement that separates them. `maxLength` is now **95**,
+which is not a guess but the whole filename budget: `compose` builds
+`"YYYY-MM-DD " + subject` and needs `FILENAME_TAIL_RESERVE` on top, so at
+`max_filename_len: 120` the subject can be `120 - 11 - 14 = 95` characters and
+never trip `TooLong`. A test derives that arithmetic from the constants, so
+moving either side fails rather than producing documents that quarantine on
+length. And the prompt now prescribes the shape `<form> - <party>`, with the
+short form identifier rather than the legal title.
 
-### 0e. A party cut short by filename length is recorded nowhere
-`SUBJECT_TRUNCATED` reports the ten-word subject cap. It is **not** the flag for
-a name cut by `compose`'s `max_filename_len` trim, which is a separate mechanism
-and currently records nothing at all — measured, it fired on only 2 of the 8
-documents whose party was actually cut in the filename, and on 2 of the 18 whose
-party was complete.
+Measured on the same 40 documents, scoring each filename against the document's
+own `Taxpayer / Entity:` line:
 
-Neither is wrong about what it claims, but the effect is that a user looking at
-`... - Ironwood & Vance.pdf` has no indication that `Roofing` was dropped, and no
-way to tell that filename from one where the party genuinely is `Ironwood &
-Vance`. A `SUBJECT_TRIMMED_TO_FILENAME_LENGTH` note at the point of the trim
-would close it. Small and self-contained; not done here only because it belongs
-with 0d.
+| | 0.4.2 | 0.4.3 |
+|---|---|---|
+| party named exactly | 18 | **38** |
+| party cut short | 8 | **0** |
+| party garbled | 2 | **0** |
+| party absent entirely | 12 | **2** |
+| subjects at exactly the 64-char cap | 18 | **0** (longest now 87) |
 
-### 0f. Character-level garbling of a party name is undetectable
-Two of the 40 documents had their party altered rather than shortened:
-`Cross & Daughters Bakery` was named `Cross & Daubs`, and `Whitmore &
-Associates` became `Whitmore &Associes`. A third is borderline — `Derrick Pena`
-became `Derrick Pén`, acquiring an acute accent that appears nowhere in the
-source.
+The date lane improved without being touched, which was not predicted:
+`dated_deep` documents named from their own date went from 2 of 8 to **4 of 8**,
+run-dated fell from 16 to 14, and `DATE_PREFERRED_FROM_DOCUMENT` from 21 to 9 — the
+printed date is chosen outright more often when the model is not also fighting a
+severed subject. See item 0c, which this relieved.
 
-Neither carries a soft flag, and none of the checker's rules can catch this:
-`SUBJECT_UNGROUNDED` tests whether the subject is a phrase from the document, but
-these subjects mostly *are*, and the check is not per-token. A 0.6B model
-mis-transcribing a proper noun is a known limit of the model tier rather than a
-logic error, so the honest options are a substring check of the party against the
-document text, or accepting it and documenting the rate. Recorded, not fixed.
+**It cost 19% throughput: 9.58 to 11.61 s/file**, so 1,000 files went from 2.7 to
+3.2 hours.
+
+That number is the second attempt. The first wrote each subject prohibition as its
+own rule — four bullets instead of two — and cost **22.95 s/file, 6.4 hours per
+1,000**, for 37 of 40 on the party and 39 of 40 named. Twice the wall clock for
+slightly worse results, because a system prompt is re-sent on every naming attempt
+and every escalation, so prompt words are not free. The shorter prompt wins on party
+accuracy, naming rate and speed together.
+
+**Worth recording as method, not just result:** judging the four-bullet version on
+its first ten documents said it was clearly the better prompt — the ten-document
+sample showed degenerate output from the short one, including a repeated party and a
+leaked EIN. Scoring all 40 reversed it. Ten documents mislead on this corpus; score
+the whole sample.
+
+### 0e. ~~A party cut short by filename length is recorded nowhere~~ — withdrawn, the premise was false
+`compose` **rejects** an over-long name with `TooLong`; it has never truncated
+one. The eight filenames this item was written about were cut by the schema
+`maxLength` described in 0d, not by the filename budget, and
+`SUBJECT_TRUNCATED`'s weak correlation with them (2 of 8) was the clue that the
+two mechanisms were different — read at the time as the flag being unreliable
+rather than as the diagnosis being wrong.
+
+One real defect did come out of it and is fixed: a subject could arrive already
+ending in a separator whose right-hand side was never emitted, and ship that way.
+`sanitize_subject_inner` now strips a dangling tail from every model subject
+rather than only from one it trimmed itself
+(`a_subject_that_arrives_ending_in_a_separator_is_tidied`). It is deliberately
+unflagged — it drops punctuation, never a word.
+
+### 0f. ~~Character-level garbling of a party name is undetectable~~ — no longer observed
+Zero garbled parties in the 0.4.3 run, against two in 0.4.2
+(`Cross & Daughters Bakery` named `Cross & Daubs`, `Whitmore & Associates` named
+`Whitmore &Associes`). Both were adjacent to the severed-subject bug of 0d, and
+neither survived fixing it.
+
+**This is "not observed", not "cannot happen".** Nothing was added that would
+detect a mis-transcribed proper noun, and a 0.6B model is capable of one; the
+sample is 40 documents. The third borderline case originally recorded here —
+`Derrick Pena` becoming `Derrick Pén` — turned out to be the 64-character cut
+landing mid-name, not an invented diacritic, so it was never garbling either. If
+this reappears at scale, the options remain a per-token substring check of the
+party against the document text, or documenting the rate.
+
+### 0g. `SUBJECT_TRUNCATED` now fires on 35 of 40 and no longer distinguishes anything
+The checker trims a subject over ten words at a word boundary and flags it. That is
+the intended replacement for the schema severing subjects mid-word (item 0d), and it
+is working. But the model now writes past eight words on **35 of 40** documents, up
+from 10, so the flag fires on seven documents in eight.
+
+Nothing that ships is wrong: the trim keeps the leading `<form> - <party>`, which is
+what a filename is for, and the full wording stays in the description. The problem is
+that the flag has stopped carrying information. A reviewer filtering on
+`SUBJECT_TRUNCATED` to spot-check the interesting cases now gets almost the whole
+batch, which is the same as having no flag.
+
+Two options, neither obviously right. Stop flagging a trim that only removed words
+after a complete `<form> - <party>` — cheap, but it needs a way to recognise that
+shape, and the checker deliberately knows nothing about tax forms. Or raise
+`SUBJECT_MAX_WORDS` from ten so eight-to-twelve-word subjects stop being trimmed at
+all — which spends filename length on wording that is usually filler.
+
+Not attempted here: both change what ships, so both want their own measured run
+rather than being folded into a release that already moved the schema cap and the
+prompt.
+
+### 0h. The pipeline does not record how many naming attempts a document took
+A rejection costs three naming attempts instead of one, and an escalation runs the
+1.7B tier at roughly 3x the cost of the 0.6B — so attempts and tier are most of what
+determines wall clock. Neither is recorded anywhere: not in the manifest, not in the
+ledger, not in the app log except as an unattributed `warn` line.
+
+That is why the 0.4.3 throughput question above took three full 40-document runs to
+answer, when one run plus two numbers per document would have shown it directly. One
+integer (attempts) and one string (which tier answered) per document would make the
+next such question a query instead of an experiment, and would let
+`docs/SIZING.md`'s throughput table say *why* a configuration is slow rather than
+only that it is.
 
 ### 1. The shipped sidecars are not built by anything reproducible
 `src-tauri/binaries/` is gitignored and empty on a fresh clone. A release
@@ -311,6 +410,15 @@ in `ci.yml` are enforced only by `scripts/ci-local.sh`, which runs the same five
 jobs on a developer's machine. `.github/scripts/check-ci-parity.mjs` exists to
 keep the two in lockstep, so that the day Actions is switched on the workflow
 does not fail on drift accumulated while nobody could see it.
+
+Because "run it before you push" is a request and not a gate, the tracked
+`.githooks/` directory makes it one: `pre-push` runs the whole of
+`scripts/ci-local.sh` and fails the push on any gate, and `pre-commit` runs the
+seconds-long subset (`cargo fmt --check` plus the five file-reading gates).
+`scripts/install-hooks.ps1` (or `.sh`) points `core.hooksPath` at that
+directory, and until it has been run in a clone, nothing checks anything — see
+README Setup step 0. `BACKLOG_SKIP_HOOKS=1` and `--no-verify` both bypass them,
+so they remain a gate against mistakes rather than against intent.
 
 `docs/RELEASE_CHECKLIST.md` therefore gates on `./scripts/ci-local.sh` and marks
 its CI-green box explicitly unsatisfiable, in the same way as the hash-pinned

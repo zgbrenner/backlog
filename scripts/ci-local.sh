@@ -16,7 +16,11 @@
 #   ./scripts/ci-local.sh trust-core # one job (trust-core|workspace|frontend|python|version-drift)
 #
 # Exits non-zero on the first failure with the job named, so it is usable as a
-# pre-push hook:  ln -s ../../scripts/ci-local.sh .git/hooks/pre-push
+# pre-push hook — and .githooks/pre-push is exactly that. Install it once per
+# clone: scripts/install-hooks.ps1 (or .sh) points core.hooksPath at .githooks.
+# Not a symlink into .git/hooks, which is what this comment used to suggest:
+# that directory is untracked, so the link dies with the clone that made it and
+# the next clone is silently unenforced.
 
 set -uo pipefail
 

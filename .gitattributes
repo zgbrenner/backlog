@@ -2,6 +2,14 @@
 # build machines (avoids CRLF churn and cross-OS diffs).
 * text=auto eol=lf
 
+# Git runs hooks through its own bundled sh, and a hook checked out with CRLF
+# dies with "bad interpreter: No such file or directory" — which reads like a
+# missing bash, not a line-ending problem. The rule above already yields LF, but
+# it is one edit away from not doing so (dropping `eol=lf` gives CRLF on a
+# Windows checkout, and core.autocrlf=true is common), and that edit would
+# disable every gate on this machine. Pin these explicitly.
+.githooks/** text eol=lf
+
 # Binary assets — never normalize.
 *.png binary
 *.ico binary

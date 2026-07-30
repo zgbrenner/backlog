@@ -76,6 +76,32 @@ Intake (SharePoint) --Flow 1--> Processing folder (OneDrive-synced)
 
 ## Setup
 
+### 0. Git hooks — do this before you write any code
+
+```
+pwsh scripts/install-hooks.ps1        # or: bash scripts/install-hooks.sh
+```
+
+Points this clone's `core.hooksPath` at the tracked `.githooks/` directory. It
+is one command, it is idempotent, and it is the only quality gate this
+repository has: `.github/workflows/ci.yml` has never been assigned a runner and
+will not be on this account (`docs/KNOWN_ISSUES.md` item 11), so nothing checks
+a commit or a push except the hooks on your own machine.
+
+- **pre-commit** — `cargo fmt --check` plus the five gates that only read files
+  (versions agree, troubleshooting coverage, button labels, CI parity, dev-stub
+  marker). About two seconds, deliberately: a pre-commit hook that takes minutes
+  gets bypassed with `--no-verify` and then guards nothing.
+- **pre-push** — the whole of `./scripts/ci-local.sh`, all five jobs, about three
+  minutes. This is the replacement for Actions, and the last point at which a
+  broken commit is still cheap.
+
+Both are skippable when you mean it — `BACKLOG_SKIP_HOOKS=1 git push`, or
+`git push --no-verify` — and each prints how when it fails. `.githooks/` is
+tracked, which is the whole reason for `core.hooksPath`: a symlink into
+`.git/hooks/` dies with the clone that made it, so the next clone would silently
+have no enforcement at all.
+
 ### 1. App
 
 ```
@@ -243,17 +269,20 @@ models/                 download script, lockfile, GBNF grammar copy
 training/               Ettin silver labeling + fine-tune (not shipped)
 power-automate/         Flow 1 and Flow 2 build sheets + manifest schemas
 scripts/                sidecar build, dev stubs, release binary verification,
-                        ci-local.sh (the five gates, and what actually runs them)
+                        ci-local.sh (the five gates, and what actually runs them),
+                        install-hooks (points core.hooksPath at .githooks/)
+.githooks/              tracked git hooks: pre-commit (fast subset, ~2s) and
+                        pre-push (all five gates) — the only enforcement there is
 .github/                the same five jobs as a workflow, for the day Actions works
 ```
 
 ## Tests
 
 `./scripts/ci-local.sh` runs everything below in one pass, on Linux, with no
-Windows, no sidecar binaries and no model weights. Run it before you push;
+Windows, no sidecar binaries and no model weights. `.githooks/pre-push` runs it
+for you on every push once you have done Setup step 0;
 `.github/workflows/ci.yml` describes the same five jobs but has never been
-assigned a runner, so nothing runs them for you (`docs/KNOWN_ISSUES.md` item
-11).
+assigned a runner, so nothing else runs them (`docs/KNOWN_ISSUES.md` item 11).
 
 ```
 cd src-tauri

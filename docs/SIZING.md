@@ -12,7 +12,8 @@ Reproduce any of it with the load harness described at the bottom.
 | Runs on 8 GB RAM, no dedicated GPU? | **Yes**, at `slm_parallel: 1`, which is now the automatic default on that machine. |
 | Runs on 8 GB with the shipped pre-0.4.0 defaults? | **No.** `slm_parallel: 4` puts the two model servers alone at 6,078 MB. |
 | A GPU helps? | Not used at all. `llama-server` is the CPU build; there is no CUDA/Vulkan path in this product. |
-| 1,000 tax PDFs/DOCX of 2–12 pages? | Completes, nothing is dropped. **~2.7 hours** measured on a 16-core desktop (see Throughput) — an 8 GB laptop with fewer cores will be slower. Treat it as an upper bound on speed, not a promise; still safe to leave running overnight. |
+| 1,000 tax PDFs/DOCX of 2–12 pages? | Completes, nothing is dropped. **~3.2 hours** measured on a 16-core desktop (see Throughput) — an 8 GB laptop with fewer cores will be slower. Treat it as an upper bound on speed, not a promise; an overnight run either way. |
+| Why 3.2 hours when 0.4.2 did it in 2.7? | 0.4.3 bought the party name in the filename — 38 of 40 correct against 18 — for 19% more wall clock. See Naming quality. |
 
 ## Memory
 
@@ -132,7 +133,7 @@ which is a function of RAM.
 
 Measured, `slm_parallel: 1`, `convert_workers: 1`, mixed synthetic tax corpus of
 2–12 page PDFs and DOCX, versions 0.4.0/0.4.1 — kept here to show the trend;
-superseded by the 0.4.2 numbers below:
+superseded by the version table below:
 
 | Batch | Model tiers | Wall clock | Per file | Named `ok` |
 |---|---|---|---|---|
@@ -148,7 +149,7 @@ escalation tier was the difference between the two ends: it more than tripled
 the auto-naming rate and cost about 43% more wall clock, because a document
 that escalated paid for three naming attempts instead of one.
 
-**0.4.2 is the current, authoritative measurement.** Same hardware, same
+**0.4.3 is the current, authoritative measurement.** Same hardware, same
 `slm_parallel: 1` and `convert_workers: 1`, both tiers live, over the
 40-document deliberately-hard stratified sample used throughout this doc (see
 Naming quality, honestly):
@@ -156,7 +157,19 @@ Naming quality, honestly):
 | Version | Documents | Wall clock | Per file | Named `ok` | Extrapolated to 1,000 files |
 |---|---|---|---|---|---|
 | 0.4.1 | 40 | 424 s | 10.6 s | 40/40 | 2.9 hours |
-| 0.4.2 | 40 | 383 s | 9.58 s | 40/40 | **2.7 hours** |
+| 0.4.2 | 40 | 383 s | 9.58 s | 40/40 | 2.7 hours |
+| 0.4.3 | 40 | 464 s | 11.61 s | 40/40 | **3.2 hours** |
+
+**0.4.3 costs 19% more wall clock, and the reason is the prompt, measured.** It
+bought the party name — 38 of 40 filenames name the right party against 18 — by
+widening the subject schema cap and prescribing the subject's shape.
+
+An intermediate version stated each subject prohibition as its own rule and cost
+**22.95 s/file, 6.4 hours per 1,000**, for 37 of 40 on the party and 39 of 40 named:
+twice the wall clock for slightly worse results. A system prompt is re-sent on every
+naming attempt and every escalation, so prompt length is a throughput decision here,
+not only a quality one. The shipped prompt is the shorter of the two and wins on
+party accuracy, naming rate and speed at once.
 
 Neither `slm_parallel` nor `convert_workers` moved from the earlier runs — both
 are still 1. **The step change belongs to 0.4.1, not 0.4.2**: fixing false
@@ -174,145 +187,135 @@ bound on speed, not a promise.
 
 ## Naming quality, honestly
 
-Measured on 0.4.2, `slm_parallel: 1`, `convert_workers: 1`, both tiers live:
-the 40-document deliberately hard stratified sample used throughout this doc —
-2–12 page PDFs and DOCX, weighted equally toward undated, ambiguous and
-deep-dated documents rather than the easier mostly-page-1 mix a random sample
-would give.
+Measured on 0.4.3, `slm_parallel: 1`, `convert_workers: 1`, both tiers live: the
+40-document deliberately hard stratified sample used throughout this doc — 2–12
+page PDFs and DOCX, weighted equally toward undated, ambiguous and deep-dated
+documents rather than the easier mostly-page-1 mix a random sample would give.
 
-**40 of 40 named `ok`. Zero flagged, zero quarantined** — reached in 0.4.1 by
-removing false rejections, and held here. Before that the majority of this
-sample was flagged. Neither release changed the models or the concurrency
-settings; see Throughput.
-
-**What 0.4.2 changed is where the date comes from, not how many files get
-named.** Both releases name 40 of 40. The difference is that 0.4.1 named more
-than half of them with the day the batch ran.
+**40 of 40 named `ok`. Zero flagged, zero quarantined**, held from 0.4.1 and 0.4.2.
 
 `date_source` across the 40:
 
-| `date_source` | count |
-|---|---|
-| `document` | 24 |
-| `metadata` | 16 |
+| `date_source` | 0.4.2 | 0.4.3 |
+|---|---|---|
+| `document` | 24 | **26** |
+| `metadata` | 16 | 14 |
 
 Fixture shape, taken from the corpus generator's own ground truth
-(`corpus_manifest.csv`'s `shape` column), against whether the file ended up
-named from a date belonging to the document:
+(`corpus_manifest.csv`'s `shape` column), against whether the file ended up named
+from a date belonging to the document:
 
-| Fixture shape | n | named from a document date |
-|---|---|---|
-| `dated_page1` — date printed on page 1 | 16 | **16 of 16** |
-| `dated_deep` — only date is on page 3 or later | 8 | 2 of 8 |
-| `ambiguous` — only date is ambiguous (`04/05/2023`) | 4 | 4 of 4 |
-| `sensitive` — carries an SSN or card number | 4 | 2 of 4, and the other 2 carry no date |
-| `undated` — no date-shaped text anywhere | 8 | 0 of 8, by design |
-| **total** | **40** | 24 |
-
-That accounts for all 40, and the 24 matches the `date_source: document` count
-above exactly.
-
-Two rows are correct outcomes rather than failures. The `undated` fixtures
-contain no date to find, so the file modified time is the right answer and they
-are named from it with `date_source: metadata`. Two of the four `sensitive`
-fixtures also have an empty `date_str` in the ground truth — they are undated
-too — so that row is really 2 of 2 where a date exists. Because the corpus was
-generated the same day it was measured, an mtime *is* the run date, which is why
-the run-date count below cannot fall below ten on this sample.
-
-**All six genuine misses are one cause, and it is measurable.** Every
-`dated_deep` document that failed has its date on page 4 to 7 of a 6- to 12-page
-file; both that succeeded have it on page 3 or earlier, inside the 6,000-character
-head window the harvest reads. Nothing about the two groups differs except
-whether the date falls inside that window:
-
-| `dated_deep` | date on page (0-based) | of pages | named from it |
+| Fixture shape | n | 0.4.2 | 0.4.3 |
 |---|---|---|---|
-| succeeded | 2, 3 | 8, 4 | yes |
-| failed | 3, 4, 5, 6, 7, 2 | 7, 10, 6, 8, 12, 9 | no |
+| `dated_page1` — date printed on page 1 | 16 | 16 of 16 | **16 of 16** |
+| `dated_deep` — only date is on page 3 or later | 8 | 2 of 8 | **4 of 8** |
+| `ambiguous` — only date is ambiguous (`04/05/2023`) | 4 | 4 of 4 | **4 of 4** |
+| `sensitive` — carries an SSN or card number | 4 | 2 of 4 | 2 of 4 |
+| `undated` — no date-shaped text anywhere | 8 | 0 of 8, by design | 0 of 8, by design |
+| **total** | **40** | 24 | **26** |
 
-(The one failure at page index 2 is in a 9-page file, whose earlier pages are
-long enough to push it past the window — position in characters is what matters,
-not page number.)
+Two rows are correct outcomes rather than failures. The `undated` fixtures contain
+no date to find, so the file modified time is the right answer and they are named
+from it with `date_source: metadata`. Two of the four `sensitive` fixtures also
+have an empty `date_str` in the ground truth — they are undated too — so that row
+is really 2 of 2 where a date exists. Because the corpus was generated the same day
+it was measured, an mtime *is* the run date, which is why the run-date count cannot
+fall below ten on this sample.
 
-Page 3+ dates are the remaining known limit: the text harvest only scans the
-first 6,000 and last 2,500 characters of a document, so a date sitting in the
-middle of a longer document is invisible to the preference logic. It is
-recorded as item 0c in `docs/KNOWN_ISSUES.md`.
+Date provenance across the three releases:
 
-Date provenance, before and after 0.4.2:
+| Metric | 0.4.1 | 0.4.2 | 0.4.3 |
+|---|---|---|---|
+| Named with the RUN date rather than the document's own | 37 of 40 | 16 of 40 | **14 of 40** |
+| Page-1 date correctly used | 2 of 16 | 16 of 16 | **16 of 16** |
+| `dated_deep` date correctly used | — | 2 of 8 | **4 of 8** |
 
-| Metric | Before 0.4.2 | 0.4.2 |
+**Ten of the fourteen run-dated files are fixtures with no date to find**, so the
+genuine remainder is **four documents that had a date and did not get it** — down
+from six in 0.4.2. All four are `dated_deep`, the harvest-window limit of item 0c.
+
+**"Named" is still not the same as "named well."** `SUBJECT_TRUNCATED` fired on
+**35 of 40**, up from 10, because the checker's word trim is now the thing doing the
+shortening instead of the schema severing the answer mid-word. That is the intended
+direction — a flagged trim at a word boundary beats a silent cut mid-word — but it
+means the model's raw subject needs repair on seven documents in eight, and the flag
+has stopped distinguishing anything. Recorded as item 0h: noise, not a defect in the
+names that ship.
+
+Soft-flag histogram (a document can carry more than one; a soft flag is a recorded
+note on a document that was still named, not a failure):
+
+| flag | 0.4.2 | 0.4.3 |
 |---|---|---|
-| Named from the RUN date (the day the batch ran), not a date belonging to the document | 37 of 40 | 16 of 40 |
-| Page-1 date correctly used | 2 of 16 | 16 of 16 |
+| SUBJECT_TRUNCATED | 10 | **35** |
+| DATE_SOURCE_CORRECTED | 15 | 12 |
+| DATE_PREFERRED_FROM_DOCUMENT | 21 | **9** |
+| DESCRIPTION_TRIMMED_TO_ONE_SENTENCE | 1 | 2 |
+| DATE_FROM_FILE_MTIME | 1 | 2 |
+| DATE_PROPOSAL_DISCARDED | 1 | 2 |
+| DATE_FROM_BODY | 0 | 2 |
+| SUBJECT_UNGROUNDED | 0 | 1 |
 
-**But "named" is not the same as "named well."** 16 of the 40 still carry the
-run date rather than a date belonging to the document. Ten of those sixteen are
-fixtures with no date to find, where that is the correct answer, so the real
-remainder is **six documents that had a date and did not get it** — all six the
-same harvest-window cause above. Much better than before, not solved.
+`DATE_PREFERRED_FROM_DOCUMENT` falling from 21 to 9 is the one to notice: the
+printed date is more often chosen outright, without the checker having to substitute
+it.
 
-A soft flag is also not nothing: `DATE_SOURCE_CORRECTED`
-fired on 15 of 40 and `SUBJECT_TRUNCATED` on 10 of 40, meaning the model's raw
-proposal needed the pipeline to catch and repair it on more than a third of
-documents. That is the system working as designed, not the model getting it
-right unassisted, and it is worth saying plainly rather than only citing the
-40/40 headline.
-
-Soft-flag histogram over the 40 (a document can carry more than one; a soft
-flag is a recorded note on a document that was still named, not a failure):
-
-| flag | count |
-|---|---|
-| DATE_PREFERRED_FROM_DOCUMENT | 21 |
-| DATE_SOURCE_CORRECTED | 15 |
-| SUBJECT_TRUNCATED | 10 |
-| DESCRIPTION_TRIMMED_TO_ONE_SENTENCE | 1 |
-| DATE_FROM_FILE_MTIME | 1 |
-| DATE_PROPOSAL_DISCARDED | 1 |
-
-A representative result: `2022-08-12 Return prepared and filed on 08 12 2022 -
-Nathaniel Okafor.pdf`.
+Representative results: `2022-08-12 Form 1120-S - Patrick Kowalski.pdf`,
+`2021-09-28 Form 1099-NEC - Ironwood & Vance Roofing - 2021 Tax Return.pdf`.
 
 ### Does the filename name the right party?
 
-The date work above is measured; the *party* had never been. It is half of what a
-filename is for, so here it is, scored against each document's own
-`Taxpayer / Entity:` line — read out of the document text, because the corpus
-generator draws the filename's party and the body's party independently and the
-original filename is therefore never evidence:
+The date work above is measured; the *party* had never been until 0.4.2 was
+already out. It is half of what a filename is for. Scored against each document's
+own `Taxpayer / Entity:` line — read out of the document text, because the corpus
+generator draws the filename's party and the body's party independently, so an
+original filename is never evidence:
 
-| Result | n | share |
+| Result | 0.4.2 | 0.4.3 |
 |---|---|---|
-| **EXACT** — the full party appears in the new filename | 18 | 45% |
-| **PARTIAL** — a correct prefix, cut short (`Ironwood & Vance` for `Ironwood & Vance Roofing`) | 8 | 20% |
-| **GARBLED** — characters altered, not merely cut | 2 | 5% |
-| **ABSENT** — no party in the filename at all | 12 | 30% |
+| **EXACT** — the full party appears in the new filename | 18 (45%) | **38 (95%)** |
+| **PARTIAL** — a correct prefix, cut short | 8 | **0** |
+| **GARBLED** — characters altered, not merely cut | 2 | **0** |
+| **ABSENT** — no party in the filename at all | 12 | **2** |
+| flagged, so never named | 0 | **0** |
 
-**The 30% with no party is the largest single naming defect in the product, and
-it is a budget problem rather than a reading problem.** The subject is capped at
-ten words, and a model that spends them on the form title —
-`Form 8829 - Expenses for Business Use of Your Home` is exactly ten — has none
-left for the party. The document was read correctly; the filename just does not
-say who it belongs to. The clear next lever is telling the prompt that the party
-outranks the form's full legal title, which is cheap to try and needs its own
-measured run.
+**What was actually wrong was not a word budget.** The first write-up of this
+called it one — ten words, spent on the form's legal title. The real cause was the
+naming schema's `maxLength: 64` on `subject`. llama.cpp enforces `maxLength` by
+refusing to emit another character, so it did not shorten the subject, it severed
+it: **18 of the 40 came back at exactly 64 characters**, mid-word, and none carried
+a flag because the word count was still under ten.
 
-**Neither garbled case carries any soft flag.** They are
-`Cross & Daughters Bakery` named `Cross & Daubs`, and `Whitmore & Associates`
-named `Whitmore &Associes` — character substitution by a 0.6B model, which is a
-failure mode no flag in the system currently detects. A third case is borderline:
-`Derrick Pena` became `Derrick Pén`, both cut for length *and* given an acute
-accent that appears nowhere in the source. Counted as PARTIAL above; call it
-GARBLED and the split is 7 PARTIAL / 3 GARBLED.
+```
+'Form 4562 - Depreciation and Amortization Return for Yolanda Bea'   (Beaumont)
+'Tax Return - Supplemental Income and Loss (Rental Real Estate) -'   (party was next)
+'S Corporation Tax Return for Whitmore & Associates - Internal 11'
+```
 
-**`SUBJECT_TRUNCATED` does not mean "the party was cut".** It fired on 2 of the 8
-PARTIAL cases and on 2 of the 18 EXACT ones. That is not a bug: it reports the
-ten-word subject cap, while a party cut short in the filename is `compose`
-trimming to `max_filename_len` — a different mechanism, and one that currently
-records nothing. A user seeing `Ironwood & Vance` has no indication a word was
-dropped.
+The cap is now 95 — the whole filename budget, `120 - 11 - 14`, with a test
+deriving it from those constants — and the prompt prescribes `<form> - <party>`
+using the short form identifier. The longest subject in the 0.4.3 run is 87
+characters and none sits at the cap, so nothing is being severed any more.
+
+**The date lane improved without being touched**, which was not predicted and is
+the most interesting number here:
+
+| | 0.4.2 | 0.4.3 |
+|---|---|---|
+| `dated_deep` named from its own date | 2 of 8 | **4 of 8** |
+| named with the run date | 16 of 40 | **14 of 40** |
+| `date_source: document` | 24 | **26** |
+| `DATE_PREFERRED_FROM_DOCUMENT` fired | 21 | **9** |
+
+Nothing in the date logic changed between those two runs. The most likely reading
+is that the evidence bundle always held the date and the model was the bottleneck:
+one not spending its output on a severed form title also picks the date better. It
+also means the harvest-window ceiling of `docs/KNOWN_ISSUES.md` item 0c is a smaller
+problem than 2-of-8 suggested — though the intermediate prompt reached 6 of 8, so
+how much of that ceiling is the window and how much is the model is still open.
+
+**Two parties are still absent**, and the fix cost 19% throughput — see the
+Throughput table.
 
 Run-to-run variance is worth knowing before reading too much into any single
 number here: the same 12 documents have produced 2, 4 and 7 successes across

@@ -50,6 +50,14 @@ it.
 - [ ] `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`
       declare the same version (`node .github/scripts/check-versions.mjs`), and
       `CHANGELOG.md` has a section for it.
+- [ ] **`src-tauri/Cargo.lock` records the new version too.** `check-versions.mjs`
+      does not look at it, so bumping the three files above leaves the lock behind
+      and every `--locked` cargo gate then fails with "cannot update the lock file
+      because --locked was passed" — four of the five jobs in
+      `scripts/ci-local.sh`, and not obviously a version problem from the message.
+      Fix with `cargo update --manifest-path src-tauri/Cargo.toml -p backlog
+      --offline`. The pre-push hook catches this; the pre-commit hook does not,
+      because it deliberately runs no cargo build.
 
 ## Offline model bundle
 

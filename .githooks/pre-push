@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Every gate, before anything leaves this machine. ~3 minutes.
+#
+# GitHub Actions has never executed for this repository (docs/KNOWN_ISSUES.md
+# item 11), so this hook is the replacement for it, not a supplement to it. It
+# runs scripts/ci-local.sh, which runs the same five jobs .github/workflows/ci.yml
+# declares — trust-core, workspace, frontend, python, version-drift — and exits
+# non-zero naming every gate that failed. This is the last point at which a
+# broken commit is still cheap.
+#
+# Side effect worth knowing about: ci-local.sh stages dev stub sidecars
+# (scripts/dev-stubs.sh), which creates src-tauri/binaries/_placeholder.dll when
+# it is absent. scripts/verify-binaries.ps1 refuses to package a release while a
+# marked stub is present, so delete that file before a release build.
+#
+# Bypass, when you mean it (pushing a WIP branch for someone to look at, or a
+# machine that cannot run the suite at all):
+#   BACKLOG_SKIP_HOOKS=1 git push ...
+#   git push --no-verify
+
+set -uo pipefail
+
+if [ "${BACKLOG_SKIP_HOOKS:-0}" != "0" ]; then
+  echo "pre-push: skipped (BACKLOG_SKIP_HOOKS=$BACKLOG_SKIP_HOOKS). Nothing checked this push."
+  exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+echo "pre-push: running every gate (scripts/ci-local.sh, ~3 min). BACKLOG_SKIP_HOOKS=1 skips."
+
+if ! bash scripts/ci-local.sh; then
+  cat <<'EOF' >&2
+
+pre-push: the gates above are what CI would have caught, if CI ran for this
+repository; it does not (docs/KNOWN_ISSUES.md item 11), so this hook is the
+only thing between a broken commit and the remote.
+
+Re-run one job while you fix it:
+  ./scripts/ci-local.sh trust-core     # or: workspace | frontend | python | version-drift
+
+Push anyway, on purpose:
+  BACKLOG_SKIP_HOOKS=1 git push ...
+  git push --no-verify
+EOF
+  exit 1
+fi
+
+# A repo-local core.hooksPath supersedes a global one, so any machine-wide hook
+# of this name stopped running here the moment install-hooks pointed git at
+# .githooks. Hand off to it rather than silently disabling it. No-op on a
+# machine with no global core.hooksPath, which is every fresh clone.
+global_hooks="$(git config --global --get core.hooksPath || true)"
+if [ -n "$global_hooks" ]; then
+  global_hook="$global_hooks/$(basename "$0")"
+  if [ -x "$global_hook" ] && ! [ "$global_hook" -ef "$0" ]; then
+    exec "$global_hook" "$@"
+  fi
+fi

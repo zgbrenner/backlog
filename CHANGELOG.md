@@ -15,6 +15,124 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.4.3] — the filename says whose document it is
+
+### A character cap cannot enforce a word count
+
+**Fixed — the naming schema's `maxLength: 64` on `subject` was severing the
+answer, not shortening it.** llama.cpp enforces `maxLength` by refusing to emit
+another character, so **18 of 40 subjects came back at exactly 64 characters**,
+mid-word, with no flag on any of them — the word count was still under ten, so the
+checker's trimmer never engaged:
+
+```
+'Form 4562 - Depreciation and Amortization Return for Yolanda Bea'   (Beaumont)
+'Tax Return - Supplemental Income and Loss (Rental Real Estate) -'   (party was next)
+'S Corporation Tax Return for Whitmore & Associates - Internal 11'
+```
+
+This is the same defect 0.4.1 fixed for `description` and introduced for `subject`
+in the same change, reasoning that "64 characters is about ten words of ordinary
+English". The schema counts characters; the rule is about words; the two do not
+substitute for one another.
+
+The cap is now **95**, which is not a judgement call but the whole filename budget:
+`compose` builds `"YYYY-MM-DD " + subject` and needs `FILENAME_TAIL_RESERVE` on
+top, so at `max_filename_len: 120` a 95-character subject never trips `TooLong`. A
+test derives that from the constants, so moving either side fails loudly instead of
+producing documents that quarantine on length.
+
+**Added — the naming prompt now prescribes the subject's shape**, `<form> -
+<party>`, with the short form identifier rather than the form's full legal title.
+`Form 8829 - Expenses for Business Use of Your Home` is exactly ten words on its
+own, so a model leading with the legal title had nothing left for the party even
+when the cap was not cutting it off.
+
+**Fixed — a subject that arrives already ending in a separator is tidied.** The
+word trim always cleaned its own cut, but a subject severed by the schema could
+ship as `"... (Rental Real Estate) -"`, pointing at a party that was never written.
+`sanitize_subject_inner` now strips a dangling tail from every model subject.
+Unflagged deliberately: it drops punctuation, never a word.
+
+### Measured, same 40 documents, same settings
+
+Scored against each document's own `Taxpayer / Entity:` line, because the corpus
+draws the filename's party and the body's party independently:
+
+| | 0.4.2 | 0.4.3 |
+|---|---|---|
+| party named **exactly** | 18 | **38** |
+| party cut short | 8 | **0** |
+| party garbled | 2 | **0** |
+| party absent entirely | 12 | **2** |
+| subjects at exactly the old 64-char cap | 18 | **0** (longest 87) |
+
+**The date lane improved without being touched**, which was not predicted:
+
+| | 0.4.2 | 0.4.3 |
+|---|---|---|
+| `dated_deep` named from its own date | 2 of 8 | **4 of 8** |
+| named with the run date | 16 of 40 | **14 of 40** |
+| `date_source: document` | 24 | **26** |
+| `DATE_PREFERRED_FROM_DOCUMENT` fired | 21 | **9** |
+
+No date logic changed between those runs. The likely reading is that the evidence
+always held the date and the model was the bottleneck: one not spending its output
+on a severed form title also picks the date better. Ten of the fourteen remaining
+run-dated files have no date to find, so the genuine misses are **four**, down from
+six — and the harvest-window ceiling of `KNOWN_ISSUES.md` item 0c is a smaller
+problem than 2-of-8 made it look.
+
+### What it cost, and the attempt that cost twice as much
+
+**Throughput fell 19% — 9.58 to 11.61 s/file, so 1,000 files goes from 2.7 to 3.2
+hours.** Naming stays at 40 of 40.
+
+The first version of this prompt stated each subject prohibition as its own rule,
+four bullets instead of two, and cost **22.95 s/file — 6.4 hours per 1,000** for 37
+of 40 on the party and 39 of 40 named. Twice the wall clock for slightly worse
+results: a system prompt is re-sent on every naming attempt and every escalation, so
+prompt length is a throughput decision here and not only a quality one.
+
+**How that was nearly got wrong is worth recording.** Read on its first ten
+documents, the four-bullet prompt looked clearly better and the short one looked
+broken — a repeated party, a leaked EIN, `"... - 2021 - 2021 - 2021"`. Scoring all
+40 reversed it: the degenerate cases were real but rare, and the party was still
+correct in them because the word trim removes the tail. The comment above the prompt
+now says to score the whole sample, because ten documents mislead on this corpus.
+
+Two things this leaves open, both recorded rather than rushed:
+`SUBJECT_TRUNCATED` now fires on 35 of 40 and has stopped distinguishing anything
+(item 0g), and the pipeline still records neither how many naming attempts a document
+took nor which tier answered — which is why settling the throughput question took
+three full runs instead of one (item 0h).
+
+### The gates now enforce themselves, locally
+
+GitHub Actions has never assigned a runner for this repository and never will on
+this account, so `scripts/ci-local.sh` was the only thing standing between a bad
+change and `origin` — and nothing invoked it. `.git/hooks/` held only the stock
+samples, despite a comment in that script suggesting a symlink since 0.3.0.
+
+- **`.githooks/pre-commit`** — `cargo fmt --check` plus the five file-reading node
+  gates. **2.2 seconds.** A commit hook that takes minutes gets bypassed and then
+  guards nothing, so what lives here is decided by the clock: everything that
+  compiles, bundles or launches a browser stays in pre-push.
+- **`.githooks/pre-push`** — the whole of `scripts/ci-local.sh`, ~190 s.
+- **`scripts/install-hooks.ps1` / `.sh`** — point `core.hooksPath` at `.githooks`
+  and then verify it: config value, hook presence, CRLF detection, `bash -n`, and a
+  warning when a hook is tracked as mode `100644`, which Linux and macOS clones
+  silently skip.
+- **Tracked, not symlinked into `.git/hooks`.** That directory is not version
+  controlled, so a link dies with the clone that made it and the next clone is
+  silently unenforced — the same failure as a CI file nobody can run.
+- **`.gitattributes` pins `.githooks/** text eol=lf`.** With `core.autocrlf=true`
+  set globally on a dev machine, CRLF hooks fail with `bad interpreter` and every
+  gate stops running.
+- Both hooks honour `BACKLOG_SKIP_HOOKS=1`, print how to bypass when they fail,
+  and hand off to a global `core.hooksPath` hook of the same name afterwards, so
+  installing these does not silently disable a machine-wide hook.
+
 ## [0.4.2] — a date on the page beats a date in the file's properties
 
 ### Filesystem timestamps are no longer evidence

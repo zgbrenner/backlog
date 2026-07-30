@@ -586,6 +586,28 @@ impl Checker {
             }
         }
 
+        // A dangling separator is stripped from every model subject, not only
+        // from one this function trimmed itself.
+        //
+        // `truncate_to_words` has always cleaned its own cut, but a subject can
+        // arrive already ending in one: the JSON schema's `maxLength` stops
+        // generation at a fixed character count, so
+        // `"Tax Return - Supplemental Income and Loss (Rental Real Estate) -"`
+        // shipped exactly like that, with the party it was about to name lost and
+        // the separator left pointing at nothing. Widening that cap makes this
+        // rarer, not impossible — the cap still exists — so the cleanup belongs
+        // here, where every subject passes, rather than only on the trim path.
+        //
+        // Unflagged on purpose: this drops punctuation, never a word, so there is
+        // nothing a reviewer would need to check. `SUBJECT_TRUNCATED` still marks
+        // the case where words were actually dropped.
+        if source == Source::Model {
+            let tidied = trim_dangling_tail(&s);
+            if !tidied.is_empty() {
+                s = tidied;
+            }
+        }
+
         // Generic check runs BEFORE the size gate. Behind it, every entry in
         // the list is short enough to die at the word count first, which is why
         // "Scanned Document 001" and "New Microsoft Word Document" sailed
@@ -779,8 +801,18 @@ fn truncate_to_words(s: &str, max: usize) -> String {
         }
     }
     // A cut mid-list leaves things like "Service, " or "Entity / " behind.
-    s[..cut]
-        .trim_end_matches(|c: char| is_sep(c) || matches!(c, ',' | ';' | ':' | '.' | '&' | '('))
+    trim_dangling_tail(&s[..cut])
+}
+
+/// Strip trailing punctuation that only makes sense if something followed it.
+///
+/// Shared by the word trim and by `sanitize_subject_inner`, because a subject can
+/// end this way for two unrelated reasons — this function's own cut, or the JSON
+/// schema stopping generation at a character count — and both leave a filename
+/// ending in a separator that points at nothing.
+fn trim_dangling_tail(s: &str) -> String {
+    let is_sep = |c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/';
+    s.trim_end_matches(|c: char| is_sep(c) || matches!(c, ',' | ';' | ':' | '.' | '&' | '('))
         .to_string()
 }
 
@@ -1845,6 +1877,82 @@ mod tests {
             !v.subject.ends_with(',') && !v.subject.ends_with('/'),
             "a cut must not leave a dangling separator: {:?}",
             v.subject
+        );
+    }
+
+    /// The JSON schema's `maxLength` stops generation at a character count, so a
+    /// subject can arrive already ending in a separator whose right-hand side was
+    /// never emitted. Measured on the 0.4.2 run, one document shipped as
+    /// `"Tax Return - Supplemental Income and Loss (Rental Real Estate) -"`.
+    /// The word trim cleans its own cut; this covers the one it did not make.
+    #[test]
+    fn a_subject_that_arrives_ending_in_a_separator_is_tidied() {
+        let c = Checker::new(200);
+        for raw in [
+            "Tax Return - Supplemental Income and Loss (Rental Real Estate) -",
+            "Form 1099-MISC - Kessler & Sons Contracting -",
+            "Schedule E for Patrick Chen &",
+            "Form 4562 Depreciation,",
+        ] {
+            let mut out = ok_out();
+            out.subject = raw.into();
+            let v = c
+                .check(
+                    &out,
+                    &harvest_with(&["2026-07-20"]),
+                    &[],
+                    "2026-07-21",
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("{raw:?} must still be nameable, got {e:?}"));
+            let last = v.subject.chars().last().expect("non-empty");
+            assert!(
+                last.is_alphanumeric() || last == ')',
+                "subject must not end pointing at nothing: {:?} (from {raw:?})",
+                v.subject
+            );
+            // A tidy-up drops punctuation, never a word, so it stays unflagged.
+            assert!(
+                !v.soft_flags.contains(&"SUBJECT_TRUNCATED".to_string()),
+                "no words were dropped, so nothing to flag: {:?}",
+                v.soft_flags
+            );
+        }
+    }
+
+    /// A person who types a trailing separator in the review pane gets it back
+    /// verbatim; the tidy-up is a repair for model output only.
+    #[test]
+    fn a_human_subject_is_not_tidied() {
+        let c = Checker::new(200);
+        let mut out = ok_out();
+        out.subject = "Estate of A. Whitfield -".into();
+        let v = c
+            .check_human(
+                &out,
+                &harvest_with(&["2026-07-20"]),
+                &[],
+                "2026-07-21",
+                None,
+            )
+            .expect("a human subject is honored");
+        assert_eq!(v.subject, "Estate of A. Whitfield -");
+    }
+
+    /// The schema cap and the filename budget are one decision: a subject at the
+    /// cap must still compose without tripping `TooLong`. `slm.rs` sets 95 from
+    /// this arithmetic, so if either side moves, this fails rather than producing
+    /// documents that quarantine on length.
+    #[test]
+    fn the_schema_subject_cap_still_composes_at_the_filename_budget() {
+        const SCHEMA_SUBJECT_MAX: usize = 95; // slm.rs naming_schema()
+        const DATE_PREFIX: usize = 11; // "YYYY-MM-DD "
+        let c = Checker::new(120); // config.rs default max_filename_len
+        assert!(
+            DATE_PREFIX + SCHEMA_SUBJECT_MAX + FILENAME_TAIL_RESERVE <= c.max_filename_len,
+            "a subject at the schema cap ({SCHEMA_SUBJECT_MAX}) plus the date prefix and \
+             the collision reserve ({FILENAME_TAIL_RESERVE}) must fit in {}",
+            c.max_filename_len
         );
     }
 
