@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # The fast gates, on every commit. Currently ~1.5s.
 #
-# GitHub Actions has never executed for this repository: every run dies in
-# seconds with no runner assigned, because the account's allowance for this
-# private repo is spent (docs/KNOWN_ISSUES.md item 11). Nothing enforces
+# GitHub Actions runs for this repository and costs nothing (it is public), but
+# one of its five jobs can never pass and the workflows are disabled for that
+# reason (docs/KNOWN_ISSUES.md item 11). Nothing enforces
 # .github/workflows/ci.yml, so these hooks are the enforcement. Install once:
 #   pwsh scripts/install-hooks.ps1      # or: bash scripts/install-hooks.sh
 #

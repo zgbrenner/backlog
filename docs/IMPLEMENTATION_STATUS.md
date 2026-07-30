@@ -71,7 +71,9 @@ and the independent reproducibility contribution.
 `./scripts/ci-local.sh` runs all of this in one pass, with no Windows, no
 sidecar binaries and no model weights, and is the copy that actually enforces
 anything: `.github/workflows/ci.yml` lists the same five jobs on ubuntu-latest
-but has never been assigned a runner (`docs/KNOWN_ISSUES.md` item 11). Fresh
+and does execute — the repository is public, so runs are unmetered — but its
+`Workspace (app crate)` job cannot pass without the model weights, and the
+workflows are disabled for that reason (`docs/KNOWN_ISSUES.md` item 11). Fresh
 counts from the current tree:
 
 | Check | Result |

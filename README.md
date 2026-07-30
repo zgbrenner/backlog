@@ -84,9 +84,13 @@ pwsh scripts/install-hooks.ps1        # or: bash scripts/install-hooks.sh
 
 Points this clone's `core.hooksPath` at the tracked `.githooks/` directory. It
 is one command, it is idempotent, and it is the only quality gate this
-repository has: `.github/workflows/ci.yml` has never been assigned a runner and
-will not be on this account (`docs/KNOWN_ISSUES.md` item 11), so nothing checks
-a commit or a push except the hooks on your own machine.
+repository has. `.github/workflows/ci.yml` does run — the repository is public,
+so Actions is unmetered and costs nothing — but it cannot be the authority:
+`Workspace (app crate)` fails on every runner because `tauri-build` resolves
+`bundle.resources` and `resources/models/*.gguf` matches nothing without the
+2.4 GB of weights, which are correctly not committed. The workflows are disabled
+at the repository level for that reason (`docs/KNOWN_ISSUES.md` item 11), so
+nothing checks a commit or a push except the hooks on your own machine.
 
 - **pre-commit** — `cargo fmt --check` plus the five gates that only read files
   (versions agree, troubleshooting coverage, button labels, CI parity, dev-stub
