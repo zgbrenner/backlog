@@ -16,7 +16,7 @@ evidence attached to the release record.
 - [ ] `npm run check` and `npm run harness:shots` pass under Node 22, with no
       browser console error.
 - [ ] Rust format, clippy, and all workspace tests pass with
-      `src-tauri/Cargo.lock` and Rust 1.94.
+      `src-tauri/Cargo.lock` and Rust 1.94.1.
 - [ ] Sidecar/model unit tests pass with Python 3.11:
 
   ```bash

@@ -3,6 +3,6 @@
 # Linux CI runner, on the Windows release machine, and on a contributor's box.
 # rustfmt and clippy are named explicitly because a minimal rustup profile
 # ships neither, and a missing component turns a hard gate into a skipped one.
-channel = "1.94"
+channel = "1.94.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   validateBuildDependencyLock,
   validateReleaseWorkflow,
+  validateRustToolchain,
 } from "./validate-release-workflow.mjs";
 
 const validWorkflow = `
@@ -332,4 +333,12 @@ test("a missing or non-exact build helper is rejected", () => {
   assert.match(problems, /missing pefile/);
   assert.match(problems, /not exactly pinned: setuptools>=83/);
   assert.match(problems, /missing setuptools/);
+});
+
+test("the Rust compiler is pinned through the patch version", () => {
+  assert.deepEqual(validateRustToolchain('channel = "1.94.1"'), []);
+  assert.match(
+    validateRustToolchain('channel = "1.94"').join("\n"),
+    /major\.minor\.patch/,
+  );
 });
