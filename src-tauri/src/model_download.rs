@@ -172,22 +172,31 @@ struct DownloadTarget {
     size_hint: u64,
 }
 
-/// Maps every [`MODEL_FILES`] entry onto a concrete destination: the two
-/// GGUFs go wherever the running config's `slm_primary_gguf` /
-/// `slm_escalation_gguf` currently resolve to (so a user's custom Settings
-/// path is honored), everything else goes under `<models_dir>/<target>`.
+/// Maps every [`MODEL_FILES`] entry onto a concrete destination: distinct
+/// configured GGUF paths are honored, while a legacy/collapsed pair is
+/// separated into the canonical filenames under `models_dir` so one download
+/// can never overwrite the other.
 fn download_targets(
     models_dir: &Path,
     primary_gguf: &Path,
     escalation_gguf: &Path,
 ) -> Vec<DownloadTarget> {
+    let destinations_collide = primary_gguf == escalation_gguf;
     MODEL_FILES
         .iter()
         .map(|f| {
             let dest = if f.target == PRIMARY_GGUF_NAME {
-                primary_gguf.to_path_buf()
+                if destinations_collide {
+                    models_dir.join(PRIMARY_GGUF_NAME)
+                } else {
+                    primary_gguf.to_path_buf()
+                }
             } else if f.target == ESCALATION_GGUF_NAME {
-                escalation_gguf.to_path_buf()
+                if destinations_collide {
+                    models_dir.join(ESCALATION_GGUF_NAME)
+                } else {
+                    escalation_gguf.to_path_buf()
+                }
             } else {
                 models_dir.join(f.target)
             };
@@ -745,9 +754,17 @@ pub async fn download_models(
             finished_at: chrono::Utc::now().to_rfc3339(),
         },
     );
+    download_command_result(outcome)
+}
+
+/// Tauri treats `Err` as a failed command and presents its generic command
+/// error path. An operator cancellation is already represented by the
+/// structured terminal event/status above, so it completes the command
+/// cleanly while preserving real failures as errors.
+fn download_command_result(outcome: Result<(), DownloadError>) -> Result<(), String> {
     match outcome {
         Ok(()) => Ok(()),
-        Err(DownloadError::Cancelled) => Err("Download cancelled.".to_string()),
+        Err(DownloadError::Cancelled) => Ok(()),
         Err(DownloadError::Failed(message)) => Err(message),
     }
 }
@@ -1070,6 +1087,26 @@ mod tests {
     }
 
     #[test]
+    fn download_targets_separate_colliding_model_destinations() {
+        let models_dir = Path::new("/app-data/models");
+        let shared = Path::new("/custom/primary.gguf");
+        let targets = download_targets(models_dir, shared, shared);
+
+        let primary = targets
+            .iter()
+            .find(|target| target.key == PRIMARY_GGUF_NAME)
+            .unwrap();
+        let escalation = targets
+            .iter()
+            .find(|target| target.key == ESCALATION_GGUF_NAME)
+            .unwrap();
+
+        assert_ne!(primary.dest, escalation.dest);
+        assert_eq!(primary.dest, models_dir.join("Qwen3-0.6B-Q8_0.gguf"));
+        assert_eq!(escalation.dest, models_dir.join("Qwen3-1.7B-Q8_0.gguf"));
+    }
+
+    #[test]
     fn download_targets_covers_every_spec_entry_exactly_once() {
         let targets = download_targets(Path::new("/m"), Path::new("/p.gguf"), Path::new("/e.gguf"));
         assert_eq!(targets.len(), MODEL_FILES.len());
@@ -1261,6 +1298,11 @@ mod tests {
             part_path_for(&dest).exists(),
             "the partial must survive so the next attempt can resume it"
         );
+    }
+
+    #[test]
+    fn an_operator_cancel_is_a_clean_command_outcome() {
+        assert!(download_command_result(Err(DownloadError::Cancelled)).is_ok());
     }
 
     /// The old trust-on-first-use path recorded whatever was already sitting

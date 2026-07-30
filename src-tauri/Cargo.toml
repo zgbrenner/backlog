@@ -1,6 +1,6 @@
 [package]
 name = "backlog"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2021"
 description = "Local document naming and indexing pipeline"
 
@@ -52,6 +52,12 @@ env_logger = "0.11"
 # (compiled as part of the normal lib target) needs it for its
 # writable-directory probe tests.
 tempfile = "3"
+
+[dev-dependencies]
+# The release-only example verifies the updater artifact with exactly the same
+# zero-dependency Minisign implementation already resolved by the updater
+# plugin. It is an independent publication gate, not app runtime code.
+minisign-verify = "=0.2.5"
 
 # DPAPI (CryptProtectData/CryptUnprotectData) protects the SQLCipher key at
 # rest — see dbkey.rs. Windows-only on purpose: gating it here (rather than

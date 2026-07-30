@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -74,6 +75,10 @@ pub struct SlmLane {
     /// it the naming lane is an unauthenticated inference endpoint on
     /// loopback that any local process can post harvested document text to.
     api_key: String,
+    /// Once set, no request may create another child. Tauri exits through
+    /// `std::process::exit`, so relying on Drop alone can otherwise leave a
+    /// request racing the exit path and respawning a multi-GB model server.
+    shutting_down: AtomicBool,
     primary: Mutex<Option<Server>>,
     escalation: Mutex<Option<Server>>,
     http: reqwest::Client,
@@ -131,6 +136,7 @@ impl SlmLane {
             primary_port: base_port,
             escalation_port: base_port + 1,
             api_key: hex::encode(token),
+            shutting_down: AtomicBool::new(false),
             primary: Mutex::new(None),
             escalation: Mutex::new(None),
             http: reqwest::Client::builder()
@@ -194,6 +200,10 @@ impl SlmLane {
     /// by a message that named the port and nothing else — and every later
     /// call paid the same 60 seconds against the same dead child forever.
     async fn ensure_up(&self, tier: Tier) -> anyhow::Result<u16> {
+        anyhow::ensure!(
+            !self.shutting_down.load(Ordering::SeqCst),
+            "llama-server is shutting down"
+        );
         // When both tiers name the same weights, escalation is a second pass
         // over a wider evidence bundle rather than a bigger model, so it runs
         // on the server that is already up. Standing a second llama-server on a
@@ -214,6 +224,10 @@ impl SlmLane {
         };
         let port = {
             let mut guard = slot.lock().unwrap();
+            anyhow::ensure!(
+                !self.shutting_down.load(Ordering::SeqCst),
+                "llama-server is shutting down"
+            );
             let live = match guard.as_mut() {
                 Some(server) => match server.child.try_wait() {
                     Ok(None) => Some(server.port),
@@ -237,6 +251,10 @@ impl SlmLane {
         let health_url = format!("http://127.0.0.1:{port}/health");
         let deadline = Instant::now() + HEALTH_TIMEOUT;
         loop {
+            if self.shutting_down.load(Ordering::SeqCst) {
+                *slot.lock().unwrap() = None;
+                anyhow::bail!("llama-server is shutting down");
+            }
             if let Some(exit) = self.child_exit(slot)? {
                 *slot.lock().unwrap() = None;
                 anyhow::bail!(
@@ -493,17 +511,53 @@ impl SlmLane {
             drop(slot.lock().unwrap_or_else(|e| e.into_inner()).take());
         }
     }
+
+    /// Permanently stop this lane for the lifetime of the process.
+    ///
+    /// The latch is set before either slot is taken so an in-flight request
+    /// that reaches `ensure_up` after shutdown began fails closed instead of
+    /// replacing the child that the exit path just killed.
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        self.shutdown();
+    }
+
+    #[cfg(test)]
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for SlmLane {
     fn drop(&mut self) {
-        self.shutdown();
+        self.begin_shutdown();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_latch_prevents_a_server_respawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let lane = SlmLane::new(
+            dir.path().join("missing-llama-server"),
+            String::new(),
+            dir.path().join("missing-primary.gguf"),
+            dir.path().join("missing-escalation.gguf"),
+            28_137,
+            1,
+        );
+
+        lane.begin_shutdown();
+        assert!(lane.is_shutting_down());
+        let error = lane.ensure_up(Tier::Primary).await.unwrap_err();
+        assert!(
+            error.to_string().contains("shutting down"),
+            "shutdown must fail before inspecting or spawning any binary: {error}"
+        );
+    }
 
     #[test]
     fn request_uses_chat_template_and_schema_without_raw_prompt() {

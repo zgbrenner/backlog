@@ -427,6 +427,21 @@ impl Ledger {
         Ok(state.map(|s| JobState::parse(&s).unwrap_or(JobState::Flagged)))
     }
 
+    /// Jobs whose durable outcome may still need to be reconciled.
+    ///
+    /// `Flagged` is intentionally included: a corrected or dismissed manifest
+    /// can become durable immediately before the process dies while the ledger
+    /// still says the document awaits review.
+    pub fn unresolved_jobs(&self) -> anyhow::Result<Vec<Job>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM jobs WHERE state NOT IN ('emitted', 'dismissed')
+             ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_job)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     fn get_inner(conn: &Connection, sha256: &str) -> anyhow::Result<Option<Job>> {
         let job = conn
             .query_row(
@@ -493,6 +508,20 @@ impl Ledger {
             params![sha256],
         )?;
         Ok(())
+    }
+
+    /// Release work owned by this process before it exits, or work left by a
+    /// process that did not reach its shutdown path.
+    ///
+    /// BackLog is a single-user tray appliance and rebuilds its active work
+    /// set from Processing on startup. Keeping claims across process lifetimes
+    /// adds no safety: it only hides documents until the stale timeout expires.
+    pub fn release_all_claims(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE jobs SET claimed_at=NULL WHERE claimed_at IS NOT NULL",
+            [],
+        )?)
     }
 
     /// Record that a claim was taken while the job sat at `stage`, and return
@@ -1097,6 +1126,23 @@ mod tests {
     fn try_claim_on_an_unknown_job_is_false_not_an_error() {
         let (_dir, ledger) = ledger();
         assert!(!ledger.try_claim("nope", 600).unwrap());
+    }
+
+    /// A controlled shutdown and the next startup must not inherit the
+    /// wall-clock stale timeout of work owned by the process that just ended.
+    #[test]
+    fn releases_every_session_claim() {
+        let (_dir, ledger) = ledger();
+        seed(&ledger, "first");
+        seed(&ledger, "second");
+        assert!(ledger.try_claim("first", 3_600).unwrap());
+        assert!(ledger.try_claim("second", 3_600).unwrap());
+
+        assert_eq!(ledger.release_all_claims().unwrap(), 2);
+        assert!(ledger.try_claim("first", 3_600).unwrap());
+        assert!(ledger.try_claim("second", 3_600).unwrap());
+        assert_eq!(ledger.release_all_claims().unwrap(), 2);
+        assert_eq!(ledger.release_all_claims().unwrap(), 0);
     }
 
     // ---- state machine ----------------------------------------------------

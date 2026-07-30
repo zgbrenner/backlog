@@ -62,7 +62,7 @@ of the same rules.
 |---|---|
 | `BAD_DATE` | The date is not a date that exists on the calendar (`2024-02-31`). **Type the date printed on the document.** |
 | `DATE_OUT_OF_RANGE` | The date is before 1800 or more than about 13 months in the future — almost always a misread scan. **Type the date printed on the document.** |
-| `DATE_NOT_IN_EVIDENCE` | BackLog will not put a date on a file unless it can point at that exact date in the document text or in the file's own properties. It could not. This is the anti-hallucination rule. **Open the document, find the date printed on it, and type that.** If the document genuinely has no date, leave the date blank and BackLog will use the file's modified date, labelled honestly. |
+| `DATE_NOT_IN_EVIDENCE` | BackLog will not put a date on a file unless it can point at that exact date in the document text or in the file's own properties. It could not. This is the anti-hallucination rule. **Open the document, find the date printed on it, and type that.** If the document genuinely has no date, keep the file-modified date BackLog prefilled. If the field is unexpectedly blank, open the original file's **Properties** in File Explorer and enter its **Modified** date before filing. |
 | `BAD_DATE_SOURCE` | BackLog could not record where the date came from. Every date has to be traceable to the document or the file's properties. **Type the date printed on the document.** |
 | `BAD_SUBJECT` | The subject was empty, too short, too long, generic (`Scanned Document`, `New Microsoft Word Document`), contained characters SharePoint forbids, or looked like an identifier rather than a description. **Write a short subject: what this document is, in two to ten words.** |
 | `BAD_DESCRIPTION` | The description was too short, too long, more than one sentence, or just repeated the subject. **Write one sentence saying what this document is and who it is from.** |
@@ -96,9 +96,10 @@ These do not stop anything. They ride along on the manifest and land in the
 ## 4. Readiness problems (Settings → Readiness)
 
 These are about this computer, not about a document. BackLog will not start
-until every one of them is clear — deliberately, so a half-set-up machine
-cannot start a batch that would fail on the first file. Each row in the app
-carries the plain sentence; the code below is what a support call needs.
+until every required problem is clear, so a half-set-up machine cannot start a
+batch that would fail on the first file. A row explicitly marked as a warning
+does not block Start. Each row in the app carries the plain sentence; the code
+below is what a support call needs.
 
 | What BackLog says (code) | What it means, and what to do |
 |---|---|
@@ -108,7 +109,8 @@ carries the plain sentence; the code below is what a support call needs.
 | `processing_missing` | The Processing folder is not there. Usually a renamed OneDrive folder or a drive that is not connected. **Press Create this folder for me if BackLog offers it, or Browse to the right folder.** |
 | `processing_unreadable` | The folder exists but Windows would not let BackLog list it. **Ask IT to check the folder's permissions.** |
 | `outbox_not_writable` / `quarantine_not_writable` / `cache_not_writable` | BackLog could not create a test file in that folder — no permission, a full disk, or a OneDrive folder that is still syncing. **Check the folder opens in Explorer and that the disk is not full.** |
-| `models_missing` | The two model files BackLog uses to suggest names are not on this computer yet. **Press Download the model files. It is a one-time download of about 2.4 GB.** No account is needed. |
+| `models_missing` | The everyday 0.6B naming model is missing. A normal v0.5.0 installer includes it. **Press the download action BackLog shows, or reinstall v0.5.0 if the bundled model was removed.** If the optional backup model is also absent, the combined download is about 2.4 GB; otherwise BackLog downloads only the everyday model, about 0.6 GB. No account is needed. |
+| `escalation_model_missing_using_primary` (warning) | The optional 1.7B backup model is not installed. **Nothing is broken: BackLog is ready and safely reuses the everyday model for difficult naming attempts.** If you want the larger backup model and have about 1.8 GB of disk space, press **Download optional backup model**. The transfer can be cancelled and resumed. |
 | `install_dir_unknown` | BackLog cannot work out where it is installed, so it cannot start its own parts. **Reinstall BackLog.** |
 | `sidecar_not_found` | The part of BackLog that reads documents is missing from the installation. **Reinstall BackLog.** |
 | `llama_server_not_found` | The part of BackLog that suggests names is missing. **Reinstall BackLog.** |

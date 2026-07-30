@@ -12,10 +12,12 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -36,6 +38,51 @@ const MAX_STDERR_LINE_BYTES: usize = 16 * 1024;
 /// out of the rotating log within minutes. Startup output arrives first, so a
 /// per-process cap keeps exactly the part that explains a failure.
 const MAX_LOGGED_STDERR_LINES: usize = 2000;
+
+#[cfg(not(windows))]
+fn terminate_pid(pid: u32) -> bool {
+    const SIGKILL: i32 = 9;
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // SAFETY: the PID remains registered and therefore unreaped while the
+    // registry lock is held by the caller; it cannot have been recycled.
+    unsafe { kill(pid as i32, SIGKILL) == 0 }
+}
+
+#[cfg(windows)]
+fn terminate_pid(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> isize;
+        fn TerminateProcess(process: isize, exit_code: u32) -> i32;
+        fn WaitForSingleObject(object: isize, milliseconds: u32) -> u32;
+        fn CloseHandle(object: isize) -> i32;
+    }
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
+    // SAFETY: `pid` remains registered and unreaped while the caller holds the
+    // registry lock. The returned handle is checked before use and closed.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid) };
+    if handle == 0 {
+        return false;
+    }
+    let initial = unsafe { WaitForSingleObject(handle, 0) };
+    let stopped = if initial == WAIT_OBJECT_0 {
+        // It exited before shutdown acquired the handle but has not yet been
+        // reaped by its checkout. That is already a successful outcome.
+        true
+    } else if initial == WAIT_TIMEOUT {
+        (unsafe { TerminateProcess(handle, 1) }) != 0
+            && unsafe { WaitForSingleObject(handle, 5_000) } == WAIT_OBJECT_0
+    } else {
+        false
+    };
+    let _ = unsafe { CloseHandle(handle) };
+    stopped
+}
 
 /// Outcome of one [`read_line_bounded`] call.
 pub enum LineRead {
@@ -196,8 +243,8 @@ pub struct Sidecar {
     ///
     /// A checked-out worker is *absent* from `idle` and owned by the caller for
     /// the round trip, which is what makes a failed worker easy to retire: the
-    /// caller simply never returns it, `Proc::drop` kills the child, and `live`
-    /// drops so the next checkout spawns a replacement.
+    /// caller simply retires it, the tracked child is killed, and `live` drops
+    /// so the next checkout spawns a replacement.
     pool: Mutex<PoolState>,
     /// Signalled whenever a worker is returned or retired. A free-list with a
     /// condvar rather than one mutex per slot: with per-slot mutexes a caller
@@ -206,6 +253,13 @@ pub struct Sidecar {
     available: Condvar,
     max_workers: usize,
     counter: std::sync::atomic::AtomicU64,
+    /// Permanent latch set before app exit starts tearing down process-owned
+    /// state. Tauri exits with `process::exit`, so destructors are not a
+    /// lifecycle guarantee.
+    shutting_down: AtomicBool,
+    /// Every spawned child remains registered until it has been reaped. The
+    /// registry closes both spawn-vs-shutdown and PID-reuse races.
+    children: Arc<Mutex<HashSet<u32>>>,
     pub timeout: Duration,
 }
 
@@ -219,21 +273,44 @@ struct PoolState {
     live: usize,
 }
 
-struct Proc {
+struct TrackedChild {
     child: Child,
+    pid: u32,
+    children: Arc<Mutex<HashSet<u32>>>,
+}
+
+impl TrackedChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        // Reaping and unregistering are one critical section. Otherwise
+        // shutdown could snapshot this PID after `try_wait` reaped it and
+        // accidentally signal a new process that reused the number.
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            children.remove(&self.pid);
+        }
+        Ok(status)
+    }
+}
+
+impl Drop for TrackedChild {
+    fn drop(&mut self) {
+        // Keep the PID registered until the child is reaped. `begin_shutdown`
+        // holds the same lock while signalling its snapshot, so the OS cannot
+        // recycle a tracked PID between the snapshot and termination.
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        children.remove(&self.pid);
+    }
+}
+
+struct Proc {
+    child: TrackedChild,
     stdin: ChildStdin,
     rx: Receiver<std::io::Result<String>>,
     _reader: JoinHandle<()>,
     _stderr: JoinHandle<()>,
-}
-
-impl Drop for Proc {
-    fn drop(&mut self) {
-        // Never orphan a sidecar process — on replace, timeout, or app exit.
-        // Killing the child closes its stdout, which ends the reader thread.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Sidecar {
@@ -258,6 +335,8 @@ impl Sidecar {
             // long-lived pipeline sidecar pools.
             max_workers: 1,
             counter: std::sync::atomic::AtomicU64::new(1),
+            shutting_down: AtomicBool::new(false),
+            children: Arc::new(Mutex::new(HashSet::new())),
             timeout,
         }
     }
@@ -291,6 +370,9 @@ impl Sidecar {
     fn checkout(&self) -> anyhow::Result<Checkout<'_>> {
         let mut state = self.lock_pool();
         loop {
+            if self.shutting_down.load(Ordering::Acquire) {
+                anyhow::bail!("document processing is shutting down");
+            }
             if let Some(proc) = state.idle.pop() {
                 return Ok(Checkout {
                     sidecar: self,
@@ -303,10 +385,16 @@ impl Sidecar {
                 state.live += 1;
                 drop(state);
                 return match self.spawn() {
-                    Ok(proc) => Ok(Checkout {
+                    Ok(proc) if !self.shutting_down.load(Ordering::Acquire) => Ok(Checkout {
                         sidecar: self,
                         proc: Some(proc),
                     }),
+                    Ok(proc) => {
+                        drop(proc);
+                        self.lock_pool().live -= 1;
+                        self.available.notify_all();
+                        anyhow::bail!("document processing is shutting down");
+                    }
                     Err(e) => {
                         // Give the reservation back, or the pool shrinks by one
                         // every time a spawn fails and eventually serves nobody.
@@ -346,8 +434,8 @@ impl Checkout<'_> {
     }
 
     /// Discard this worker instead of returning it: wedged, dead, or out of sync
-    /// with its own response stream. `Proc::drop` kills the child; the next
-    /// checkout spawns a clean replacement.
+    /// with its own response stream. Dropping its tracked child kills it; the
+    /// next checkout spawns a clean replacement.
     fn retire(&mut self) {
         self.proc = None;
     }
@@ -355,18 +443,69 @@ impl Checkout<'_> {
 
 impl Drop for Checkout<'_> {
     fn drop(&mut self) {
-        {
+        let retire = {
             let mut state = self.sidecar.lock_pool();
             match self.proc.take() {
-                Some(proc) => state.idle.push(proc),
-                None => state.live -= 1,
+                Some(proc) if !self.sidecar.shutting_down.load(Ordering::Acquire) => {
+                    state.idle.push(proc);
+                    None
+                }
+                Some(proc) => {
+                    state.live -= 1;
+                    Some(proc)
+                }
+                None => {
+                    state.live -= 1;
+                    None
+                }
             }
-        }
-        self.sidecar.available.notify_one();
+        };
+        // Reaping takes the child-registry lock. Do it outside the pool lock so
+        // shutdown and a simultaneous check-in cannot deadlock each other.
+        drop(retire);
+        self.sidecar.available.notify_all();
     }
 }
 
 impl Sidecar {
+    /// Permanently stop admitting work and terminate every spawned converter.
+    ///
+    /// This is explicit because Tauri's exit path calls `process::exit`, which
+    /// skips Rust destructors. It is safe to call more than once.
+    pub fn begin_shutdown(&self) -> usize {
+        self.shutting_down.store(true, Ordering::Release);
+        self.available.notify_all();
+
+        // Idle workers can be reaped synchronously because nobody owns them.
+        // Checked-out workers retain their slot until their Checkout drops, but
+        // are signalled below so blocked pipe reads wake promptly.
+        let idle = {
+            let mut state = self.lock_pool();
+            let idle = std::mem::take(&mut state.idle);
+            state.live = state.live.saturating_sub(idle.len());
+            idle
+        };
+        drop(idle);
+
+        let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let mut failures = 0usize;
+        for &pid in children.iter() {
+            if !terminate_pid(pid) {
+                failures += 1;
+                log::error!("could not terminate convertd process {pid} during shutdown");
+            }
+        }
+        failures
+    }
+
+    #[cfg(test)]
+    fn tracked_children(&self) -> HashSet<u32> {
+        self.children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Sets the models directory injected into every spawned process as
     /// `BACKLOG_MODELS_DIR`. Builder-style so existing call sites (and the
     /// unix-only tests below, which never load a real model) are unaffected
@@ -377,6 +516,9 @@ impl Sidecar {
     }
 
     fn spawn(&self) -> anyhow::Result<Proc> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("document processing is shutting down");
+        }
         let mut cmd = Command::new(&self.exe);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -391,16 +533,34 @@ impl Sidecar {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        let mut child = cmd.spawn()?;
+        let mut raw_child = cmd.spawn()?;
+        let pid = raw_child.id();
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        if self.shutting_down.load(Ordering::Acquire) {
+            drop(children);
+            let _ = raw_child.kill();
+            let _ = raw_child.wait();
+            anyhow::bail!("document processing is shutting down");
+        }
+        children.insert(pid);
+        drop(children);
+        let mut child = TrackedChild {
+            child: raw_child,
+            pid,
+            children: self.children.clone(),
+        };
         let stdin = child
+            .child
             .stdin
             .take()
             .ok_or_else(|| anyhow::anyhow!("no sidecar stdin"))?;
         let stdout = child
+            .child
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("no sidecar stdout"))?;
         let stderr = child
+            .child
             .stderr
             .take()
             .ok_or_else(|| anyhow::anyhow!("no sidecar stderr"))?;
@@ -438,13 +598,18 @@ impl Sidecar {
                     }
                 }
             })?;
-        Ok(Proc {
+        let proc = Proc {
             child,
             stdin,
             rx,
             _reader: reader,
             _stderr: stderr_thread,
-        })
+        };
+        if self.shutting_down.load(Ordering::Acquire) {
+            drop(proc);
+            anyhow::bail!("document processing is shutting down");
+        }
+        Ok(proc)
     }
 
     pub fn call(&self, op: &str, args: Value) -> anyhow::Result<Value> {
@@ -456,6 +621,9 @@ impl Sidecar {
         // but it keeps a stray line traceable to one call rather than to one
         // call per worker.
         let mut checkout = self.checkout()?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("document processing is shutting down");
+        }
 
         // A worker can have died on its own between checkouts (crash, killed by
         // the OS under memory pressure). Retire it and take a fresh one rather
@@ -470,8 +638,18 @@ impl Sidecar {
         let req = Request { id, op, args };
         let mut line = serde_json::to_string(&req)?;
         line.push('\n');
-        proc.stdin.write_all(line.as_bytes())?;
-        proc.stdin.flush()?;
+        if let Err(error) = proc.stdin.write_all(line.as_bytes()) {
+            if self.shutting_down.load(Ordering::Acquire) {
+                anyhow::bail!("document processing is shutting down");
+            }
+            return Err(error.into());
+        }
+        if let Err(error) = proc.stdin.flush() {
+            if self.shutting_down.load(Ordering::Acquire) {
+                anyhow::bail!("document processing is shutting down");
+            }
+            return Err(error.into());
+        }
 
         enum Wake {
             Resp(Response),
@@ -507,21 +685,30 @@ impl Sidecar {
                 Ok(resp.data)
             }
             // Retire the wedged/broken worker instead of returning it to the
-            // pool; `Checkout::drop` frees its slot and `Proc::drop` kills the
+            // pool; `Checkout::drop` frees its slot and drops the tracked
             // child, so the next checkout spawns a clean replacement. A wedged
             // worker must never go back into circulation: its next response
             // would arrive against a stale id and be discarded, leaving it one
             // reply behind forever.
             Wake::Timeout => {
                 checkout.retire();
+                if self.shutting_down.load(Ordering::Acquire) {
+                    anyhow::bail!("document processing is shutting down");
+                }
                 anyhow::bail!("sidecar '{op}' timed out after {:?}", self.timeout);
             }
             Wake::ReadErr(e) => {
                 checkout.retire();
+                if self.shutting_down.load(Ordering::Acquire) {
+                    anyhow::bail!("document processing is shutting down");
+                }
                 anyhow::bail!("sidecar read error during '{op}': {e}");
             }
             Wake::Closed => {
                 checkout.retire();
+                if self.shutting_down.load(Ordering::Acquire) {
+                    anyhow::bail!("document processing is shutting down");
+                }
                 anyhow::bail!("sidecar closed stream during '{op}'");
             }
         }
@@ -618,6 +805,12 @@ impl Sidecar {
     }
 }
 
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        let _ = self.begin_shutdown();
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConvertResult {
     pub markdown: String,
@@ -665,6 +858,88 @@ mod pool_tests {
         Arc::new(
             Sidecar::with_timeout(stdin_reader(), Duration::from_millis(50)).with_workers(workers),
         )
+    }
+
+    #[test]
+    fn shutdown_latch_rejects_new_checkout_without_spawning() {
+        let sidecar = pool(1);
+
+        assert_eq!(sidecar.begin_shutdown(), 0);
+
+        let error = sidecar
+            .ping()
+            .expect_err("shutdown must reject new converter work");
+        assert_eq!(error.to_string(), "document processing is shutting down");
+        let spawn_error = sidecar
+            .spawn()
+            .err()
+            .expect("shutdown must reject a direct spawn race");
+        assert_eq!(
+            spawn_error.to_string(),
+            "document processing is shutting down"
+        );
+        assert_eq!(sidecar.lock_pool().live, 0);
+        assert!(sidecar.tracked_children().is_empty());
+    }
+
+    #[test]
+    fn begin_shutdown_drains_every_idle_worker() {
+        let sidecar = pool(2);
+        let a = sidecar.checkout().expect("spawned worker one");
+        let b = sidecar.checkout().expect("spawned worker two");
+        drop((a, b));
+        assert_eq!(sidecar.lock_pool().idle.len(), 2);
+        assert_eq!(sidecar.tracked_children().len(), 2);
+
+        assert_eq!(sidecar.begin_shutdown(), 0);
+
+        let state = sidecar.lock_pool();
+        assert_eq!(state.live, 0);
+        assert!(state.idle.is_empty());
+        drop(state);
+        assert!(sidecar.tracked_children().is_empty());
+    }
+
+    #[test]
+    fn checked_out_worker_is_terminated_and_retires_after_shutdown() {
+        let sidecar = pool(1);
+        let mut held = sidecar.checkout().expect("spawned checked-out worker");
+
+        assert_eq!(sidecar.begin_shutdown(), 0);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if held
+                .proc()
+                .child
+                .try_wait()
+                .expect("worker status remains observable")
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown must terminate a checked-out worker"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            sidecar.lock_pool().live,
+            1,
+            "the checkout still owns its pool slot until check-in"
+        );
+
+        drop(held);
+
+        let state = sidecar.lock_pool();
+        assert_eq!(state.live, 0);
+        assert!(
+            state.idle.is_empty(),
+            "check-in after shutdown must retire instead of pooling"
+        );
+        drop(state);
+        assert!(sidecar.tracked_children().is_empty());
     }
 
     /// The whole point of the change: N workers means N documents in flight.

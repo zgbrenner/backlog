@@ -239,14 +239,12 @@ impl Write for RotatingFile {
 /// The buffering is the load-bearing part. This used to scrub each `write` as
 /// it arrived, on the reasoning that "env_logger formats a whole record and
 /// hands it over in one call". That is true of env_logger, and false of
-/// `write!`/`writeln!` into this sink directly: `fmt::write` calls back once
-/// per format fragment, and `Debug` for `OsStr` escapes its input with
-/// `f.write_char(c)` — **one character per call**. A `{path:?}` argument
-/// therefore arrives as ~100 single-byte writes, and a root can never be
-/// matched inside a one-byte haystack, so the whole path went to the file in
-/// clear. Scrubbing per complete line makes the guarantee hold whatever the
-/// caller's write granularity is, rather than resting on a detail of one
-/// dependency's `Target::Pipe`.
+/// `write!`/`writeln!` into this sink directly: callers and formatters may
+/// split a record at arbitrary byte boundaries. A root can never be matched
+/// when it straddles two separately scrubbed buffers, so a split path could
+/// reach the file in clear. Scrubbing per complete line makes the guarantee
+/// hold whatever the caller's write granularity is, rather than resting on a
+/// detail of one dependency's `Target::Pipe`.
 ///
 /// Buffering also fixes the UTF-8 half of the same bug: `from_utf8_lossy` on a
 /// one-byte slice turns every byte of a multi-byte character into U+FFFD, so
@@ -447,11 +445,9 @@ mod tests {
         assert!(tail(&dir.path().join("absent.log"), 10).is_empty());
     }
 
-    /// A path formatted with `{:?}` reaches the sink one character at a time,
-    /// so scrubbing has to reassemble the line before matching. Asserted here
-    /// as a property of the sink rather than only as an outcome of the two
-    /// tests below, because the fragmentation comes from `std`'s `Debug` for
-    /// `OsStr` and no amount of scrubber tuning would survive losing it.
+    /// Scrubbing must reassemble a path even when the writer splits it into
+    /// single-byte fragments. The standard formatter's exact write pattern is
+    /// deliberately not asserted because it can change between Rust releases.
     #[test]
     fn a_debug_formatted_path_reaches_the_sink_in_fragments_and_is_still_scrubbed() {
         let dir = tempfile::tempdir().unwrap();
@@ -459,29 +455,13 @@ mod tests {
         add_sensitive_roots([processing.clone()]);
         let doc = processing.join("Jane Roe Termination Letter.pdf");
 
-        // `write!` calls back once per format fragment, and `Debug` for `OsStr`
-        // escapes with `write_char`, so this is ~100 one-byte writes.
-        let mut widths = Vec::new();
-        struct Widths<'a>(&'a mut Vec<usize>);
-        impl Write for Widths<'_> {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.push(buf.len());
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        write!(Widths(&mut widths), "{doc:?}").unwrap();
-        assert!(
-            widths.iter().filter(|w| **w == 1).count() > 20,
-            "expected Debug to fragment into single bytes, got {widths:?}"
-        );
-
         let path = dir.path().join("logs").join("fragmented.log");
         let sink = Arc::new(Mutex::new(RotatingFile::open(path.clone(), MAX_LOG_BYTES)));
         let mut shared = SharedSink::new(sink.clone());
-        writeln!(shared, "[INFO] ignoring {doc:?}: reserved prefix").unwrap();
+        let record = format!("[INFO] ignoring {doc:?}: reserved prefix\n");
+        for byte in record.as_bytes() {
+            shared.write_all(std::slice::from_ref(byte)).unwrap();
+        }
         shared.flush().unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();

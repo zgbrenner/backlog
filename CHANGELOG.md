@@ -15,6 +15,49 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.5.0] — reliable recovery and one-download setup
+
+### Fixed
+
+- Controlled shutdown now prevents model-server respawn, releases every active
+  ledger claim, and makes abandoned work immediately recoverable on restart.
+  Persisted terminal manifests are reconciled before model work is repeated,
+  and a failed quarantine or manifest write leaves the job visible and
+  retryable.
+- A missing optional 1.7B model no longer overwrites the saved model choice.
+  BackLog honestly reports the missing file and safely reuses the installed
+  0.6B primary model for escalation attempts.
+- Model downloads always use distinct canonical destinations, retain partial
+  transfers for resume, and expose completed, failed, and cancelled outcomes
+  after navigating away from Settings.
+- The public CI workspace job now stages a deterministic marker model for
+  Tauri resource validation. Release staging hash-verifies the real model and
+  cannot publish that marker.
+
+### Changed
+
+- First run is a three-step, save-then-check flow. Active downloads can be
+  cancelled and later resumed, review approvals remain undoable across
+  navigation, and empty queues distinguish caught-up processing from review
+  work still waiting for a person.
+- The Windows installer is now the only required download. It contains the
+  app, conversion sidecar and Python runtime, llama.cpp server and runtime
+  libraries, verified Qwen3 0.6B primary model, and offline WebView2 runtime.
+  The larger Qwen3 1.7B escalation model remains an optional in-app download
+  for difficult documents.
+- Resource defaults are clamped for an 8 GB Windows laptop.
+
+### Release
+
+- A push to `main` starts a clean `windows-2022` workflow when `v0.5.0` is
+  absent. Later pushes skip cleanly after the tag exists. The build uses the
+  repository lockfiles and pinned model/llama.cpp inputs.
+- When the Tauri updater key is available, the workflow publishes the stable
+  installer, detached signature, and `latest.json`. Without that key it
+  publishes an installer-only prerelease and leaves v0.4.4 as the stable
+  updater. It never invents a signature or publishes unsigned updater
+  metadata.
+
 ## [0.4.4] — the installer was missing three DLLs it could never have noticed
 
 ### Fixed

@@ -318,6 +318,197 @@ const CHECKS = [
     },
   },
   {
+    // This catches a tempting but dangerous split flow: checking a computer
+    // before the folders displayed on screen have been saved tests yesterday's
+    // configuration, not the one the operator just chose.
+    name: "first-run save and check stores chosen folders before preflight",
+    async run(page) {
+      await boot(page, "first-run-save");
+      await page.locator('[name="processing_dir"]').fill("D:\\Intake");
+      await page.locator('[name="outbox_dir"]').fill("D:\\Outbox");
+      await page.locator('[name="quarantine_dir"]').fill("D:\\Quarantine");
+      const problems = [];
+      if (!(await page.locator(".setup-intro").isVisible())) problems.push("no three-step first-run introduction");
+      const action = page.locator('.settings button[type="submit"]');
+      if ((await action.textContent()).trim() !== "Save and check this computer") {
+        problems.push(`first-run action said ${JSON.stringify(await action.textContent())}`);
+      }
+      await action.click();
+      await page.waitForTimeout(500);
+      const calls = await page.evaluate(() => window.__harness.invocations.map((i) => i.cmd));
+      const save = calls.lastIndexOf("set_config");
+      const check = calls.lastIndexOf("run_preflight");
+      if (save === -1 || check === -1 || save > check) {
+        problems.push(`expected set_config before run_preflight, got ${JSON.stringify(calls)}`);
+      }
+      return problems;
+    },
+  },
+  {
+    name: "first run leads with setup and keeps the primary action in reach",
+    async run(page) {
+      await boot(page, "first-run");
+      const setup = page.locator(".setup-intro");
+      const readiness = page.locator(".preflight-panel");
+      const action = page.locator('.settings button[type="submit"]');
+      const problems = [];
+      const setupBox = await setup.boundingBox();
+      const readinessBox = await readiness.boundingBox();
+      const actionBox = await action.boundingBox();
+      if (!setupBox || !readinessBox || setupBox.y >= readinessBox.y) {
+        problems.push("readiness details appeared before the first-run setup guidance");
+      }
+      if (!actionBox || actionBox.y + actionBox.height > 780) {
+        problems.push("the first-run Save and check action is below the initial viewport");
+      }
+      if (!/Save and check this computer/.test(await setup.innerText())) {
+        problems.push("the setup guidance does not describe the combined primary action");
+      }
+      if (!/optional backup model/.test(await setup.innerText())) {
+        problems.push("the setup guidance does not explain the optional model download");
+      }
+      return problems;
+    },
+  },
+  {
+    name: "Save and check never claims success when the live check fails",
+    async run(page) {
+      await boot(page, "first-run-preflight-error");
+      await page.locator('[name="processing_dir"]').fill("D:\\Intake");
+      await page.locator('[name="outbox_dir"]').fill("D:\\Outbox");
+      await page.locator('[name="quarantine_dir"]').fill("D:\\Quarantine");
+      await page.locator('.settings button[type="submit"]').click();
+      await page.waitForTimeout(450);
+      const problems = [];
+      const success = (await page.locator(".ok-msg").textContent()).trim();
+      if (success !== "") {
+        problems.push(`Save and check announced false success: ${JSON.stringify(success)}`);
+      }
+      if (!(await page.locator(".toast.error").isVisible())) {
+        problems.push("the failed live check did not show an error");
+      }
+      return problems;
+    },
+  },
+  {
+    name: "an active model download can be cancelled",
+    async run(page) {
+      await boot(page, "downloading");
+      await page.click("#download-models-button");
+      await page.waitForSelector("#cancel-model-download");
+      const problems = [];
+      if ((await page.locator("#cancel-model-download").textContent()).trim() !== "Cancel download") {
+        problems.push("active download did not offer Cancel download");
+      }
+      await page.click("#cancel-model-download");
+      const called = await page.evaluate(() =>
+        window.__harness.invocations.some((i) => i.cmd === "cancel_model_download")
+      );
+      if (!called) problems.push("Cancel download never reached cancel_model_download");
+      return problems;
+    },
+  },
+  {
+    name: "a normal cancellation stays calm instead of reporting an error",
+    async run(page) {
+      await boot(page, "download-cancelling");
+      await page.click("#download-models-button");
+      await page.click("#cancel-model-download");
+      await page.waitForTimeout(150);
+      await page.evaluate(() => {
+        window.__harness.emit("model-download-done", {
+          ok: false,
+          cancelled: true,
+          error: "Download cancelled.",
+          finished_at: new Date().toISOString(),
+        });
+      });
+      await page.waitForTimeout(250);
+      const problems = [];
+      if (await page.locator(".toast.error").count()) {
+        problems.push("cancelling the download displayed a generic error toast");
+      }
+      if (!/Download cancelled/.test(await page.locator(".model-download-terminal").innerText())) {
+        problems.push("the cancellation did not leave a calm cancelled state");
+      }
+      return problems;
+    },
+  },
+  {
+    name: "terminal model downloads remain recoverable after Settings renders",
+    async run(page) {
+      const problems = [];
+      for (const scenario of ["download-cancelled", "download-failed"]) {
+        await boot(page, scenario);
+        await page.waitForTimeout(350);
+        const resume = page.locator("#download-models-button");
+        if (!/^Resume download/.test((await resume.textContent()).trim())) {
+          problems.push(`${scenario} did not offer Resume download`);
+        }
+      }
+      await boot(page, "download-completed");
+      const before = await page.evaluate(() => ({
+        config: window.__harness.invocations.filter((i) => i.cmd === "get_config").length,
+        preflight: window.__harness.invocations.filter((i) => i.cmd === "run_preflight").length,
+      }));
+      await page.click('nav button[data-v="settings"]');
+      await page.waitForTimeout(350);
+      if (!(await page.locator(".model-download-terminal").isVisible())) {
+        problems.push("completed download was lost after returning to Settings");
+      }
+      if (!/Model download complete/.test(await page.locator(".model-download-terminal").innerText())) {
+        problems.push("completed download did not restore its safe completion message");
+      }
+      const after = await page.evaluate(() => ({
+        config: window.__harness.invocations.filter((i) => i.cmd === "get_config").length,
+        preflight: window.__harness.invocations.filter((i) => i.cmd === "run_preflight").length,
+      }));
+      if (after.config <= before.config) {
+        problems.push("completion did not refresh configuration");
+      }
+      if (after.preflight <= before.preflight) {
+        problems.push("completion did not run a live readiness check");
+      }
+      const backupRow = page.locator(".check-row", { hasText: "Backup model file is present" });
+      if (!(await backupRow.evaluate((row) => row.classList.contains("check-pass")))) {
+        problems.push("completion did not change backup-model readiness to Ready");
+      }
+      return problems;
+    },
+  },
+  {
+    name: "a caught-up processing queue still shows real historical work",
+    async run(page) {
+      await boot(page, "caught-up-reviews");
+      const text = await page.locator(".caught-up").innerText();
+      const problems = [];
+      if (!/Processing is caught up/.test(text)) problems.push(`missing caught-up state: ${JSON.stringify(text)}`);
+      if (!/4 files need review/.test(text)) problems.push(`missing remaining review count: ${JSON.stringify(text)}`);
+      if (!/Power Automate/.test(text)) problems.push("Done handoff copy is missing");
+      if ((await page.locator("tbody tr").count()) !== 22) {
+        problems.push("historical queue rows disappeared while showing caught-up status");
+      }
+      return problems;
+    },
+  },
+  {
+    name: "the download action describes only the missing optional backup model",
+    async run(page) {
+      await boot(page, "optional-backup-model");
+      await page.click('nav button[data-v="settings"]');
+      const button = await page.locator("#download-models-button").innerText();
+      const text = await page.locator(".model-download").innerText();
+      const problems = [];
+      if (button.trim() !== "Download optional backup model (~1.8 GB)") {
+        problems.push(`optional backup action said ${JSON.stringify(button)}`);
+      }
+      if (!/everyday model is already installed/i.test(text)) {
+        problems.push("optional backup explanation does not say the everyday model is installed");
+      }
+      return problems;
+    },
+  },
+  {
     name: "Start is disabled with a visible on-screen reason that works",
     async run(page) {
       await boot(page, "first-run");
@@ -329,18 +520,21 @@ const CHECKS = [
       if (await page.locator("#runbtn").getAttribute("title")) {
         problems.push("Start still carries a title= a disabled control cannot show");
       }
-      // The app boots straight to Settings when it is unconfigured, so this
-      // hint is read on the screen it used to send the user to — where
-      // navigate() was a no-op and clicking it did nothing whatsoever.
+      // On a new computer there is no readiness control worth focusing yet:
+      // the next truthful action is the first missing setup folder.
       const label = (await page.locator("#start-hint").textContent()).trim();
-      if (/in Settings$/.test(label)) {
-        problems.push(`the hint says ${JSON.stringify(label)} while already on Settings`);
+      if (label !== "finish setup below") {
+        problems.push(`the first-run hint said ${JSON.stringify(label)}`);
       }
       await page.click("#start-hint");
       await page.waitForTimeout(400);
       const focused = await page.evaluate(() => document.activeElement?.id ?? "");
-      if (focused !== "preflight-button") {
-        problems.push(`clicking the hint left focus on ${JSON.stringify(focused)}`);
+      if (focused !== "") {
+        problems.push(`the setup hint focused an unexpected id ${JSON.stringify(focused)}`);
+      }
+      const focusedName = await page.evaluate(() => document.activeElement?.getAttribute("name") ?? "");
+      if (focusedName !== "processing_dir") {
+        problems.push(`clicking the hint left focus on ${JSON.stringify(focusedName)}`);
       }
       return problems;
     },
@@ -391,6 +585,66 @@ const CHECKS = [
       if (called) problems.push("undo did not stop the pending approval");
       if ((await card.locator('[name="subject"]').inputValue()) !== "Riverside lease agreement") {
         problems.push("undo lost the reviewer's typing");
+      }
+      return problems;
+    },
+  },
+  {
+    name: "navigation keeps a pending approval undoable",
+    async run(page) {
+      await boot(page, "review");
+      const card = page.locator(".card").first();
+      await card.locator('[name="date"]').fill("2026-02-14");
+      await card.locator('[name="subject"]').fill("Riverside lease agreement");
+      await card.locator('[name="description"]').fill(
+        "Signed lease agreement for the Riverside unit between Contoso and A. Patel."
+      );
+      await card.locator('[data-act="approve"]').click();
+      await page.click('nav button[data-v="settings"]');
+      await page.waitForTimeout(300);
+      const problems = [];
+      if (!(await page.locator("#pending-approval-tray").isVisible())) {
+        problems.push("pending approval disappeared on navigation");
+      }
+      await page.locator("#pending-approval-tray [data-act=undo]").click();
+      await page.waitForTimeout(300);
+      const called = await page.evaluate(() =>
+        window.__harness.invocations.some((i) => i.cmd === "resubmit" || i.cmd === "approve_job")
+      );
+      if (called) problems.push("Undo after navigation still filed the document");
+      return problems;
+    },
+  },
+  {
+    name: "reviews can be filtered by reason and ordered oldest first",
+    async run(page) {
+      await boot(page, "review-reasons");
+      const problems = [];
+      const filter = page.locator("#review-reason-filter");
+      const order = page.locator("#review-order");
+      if (!(await filter.isVisible()) || !(await order.isVisible())) {
+        problems.push("review reason filter or ordering control is missing");
+        return problems;
+      }
+      if ((await page.locator(".card").count()) !== 25) {
+        problems.push("the unfiltered review screen eagerly rendered more than its first 25 cards");
+      }
+      const values = await filter.locator("option").evaluateAll((options) =>
+        options.map((option) => option.value)
+      );
+      if (!values.includes("ENCRYPTED")) {
+        problems.push("the reason filter omitted a result beyond the first page");
+      }
+      await filter.selectOption("ENCRYPTED");
+      await order.selectOption("oldest");
+      await page.waitForTimeout(400);
+      if ((await page.locator(".card").count()) !== 1) problems.push("reason filter did not use the complete review result set");
+      if (!/reason-29\.pdf/.test(await page.locator(".card").innerText())) {
+        problems.push("oldest ordering did not render the filtered result");
+      }
+      const footer = await page.locator("#review-foot").innerText();
+      if (!/Showing all 1 file matching The file is password protected, oldest first\./.test(footer)) {
+        problems.push(`filtered review footer was not honest: ${JSON.stringify(footer)}`);
       }
       return problems;
     },

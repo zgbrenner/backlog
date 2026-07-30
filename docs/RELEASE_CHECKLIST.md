@@ -1,222 +1,146 @@
-# BackLog pilot release checklist
+# BackLog v0.5.0 release checklist
 
-A release is a **pilot candidate**, not production-ready, until every applicable
-item below has fresh evidence attached to the release record.
-
-> Every command in this file has been run on the current tree and passes. An
-> item that cannot pass is marked so explicitly rather than left as a box to
-> tick on faith — that is how the `cargo fmt` failure survived unnoticed
-> through several reviews of a checklist that called it mandatory.
+A release remains a pilot candidate until every applicable item has fresh
+evidence attached to the release record.
 
 ## Source and automated validation
 
-`./scripts/ci-local.sh` runs all five jobs — trust core, workspace, frontend,
-python, version-drift — on one machine and exits non-zero on the first failure.
-**Run it on a clean checkout of the exact release commit** — that is the item;
-the rest of this section says what it covers, and each line is one step inside
-it.
+- [ ] The release commit is on `main`, has passed `.github/workflows/ci.yml`,
+      and the workflow URL is recorded. This public repository's standard
+      Actions runners use no billable minutes.
+- [ ] `./scripts/ci-local.sh` passes on a clean checkout.
+- [ ] `node .github/scripts/check-ci-parity.mjs` confirms hosted and local CI
+      run the same staging and gate commands.
+- [ ] `npm run check:release` passes all release-contract tests and validates
+      `.github/workflows/release.yml`.
+- [ ] `npm run check` and `npm run harness:shots` pass under Node 22, with no
+      browser console error.
+- [ ] Rust format, clippy, and all workspace tests pass with
+      `src-tauri/Cargo.lock` and Rust 1.94.
+- [ ] Sidecar/model unit tests pass with Python 3.11:
 
-- [ ] `./scripts/ci-local.sh` passes on a clean checkout of the release commit,
-      and the run is attached to the release record.
-- [ ] ~~CI is green on the release commit.~~ **This is not satisfiable today.**
-      `.github/workflows/ci.yml` describes the same five jobs but has never
-      been assigned a runner (`docs/KNOWN_ISSUES.md` item 11), so no commit in
-      this repository has ever had a green Actions run and none can be produced
-      on demand. The local script above is the substitute, and
-      `node .github/scripts/check-ci-parity.mjs` — part of the version-drift
-      job — is what keeps it honest by failing if the two definitions drift.
-- [ ] `npm ci && npm run check` passes under Node 22.
-      (`check` = `tsc --noEmit` then `vite build`.)
-- [ ] `npm run harness:shots` renders every scenario with no console error, and
-      the screenshots have been looked at.
-- [ ] `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` passes.
-- [ ] `cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings`
-      passes.
-- [ ] `cargo test --manifest-path src-tauri/Cargo.toml --workspace --all-targets`
-      passes.
-- [ ] Sidecar and model-lock unit tests pass under 64-bit Python 3.11 — 99 tests,
-      no third-party runner needed:
-      `python -m unittest discover -s sidecar/tests -t sidecar/tests` and
-      `python -m unittest discover -s models/tests -t models/tests`.
-- [ ] Every Power Automate example validates against both manifest schemas, and
-      the schemas match the emitter:
-      `pip install -r power-automate/requirements-dev.txt` then
-      `python power-automate/validate_examples.py`. `scripts/ci-local.sh` now
-      finds an interpreter that already has `jsonschema` and names that install
-      command if none does, so this no longer surfaces as a bare
-      `ModuleNotFoundError`.
-- [ ] `package-lock.json`, `rust-toolchain.toml`, `src-tauri/Cargo.lock` and
-      `sidecar/requirements.lock` are committed and match the release build.
-- [ ] `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`
-      declare the same version (`node .github/scripts/check-versions.mjs`), and
-      `CHANGELOG.md` has a section for it.
-- [ ] **`src-tauri/Cargo.lock` records the new version too.** `check-versions.mjs`
-      does not look at it, so bumping the three files above leaves the lock behind
-      and every `--locked` cargo gate then fails with "cannot update the lock file
-      because --locked was passed" — four of the five jobs in
-      `scripts/ci-local.sh`, and not obviously a version problem from the message.
-      Fix with `cargo update --manifest-path src-tauri/Cargo.toml -p backlog
-      --offline`. The pre-push hook catches this; the pre-commit hook does not,
-      because it deliberately runs no cargo build.
+  ```bash
+  python -m unittest discover -s sidecar/tests -t sidecar/tests
+  python -m unittest discover -s models/tests -t models/tests
+  ```
 
-## Offline model bundle
+- [ ] `python power-automate/validate_examples.py` passes after installing
+      `power-automate/requirements-dev.txt`.
+- [ ] `node .github/scripts/check-versions.mjs` reports 0.5.0, the `backlog`
+      package in `src-tauri/Cargo.lock` is 0.5.0, and `CHANGELOG.md` has the
+      0.5.0 section.
 
-The installer does **not** contain the models. They arrive either through the
-in-app downloader (Settings → Download models) or by copying two `.gguf` files
-into `%APPDATA%\ai.sonomos.backlog\models` by hand. A model ZIP is optional and
-only exists for air-gapped deployment.
+## One-download package
 
-- [ ] `python models/download_models.py --verify-only` passes against the staged
-      `models/` directory. (`--verify-only` is one of only two flags this script
-      has; the other is no flag at all.)
-- [ ] `models.lock.json` is committed and its SHA-256 is recorded.
-- [ ] The staged set is exactly the locked Qwen3 0.6B and 1.7B Q8_0 GGUF files.
-      This is the slim, torch-free sidecar profile: no GLiClass snapshot,
-      Granite embedding snapshot, torch, transformers, or sentence-transformers
-      ship with it (see `docs/DEPENDENCY_COMPATIBILITY.md`); `classify` and
-      `salience` answer `ok=true` with deterministic fallbacks instead.
-- [ ] No Liquid LFM, Liquid VL, fastText, `lid.176`, or untracked model payload
-      remains in the model directory.
-- [ ] If an offline model ZIP is produced: it contains `models.lock.json` at its
-      root or under `models/`, and its SHA-256 is recorded before packaging
-      starts.
-- [ ] The optional trained Ettin directory is disabled, or held-out metrics meet
-      DATE F1 >= 0.90 and PARTY/SUBJECT F1 >= 0.75 for each enabled label.
-      (It is disabled in every shipped build — the slim sidecar has no
-      `transformers`, so the lane is inert. See `training/README.md`.)
-- [ ] `NOTICE.md` matches what this build actually redistributes, and the
-      license and notice review in `DEPENDENCY_COMPATIBILITY.md` is complete for
-      the intended pilot audience.
+- [ ] The only required user download is
+      `BackLog_0.5.0_x64-setup.exe`.
+- [ ] The installer contains the app, `convertd` with its Python runtime,
+      `llama-server` and every imported runtime DLL, Qwen3 0.6B Q8_0, and the
+      offline WebView2 runtime.
+- [ ] The primary model hash is
+      `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`.
+- [ ] The Qwen3 1.7B Q8_0 model is not in the installer. Settings presents it
+      as an optional, cancellable, resumable in-app download for difficult
+      documents.
+- [ ] A clean install can process a document with the network disabled and
+      without Python, a VC++ redistributable, a model script, or any second
+      installer.
+- [ ] First launch moves the bundled primary model into the per-user model
+      directory without changing an operator's custom absolute model path.
 
-## Windows packaging
+## Windows packaging evidence
 
-- [ ] Build on a clean Windows Server 2022 or Windows 11 environment with
-      64-bit Python 3.11 (exactly), Node 22, and the toolchain in
-      `rust-toolchain.toml`.
-- [ ] `scripts/build-sidecar.ps1 -Clean` succeeds and the NDJSON ping smoke test
-      passes.
-- [ ] llama-server is staged with **all** its runtime DLLs and pinned by release
-      provenance, `--version` output, and SHA-256 (`RELEASING.md` Build step 2).
-- [ ] **Dev stubs are gone and the real binaries verified:**
-      `pwsh scripts/verify-binaries.ps1` exits 0. It asserts each
-      `binaries/*.exe` is non-empty, carries no `BACKLOG-DEV-STUB-DO-NOT-SHIP`
-      marker, is a valid PE image, matches its recorded SHA-256 where one is
-      supplied, and that `_placeholder.dll` is absent. **Do not skip this.**
-      `tauri.conf.json`'s `externalBin` only checks that a path exists, so a
-      stubbed installer builds clean, installs clean and reports green — the
-      failure surfaces on the first document to reach the SLM lane on a user's
-      machine, with no logs. **This script is the only gate that catches it:**
-      the in-app readiness check still passes a marked stub, because
-      `preflight.rs`'s `binary_exists` only requires a non-empty file
-      (`docs/KNOWN_ISSUES.md` item 9).
-- [ ] **Nothing imports a DLL the target machine will not have.** The same
-      `pwsh scripts/verify-binaries.ps1` reads the import directory of every
-      shipped binary and fails if an imported DLL is neither staged in
-      `src-tauri/binaries/` nor part of a stock Windows. This is the check that
-      would have caught 0.4.3 shipping without `vcruntime140.dll`,
-      `vcruntime140_1.dll` and `msvcp140.dll`: every `ggml*.dll` and
-      `llama*.dll` imports them, Windows does not have them, and **no machine
-      that can build this app can observe the problem**, because building a
-      Tauri app requires the redistributable that supplies them. If a llama.cpp
-      bump adds a new import, this is what will say so.
-- [ ] `bundle.windows.webviewInstallMode` is `offlineInstaller` and
-      `bundle.windows.nsis.installMode` is `currentUser` in `tauri.conf.json`.
-      (Per-machine would make every passive auto-update raise a UAC prompt the
-      appliance user cannot satisfy; the default WebView2 bootstrapper would
-      fetch from Microsoft mid-install.)
-- [ ] Installer, sidecar, llama-server, model lock and model payload hashes are
-      retained.
-- [ ] Install, same-version repair, upgrade, and uninstall complete under a
-      standard non-administrator user where policy permits.
-- [ ] First launch resolves the app-data model paths without depending on the
-      shortcut working directory, and Settings → Download models works from a
-      genuinely empty models directory.
-- [ ] First launch shows actionable preflight failures when folders, models, or
-      sidecars are missing, each with a plain-language message and — where one
-      applies — a working action button.
-- [ ] `sidecar/requirements.lock` is hash-pinned for a **signed** release
-      (`pip-compile --generate-hashes`). **This is not satisfiable today** — the
-      lock is version-pinned only (`docs/KNOWN_ISSUES.md` item 2). An unlocked
-      build may be used only as an explicitly labeled internal pilot.
+- [ ] The release workflow ran on `windows-2022` with Node 22, Python 3.11 x64,
+      and the toolchain from `rust-toolchain.toml`.
+- [ ] `npm ci`, Cargo `--locked` resolution, and
+      `sidecar/requirements.lock` were used.
+- [ ] `scripts/stage-release-inputs.ps1` verified the primary model and the
+      `llama.cpp b10091` archive before staging.
+- [ ] `scripts/build-sidecar.ps1 -Clean` smoke-tested the built sidecar against
+      real DOCX, PDF, and scanned-image fixtures.
+- [ ] `scripts/verify-binaries.ps1` passed: no file carries
+      `BACKLOG-DEV-STUB-DO-NOT-SHIP`, every executable/DLL is a valid PE image,
+      the pinned llama server hash matches, `_placeholder.dll` is absent, and
+      every non-Windows imported DLL is bundled.
+- [ ] `bundle.windows.webviewInstallMode` is `offlineInstaller` and the NSIS
+      install mode is `currentUser`.
+- [ ] Installer SHA-256, exact release-input hashes, commit SHA, and workflow
+      URL are retained.
+- [ ] Install, same-version repair, upgrade, and uninstall succeed under a
+      standard non-administrator account where policy permits.
+
+## Recovery and user experience
+
+- [ ] On first run, **Save and check this computer** persists the selected
+      folders before readiness runs.
+- [ ] An active optional-model transfer can be cancelled; Cancelled and Failed
+      states offer Resume; Completed state survives navigation.
+- [ ] With the optional 1.7B model absent, readiness says it is absent, stays
+      usable, and safely uses the primary model for backup naming attempts.
+- [ ] Quitting during work releases claims; restart immediately reclaims and
+      resumes them without waiting for a stale timeout.
+- [ ] A background model request cannot respawn `llama-server` after shutdown
+      begins.
+- [ ] A valid previously written terminal manifest is reconciled without
+      repeating model work.
+- [ ] A failed quarantine or manifest write leaves the job visible and
+      retryable.
+- [ ] Only one BackLog process per user can own startup claim recovery.
+- [ ] **Processing is caught up** is distinct from **All caught up** when
+      Needs Review still contains work.
+- [ ] Pending approval Undo remains available after navigating away from
+      Needs Review.
+- [ ] Documents without a trustworthy date require review; a genuinely
+      undated document uses the file-modified date with honest provenance.
+
+## Power Automate handoff
+
+- [ ] **Done** is described and tested as “manifest handed to Power Automate,”
+      not “confirmed in SharePoint.”
+- [ ] Flow 2 owns rename, archive, SharePoint copy/index, checkpoints, and
+      retries after handoff.
+- [ ] Flow 2 uses manifest schema v3 and `manifest_id`, not content SHA, as the
+      replay key.
+- [ ] `ManifestId`, `InstanceId`, and `Sha256` columns are indexed.
+- [ ] Flow concurrency is 1 and the pilot uses
+      `"manifest_emit_per_min": 10`.
+- [ ] Forced failures after archive, index, and source move resume without
+      duplicate rows or stranded files.
 
 ## Privacy and security
 
-- [ ] With the network disabled, conversion, OCR, language detection,
-      classification, naming, review, and manifest emission still work.
-- [ ] An outbound-connection monitor confirms that during **document
-      processing** the app, sidecar, and llama-server contact only loopback, and
-      that the only non-loopback connections the app makes at all are the two
-      documented ones: the Hugging Face model download (once, from the Settings
-      button) and the startup updater check to
-      `github.com/zgbrenner/backlog/releases/latest/download/latest.json`
-      (`src/main.ts`'s `checkForUpdates`). "Loopback-only at runtime" on its own
-      is false and was reported as such.
-- [ ] No document text appears in SharePoint `_pa_errors`, application telemetry,
-      crash uploads, local build logs, or release artifacts.
-- [ ] Tauri capabilities contain no shell or opener permission, and the Rust app
-      does not initialize those plugins.
-- [ ] The sidecar sets Hugging Face, Transformers, and Datasets offline modes.
-- [ ] Installer and external binaries are code-signed before deployment outside
-      the internal pilot group. (No certificate exists yet — every install shows
-      a SmartScreen warning; the click-through is documented in
-      `docs/USER_GUIDE.md`.)
+- [ ] With networking disabled, conversion, OCR, classification, naming,
+      review, and manifest emission work.
+- [ ] During processing, the app and sidecars contact only loopback. The only
+      documented non-loopback app operations are the optional model download
+      and startup updater check.
+- [ ] No document text, filename, model proposal, key, or personal path appears
+      in CI logs or release artifacts.
 - [ ] Anti-malware scanning is complete for every bundled executable.
-- [ ] `docs/PRIVACY.md`'s uninstall-residue statement still matches what the
-      installer leaves behind.
+- [ ] `docs/PRIVACY.md`, `docs/SECURITY.md`, `NOTICE.md`, and the package
+      contents agree.
+- [ ] The absence of Authenticode is explicitly accepted for this pilot.
+      SmartScreen reputation remains an external constraint.
 
-## Functional smoke tests
+## Publication guard
 
-- [ ] Native Word, PDF, and text fixtures convert and produce schema-valid
-      manifests.
-- [ ] A scanned fixture exercises RapidOCR; low confidence retries at 400 DPI
-      and ends with enhanced 600-DPI classical OCR before `UNREADABLE`.
-- [ ] A Danish Unicode fixture processes without panic or truncation corruption,
-      and Lingua reports an ISO 639-1 language code.
-- [ ] An undated fixture uses file modified date, labels the source `metadata`,
-      and carries `DATE_FROM_FILE_MTIME`.
-- [ ] An unsupported or zero-byte file is flagged without silent deletion.
-- [ ] A file whose name begins with an underscore (`_DRAFT Agreement.docx`) is
-      processed, not skipped.
-- [ ] Three byte-identical physical files receive one content SHA-256, three
-      instance IDs, three manifest IDs, and three distinct final filenames.
-- [ ] Replaying the same manifest cannot create a second list row.
-- [ ] A dismissal ("Can't fix this") produces a `dismissed` manifest that lands
-      in `NeedsReview` with `ReviewState = Dismissed` and **never** reaches
-      `DocumentIndex`.
-- [ ] Pausing before a file arrives and resuming later does not lose the file.
-- [ ] Killing `convertd` during a request causes a bounded restart path rather
-      than an indefinite hang.
-- [ ] A failed manifest write leaves the source recoverable.
-- [ ] Qwen JSON output that violates date, subject, or description rules is
-      rejected by the deterministic checker and retried with the exact violation.
-
-## Power Automate
-
-- [ ] Flow 1 delivers each file under its **plain original name** inside a
-      per-delivery subfolder (`/BackLog/Processing/<flow-id>-<item-id>/<name>`)
-      and deletes the Intake source only after destination creation succeeds.
-      (The old `__incoming_…__` filename envelope described app behavior that
-      does not exist — see `power-automate/FLOW1-intake.md`.)
-- [ ] Flow 2 uses manifest schema **v3** — including the `dismissed` status and
-      the non-empty `model_versions` requirement on `ok` — and durable commit
-      checkpoints.
-- [ ] `ManifestId`, `InstanceId`, and `Sha256` columns are indexed.
-- [ ] Flow concurrency is 1 and app emission is
-      `"manifest_emit_per_min": 10` for the pilot. The shipped default in
-      `config.rs` is `0`, meaning unlimited — it must be set explicitly.
-- [ ] Forced failures after archive, after index, and after source move each
-      resume without duplicate rows or stranded files.
-- [ ] The 15-minute recovery sweep is enabled and monitored.
-
-## Release evidence
-
-- [ ] Record commit SHA, the `./scripts/ci-local.sh` output, installer SHA-256, external binary
-      versions/hashes, model-lock SHA-256, config snapshot, Power Automate export
-      versions, test results, and known limitations.
-- [ ] The release carries the installer, its `.sig`, **and** `latest.json` as
-      assets, and `latest.json`'s `version` equals `tauri.conf.json`'s
-      (`RELEASING.md` Cutting a release step 4, the update-channel assertion).
-      Publishing without `latest.json` makes every
-      installed copy 404 on its update check, and the frontend swallows that
-      error — the update channel can be dead fleet-wide with no signal anywhere.
-- [ ] Keep the release labeled `pilot` until the staged runbook gates pass.
+- [ ] `v0.5.0` does not exist before the prepared release commit reaches
+      `main`; successful CI starts the release workflow automatically for that
+      exact commit.
+- [ ] The release-state preflight starts Windows packaging only after successful
+      CI on `main` for the exact release commit. A published `v0.5.0` skips
+      cleanly; only a matching interrupted draft can resume, and a tag pointing
+      at any other commit fails closed.
+- [ ] If `TAURI_SIGNING_PRIVATE_KEY` is present, it matches the updater public
+      key embedded in the app. The stable release contains exactly the
+      installer, its `.sig`, and `latest.json`; the manifest signature matches
+      the detached signature, cryptographically verifies against the embedded
+      key over this installer, and its URL resolves to this installer.
+- [ ] If the updater key is absent, the release is a prerelease containing the
+      installer only. There is no `.sig` and no `latest.json`, and the notes
+      explicitly say v0.4.4 remains the stable updater.
+- [ ] No signature was generated, copied, or fabricated outside the Tauri
+      signing path.
+- [ ] Updater signing and Authenticode are recorded separately: updater signing
+      protects installed-app updates; Authenticode identifies the Windows
+      publisher and affects SmartScreen.

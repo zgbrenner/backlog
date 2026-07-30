@@ -167,6 +167,101 @@ fn get_config(state: tauri::State<AppState>) -> Config {
     state.cfg.lock().unwrap().clone()
 }
 
+/// Windows accepts both separators and normally resolves paths
+/// case-insensitively. Compare that identity even in platform-independent
+/// tests so a config copied from another machine is covered.
+#[cfg(any(windows, test))]
+fn windows_paths_equivalent(left: &Path, right: &Path) -> bool {
+    fn key(path: &Path) -> String {
+        let mut key = String::with_capacity(path.as_os_str().len());
+        for ch in path.to_string_lossy().chars() {
+            if ch == '\\' || ch == '/' {
+                key.push('\\');
+            } else {
+                for folded in ch.to_lowercase() {
+                    key.push(folded);
+                }
+            }
+        }
+        while key.len() > 3 && key.ends_with('\\') {
+            key.pop();
+        }
+        key
+    }
+    key(left) == key(right)
+}
+
+/// Model destinations collide when they are spelled identically, resolve to
+/// the same existing target, or are Windows-equivalent spellings.
+fn model_paths_collide(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    if let (Ok(left), Ok(right)) = (left.canonicalize(), right.canonicalize()) {
+        #[cfg(windows)]
+        if windows_paths_equivalent(&left, &right) {
+            return true;
+        }
+        #[cfg(not(windows))]
+        if left == right {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    return windows_paths_equivalent(left, right);
+    #[cfg(not(windows))]
+    false
+}
+
+/// Repair the v0.4.4 state where normalization persisted the installed
+/// primary path into both model fields. The desired optional-model path is
+/// always the canonical 1.7B destination, never the runtime fallback.
+fn migrate_colliding_model_paths(cfg: &mut Config, models_dir: &Path) -> Result<bool, String> {
+    if !model_paths_collide(&cfg.slm_primary_gguf, &cfg.slm_escalation_gguf) {
+        return Ok(false);
+    }
+    let canonical_escalation = models_dir.join(model_download::ESCALATION_GGUF_NAME);
+    if model_paths_collide(&cfg.slm_primary_gguf, &canonical_escalation) {
+        return Err(
+            "The everyday and optional model paths must be different. Choose the 0.6B file for \
+             the everyday model; BackLog reserves its canonical 1.7B path for the optional model."
+                .into(),
+        );
+    }
+    cfg.slm_escalation_gguf = canonical_escalation;
+    Ok(true)
+}
+
+/// Resolve installed-app model paths and durably repair the v0.4.4 collision.
+///
+/// The migration is persisted at this seam rather than waiting for the rest of
+/// startup. A later failure opening the ledger must not make the next launch
+/// rediscover the same broken configuration.
+fn repair_and_persist_startup_model_paths(
+    cfg_path: &Path,
+    cfg: &mut Config,
+    models_dir: &Path,
+) -> Result<(), String> {
+    cfg.slm_primary_gguf = model_download::resolve_configured_model_path(
+        models_dir,
+        &cfg.slm_primary_gguf,
+        model_download::PRIMARY_GGUF_NAME,
+    );
+    cfg.slm_escalation_gguf = model_download::resolve_configured_model_path(
+        models_dir,
+        &cfg.slm_escalation_gguf,
+        model_download::ESCALATION_GGUF_NAME,
+    );
+    if migrate_colliding_model_paths(cfg, models_dir)? {
+        cfg.save(cfg_path).map_err(|_| {
+            "BackLog could not save its repaired model settings. Check that its app-data folder \
+             is writable, then start BackLog again."
+                .to_string()
+        })?;
+    }
+    Ok(())
+}
+
 /// Normalize, validate, and persist an incoming configuration.
 ///
 /// Split out of the command so the policy — not the IPC plumbing — is what
@@ -179,9 +274,15 @@ fn apply_config(
     mut cfg: Config,
 ) -> Result<Config, String> {
     cfg.normalize();
+    cfg.clamp_resources_to_machine();
     if cfg.cache_dir.as_os_str().is_empty() {
         cfg.cache_dir = default_cache_dir.to_path_buf();
     }
+    let models_dir = default_cache_dir
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("models");
+    migrate_colliding_model_paths(&mut cfg, &models_dir)?;
     cfg.validate()?;
     cfg.save(cfg_path).map_err(|e| e.to_string())?;
     Ok(cfg)
@@ -779,7 +880,7 @@ async fn review_only_pipeline(
             llama_exe,
             grammar,
             cfg.slm_primary_gguf.clone(),
-            cfg.slm_escalation_gguf.clone(),
+            cfg.effective_escalation_gguf().to_path_buf(),
             // SlmLane derives the escalation port as `port + 1`; a hand-edited
             // config that never went through Config::validate must not be able
             // to overflow that add.
@@ -865,7 +966,7 @@ async fn start_pipeline(
         binary(&app, "llama-server")?,
         grammar,
         cfg.slm_primary_gguf.clone(),
-        cfg.slm_escalation_gguf.clone(),
+        cfg.effective_escalation_gguf().to_path_buf(),
         cfg.llama_port,
         cfg.slm_parallel,
     ));
@@ -887,31 +988,15 @@ async fn start_pipeline(
     Ok(())
 }
 
-/// How long the exit path waits after the first kill before killing again.
-///
-/// See `stop_pipeline_inner`: a worker that was already inside `SlmLane::propose`
-/// re-enters `ensure_up`, which respawns unconditionally, so one kill is not
-/// enough. This narrows the window; only the shutdown latch requested of
-/// model-runtime closes it.
-const RESPAWN_GRACE: Duration = Duration::from_millis(400);
-
 /// Tear the pipeline down. **Only reachable from the exit path** — see the
 /// `stop_pipeline` note below.
 ///
 /// Ordering: pause so anything already past the ingest gate parks instead of
 /// reaching for a sidecar that is about to disappear, close the ingest
 /// semaphore so queued watcher tasks bail out rather than start new work, then
-/// kill the model servers. Both llama-server processes hold a multi-GB GGUF
-/// resident, which is what matters on a machine whose user never opens Task
-/// Manager.
-///
-/// The second kill is not belt-and-braces, it is a known hole being narrowed:
-/// `SlmLane` has no shutdown latch, so `ensure_up` respawns whenever it finds
-/// the slot empty, and a worker that was mid-`propose` when the first kill
-/// landed will put a fresh llama-server there. Killing again after a short
-/// grace catches that one; a worker that is *inside* `spawn_server` across both
-/// kills still escapes. The real fix is the AtomicBool latch requested of
-/// model-runtime, which makes `ensure_up` fail closed instead of spawning.
+/// latch and kill the converter and model servers. Claims are process-local
+/// ownership and must be released before Tauri's `std::process::exit` skips
+/// every destructor.
 fn stop_pipeline_inner(state: &AppState) {
     let taken = state.pipeline.lock().unwrap().take();
     let Some(pipeline) = taken else { return };
@@ -919,15 +1004,28 @@ fn stop_pipeline_inner(state: &AppState) {
         .paused
         .store(true, std::sync::atomic::Ordering::Relaxed);
     pipeline.ingest_slots.close();
-    pipeline.slm.shutdown();
-    std::thread::sleep(RESPAWN_GRACE);
-    pipeline.slm.shutdown();
+    pipeline.slm.begin_shutdown();
+    let converter_failures = pipeline.sidecar.begin_shutdown();
+    if converter_failures > 0 {
+        log::error!(
+            "{converter_failures} converter process(es) could not be terminated during shutdown"
+        );
+    }
+    match pipeline.ledger.release_all_claims() {
+        Ok(0) => {}
+        Ok(released) => log::info!("released {released} active pipeline claims"),
+        Err(error) => log::warn!("could not release active pipeline claims: {error}"),
+    }
     // Deliberately NOT invalidating `last_preflight`: stopping says nothing
     // about whether this computer is still ready, and clearing it flipped
     // every row of the Readiness panel red with "Press Check again" — which,
     // for the user this appliance is built for, reads as "I broke it".
     // `get_runtime_status` already overlays the running/paused flags.
-    log::info!("pipeline stopped; llama-server terminated");
+    if converter_failures == 0 {
+        log::info!("pipeline stopped; converter and model servers terminated");
+    } else {
+        log::warn!("pipeline stopped; model server terminated, converter shutdown reported errors");
+    }
 }
 
 // `stop_pipeline` is deliberately NOT a command yet.
@@ -1040,8 +1138,108 @@ fn open_ledger_with_recovery(db_path: &Path) -> Result<(Arc<Ledger>, Option<Stri
     }
 }
 
+/// Claim a per-user Windows mutex before opening the ledger.
+///
+/// Startup recovery clears claims left by the prior process, so allowing two
+/// tray instances to initialize concurrently would make both believe they own
+/// the same document. The raw handle intentionally remains open for the
+/// lifetime of the process; Windows releases it automatically on exit.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SingleInstanceDecision {
+    Acquired,
+    AlreadyRunning,
+    Failed,
+}
+
+#[cfg(any(windows, test))]
+fn classify_single_instance(handle: isize, last_error: u32) -> SingleInstanceDecision {
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    if handle == 0 {
+        SingleInstanceDecision::Failed
+    } else if last_error == ERROR_ALREADY_EXISTS {
+        SingleInstanceDecision::AlreadyRunning
+    } else {
+        SingleInstanceDecision::Acquired
+    }
+}
+
+#[cfg(windows)]
+fn show_single_instance_failure() {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(window: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+    const MB_OK: u32 = 0;
+    const MB_ICONERROR: u32 = 0x10;
+    const MB_SETFOREGROUND: u32 = 0x0001_0000;
+    let text: Vec<u16> = "BackLog could not establish its single-instance safety guard, so it \
+                          will close without opening the processing ledger. Restart Windows or \
+                          contact IT."
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let caption: Vec<u16> = "BackLog could not start"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: both strings are NUL-terminated and remain alive for the call;
+    // a null owner is explicitly supported for a pre-window fatal dialog.
+    let _ = unsafe {
+        MessageBoxW(
+            0,
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        )
+    };
+}
+
+#[cfg(windows)]
+fn claim_single_instance() -> bool {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateMutexW(attributes: *mut c_void, initial_owner: i32, name: *const u16) -> isize;
+        fn GetLastError() -> u32;
+        fn CloseHandle(object: isize) -> i32;
+    }
+
+    let name: Vec<u16> = "Local\\ai.sonomos.backlog"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: attributes is null by contract, name is NUL-terminated and
+    // remains alive for the call, and the returned handle is checked.
+    let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+    // SAFETY: GetLastError is read immediately after CreateMutexW, before any
+    // other Windows API call can replace the thread-local value.
+    let last_error = unsafe { GetLastError() };
+    match classify_single_instance(handle, last_error) {
+        SingleInstanceDecision::Acquired => true,
+        SingleInstanceDecision::AlreadyRunning => {
+            // SAFETY: CreateMutexW returned a valid handle owned by this process.
+            let _ = unsafe { CloseHandle(handle) };
+            false
+        }
+        SingleInstanceDecision::Failed => {
+            eprintln!("BackLog could not create its single-instance guard.");
+            show_single_instance_failure();
+            false
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn claim_single_instance() -> bool {
+    true
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if !claim_single_instance() {
+        return;
+    }
     let notice: Arc<Mutex<Option<StartupNotice>>> = Arc::new(Mutex::new(None));
     let setup_notice = notice.clone();
 
@@ -1096,16 +1294,20 @@ pub fn run() {
             // `resolve_configured_model_path`'s doc comment.
             let models_dir = model_download::resolve_models_dir(app.handle());
             std::fs::create_dir_all(&models_dir).ok();
-            cfg.slm_primary_gguf = model_download::resolve_configured_model_path(
-                &models_dir,
-                &cfg.slm_primary_gguf,
-                model_download::PRIMARY_GGUF_NAME,
-            );
-            cfg.slm_escalation_gguf = model_download::resolve_configured_model_path(
-                &models_dir,
-                &cfg.slm_escalation_gguf,
-                model_download::ESCALATION_GGUF_NAME,
-            );
+            // v0.4.4 persisted the primary path into both fields whenever the
+            // optional model was missing. Migrate that collapsed value back to
+            // a distinct desired destination so an in-app escalation download
+            // becomes active on the next readiness check.
+            if let Err(message) =
+                repair_and_persist_startup_model_paths(&cfg_path, &mut cfg, &models_dir)
+            {
+                log::error!("model-path migration failed: {message}");
+                *setup_notice.lock().unwrap() = Some(StartupNotice {
+                    fatal: true,
+                    message,
+                });
+                return Ok(());
+            }
             // The installer ships the primary GGUF so a fresh machine can name
             // its first document without the 2.4 GB download.
             //
@@ -1173,6 +1375,22 @@ pub fn run() {
                     return Ok(());
                 }
             };
+            // Claims describe ownership by one running process, not durable
+            // document state. A crash cannot run ClaimGuard::drop, so recover
+            // those rows immediately instead of hiding them behind the stale
+            // timeout on the next launch.
+            match ledger.release_all_claims() {
+                Ok(0) => {}
+                Ok(released) => log::info!("recovered {released} interrupted pipeline claims"),
+                Err(error) => log::warn!("could not recover interrupted claims: {error}"),
+            }
+            match pipeline::reconcile_terminal_manifests(&cfg, &ledger) {
+                Ok(0) => {}
+                Ok(recovered) => {
+                    log::info!("reconciled {recovered} durable pipeline outcomes")
+                }
+                Err(error) => log::warn!("could not reconcile durable pipeline outcomes: {error}"),
+            }
 
             app.manage(AppState {
                 cfg_path,
@@ -1527,6 +1745,151 @@ mod tests {
         assert_eq!(reloaded.cache_dir, cache);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saving_colliding_model_paths_persists_honest_degraded_readiness() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for sub in ["proc", "out", "quar", "cache", "models"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        let shared_primary = root.join("models").join("shared.gguf");
+        std::fs::write(&shared_primary, b"primary model").unwrap();
+        let cfg_path = root.join("backlog.config.json");
+        let cache = root.join("cache");
+        let submitted = Config {
+            processing_dir: root.join("proc"),
+            outbox_dir: root.join("out"),
+            quarantine_dir: root.join("quar"),
+            cache_dir: cache.clone(),
+            slm_primary_gguf: shared_primary.clone(),
+            slm_escalation_gguf: shared_primary.clone(),
+            ..Default::default()
+        };
+
+        let saved = apply_config(&cfg_path, &cache, submitted).unwrap();
+        let expected_escalation = root
+            .join("models")
+            .join(model_download::ESCALATION_GGUF_NAME);
+        assert_eq!(saved.slm_primary_gguf, shared_primary);
+        assert_eq!(saved.slm_escalation_gguf, expected_escalation);
+
+        let reloaded = Config::load(&cfg_path);
+        assert_ne!(reloaded.slm_primary_gguf, reloaded.slm_escalation_gguf);
+        assert_eq!(reloaded.slm_escalation_gguf, expected_escalation);
+        assert_eq!(
+            reloaded.effective_escalation_gguf(),
+            shared_primary.as_path()
+        );
+
+        let paths = preflight::RuntimePaths {
+            sidecar: root.join("convertd"),
+            llama_server: root.join("llama-server"),
+            grammar: root.join("name.gbnf"),
+            models_dir: root.join("models"),
+            install_dir_error: None,
+        };
+        std::fs::write(
+            &paths.sidecar,
+            b"#!/bin/sh\nwhile IFS= read -r line; do\n  echo '{\"id\":1,\"ok\":true}'\ndone\n",
+        )
+        .unwrap();
+        std::fs::write(&paths.llama_server, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&paths.grammar, b"grammar").unwrap();
+        std::fs::set_permissions(&paths.sidecar, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&paths.llama_server, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let status = preflight::run_with(&paths, &reloaded, false, false).await;
+        assert!(status.configured);
+        assert!(status.primary_model_found);
+        assert!(!status.escalation_model_found);
+        assert!(status
+            .problems
+            .iter()
+            .any(|problem| problem.code == "escalation_model_missing_using_primary"));
+    }
+
+    #[test]
+    fn a_primary_at_the_canonical_escalation_path_is_rejected_not_persisted_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let cfg_path = dir.path().join("backlog.config.json");
+        let canonical_escalation = dir
+            .path()
+            .join("models")
+            .join(model_download::ESCALATION_GGUF_NAME);
+        let submitted = Config {
+            processing_dir: dir.path().join("proc"),
+            outbox_dir: dir.path().join("out"),
+            quarantine_dir: dir.path().join("quar"),
+            cache_dir: cache.clone(),
+            slm_primary_gguf: canonical_escalation.clone(),
+            slm_escalation_gguf: canonical_escalation,
+            ..Default::default()
+        };
+
+        let error = apply_config(&cfg_path, &cache, submitted).unwrap_err();
+        assert!(error.contains("must be different"), "got: {error}");
+        assert!(
+            !cfg_path.exists(),
+            "an unresolved model collision must never reach disk"
+        );
+    }
+
+    #[test]
+    fn startup_collision_migration_persists_repaired_distinct_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("backlog.config.json");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let shared_primary = models_dir.join(model_download::PRIMARY_GGUF_NAME);
+        let mut cfg = Config {
+            slm_primary_gguf: shared_primary.clone(),
+            slm_escalation_gguf: shared_primary.clone(),
+            ..Default::default()
+        };
+        cfg.save(&cfg_path).unwrap();
+
+        repair_and_persist_startup_model_paths(&cfg_path, &mut cfg, &models_dir).unwrap();
+
+        let expected_escalation = models_dir.join(model_download::ESCALATION_GGUF_NAME);
+        assert_eq!(cfg.slm_primary_gguf, shared_primary);
+        assert_eq!(cfg.slm_escalation_gguf, expected_escalation);
+        let reloaded = Config::load(&cfg_path);
+        assert_eq!(reloaded.slm_primary_gguf, shared_primary);
+        assert_eq!(reloaded.slm_escalation_gguf, expected_escalation);
+        assert_ne!(reloaded.slm_primary_gguf, reloaded.slm_escalation_gguf);
+    }
+
+    #[test]
+    fn windows_model_path_identity_ignores_case_and_separator_spelling() {
+        assert!(windows_paths_equivalent(
+            Path::new(r"C:\Users\Jane\AppData\Roaming\BackLog\models\Qwen3.gguf"),
+            Path::new(r"c:/users/jane/appdata/roaming/backlog/models/qWEN3.GGUF")
+        ));
+        assert!(!windows_paths_equivalent(
+            Path::new(r"C:\BackLog\models\primary.gguf"),
+            Path::new(r"C:\BackLog\models\escalation.gguf")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_model_aliases_are_treated_as_one_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("primary.gguf");
+        let alias = dir.path().join("primary-alias.gguf");
+        std::fs::write(&target, b"model").unwrap();
+        symlink(&target, &alias).unwrap();
+
+        assert!(model_paths_collide(&target, &alias));
+    }
+
     #[test]
     fn evidence_ids_must_stay_hex() {
         assert!(is_ledger_key(&"a".repeat(64)));
@@ -1536,6 +1899,14 @@ mod tests {
         assert!(!is_ledger_key("..%2f..%2fsecret"));
         assert!(!is_ledger_key("dead beef"));
         assert!(!is_ledger_key(&"a".repeat(91)));
+    }
+
+    #[test]
+    fn a_null_mutex_handle_fails_closed() {
+        assert_eq!(
+            classify_single_instance(0, 0),
+            SingleInstanceDecision::Failed
+        );
     }
 
     /// A DPAPI master key destroyed by a re-image leaves a key blob that

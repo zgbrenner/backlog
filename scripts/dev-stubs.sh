@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Create placeholder sidecar binaries so the full workspace build/tests run
-# on a fresh checkout. tauri-build validates externalBin + the bundle.resources
-# DLL glob at compile time; those files are gitignored (built via
-# scripts/build-sidecar.ps1 / downloaded per RELEASING.md). The trust core needs
-# none of this: `cargo test -p backlog-core`.
+# Create placeholder sidecar binaries and a placeholder primary model so the
+# full workspace build/tests run on a fresh checkout. tauri-build validates
+# externalBin and every bundle.resources glob at compile time; those files are
+# gitignored (built/downloaded for a release). The trust core needs none of
+# this: `cargo test -p backlog-core`.
 #
 # The stub names must carry the *host* target triple, because that is what
 # tauri-build resolves externalBin against. Hardcoding the Windows triple made
@@ -25,7 +25,9 @@ set -euo pipefail
 STUB_MARKER="BACKLOG-DEV-STUB-DO-NOT-SHIP"
 
 bin="$(cd "$(dirname "$0")/.." && pwd)/src-tauri/binaries"
+model="$(cd "$(dirname "$0")/.." && pwd)/src-tauri/resources/models/Qwen3-0.6B-Q8_0.gguf"
 mkdir -p "$bin"
+mkdir -p "$(dirname "$model")"
 
 host="$(rustc -vV | awk '/^host: /{print $2}')"
 if [ -z "$host" ]; then
@@ -34,7 +36,7 @@ if [ -z "$host" ]; then
 fi
 
 stub() { # stub <path>
-  printf '%s\n' "$STUB_MARKER" > "$1"
+  printf '%s' "$STUB_MARKER" > "$1"
 }
 
 stage() { # stage <triple>
@@ -61,5 +63,12 @@ if [ ! -s "$bin/_placeholder.dll" ]; then
   stub "$bin/_placeholder.dll"
 fi
 
-echo "Dev stub sidecar binaries staged in src-tauri/binaries/ for host '$host' and x86_64-pc-windows-msvc."
+# bundle.resources also requires at least one file to match models/*.gguf.
+# Never overwrite real weights; a release stages the hash-verified model here
+# and must be able to run this script safely before packaging.
+if [ ! -e "$model" ] || [ ! -s "$model" ]; then
+  stub "$model"
+fi
+
+echo "Dev stub sidecars and primary-model fixture staged for host '$host' and x86_64-pc-windows-msvc."
 echo "They carry the marker '$STUB_MARKER' and will fail scripts/verify-binaries.ps1."

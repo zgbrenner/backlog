@@ -95,11 +95,13 @@ counts from the current tree:
 
 ## Remaining validation before release
 
-Everything the gates cannot reach, because it needs Windows and real artifacts: the
-DPAPI key path, the NSIS bundle, install/repair/upgrade/uninstall, and an
-end-to-end run with the real sidecars and model weights. The release build is
-produced locally on a Windows machine and uploaded manually to a GitHub
-Release — see `RELEASING.md` and `docs/RELEASE_CHECKLIST.md`.
+Everything the local gates cannot reach, because it needs Windows and real
+artifacts: the DPAPI key path, the NSIS bundle,
+install/repair/upgrade/uninstall, and an end-to-end run with the real sidecars
+and model weights. The guarded GitHub release workflow builds the package on a
+clean Windows runner after successful CI, verifies its staged inputs, and
+publishes through a draft only after the artifact gates pass. See
+`RELEASING.md` and `docs/RELEASE_CHECKLIST.md`.
 
 ## Release gates that cannot be completed in source alone
 

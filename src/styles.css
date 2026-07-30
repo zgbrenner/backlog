@@ -431,6 +431,17 @@ button.danger:hover { background: var(--bad-soft); }
 .undo-strip .filing { flex: 1; line-height: 1.5; }
 .undo-strip .count { font-variant-numeric: tabular-nums; font-weight: 600; }
 
+/* This survives tab changes: filing has not happened until the countdown
+ * elapses, so Undo must remain available outside the review card. */
+.pending-approval-tray {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin: 10px 18px 0; padding: 9px 12px; border-radius: 8px;
+  background: var(--accent-soft); border: 1px solid var(--accent-line);
+  color: var(--text); font-size: 12.5px;
+}
+.pending-approval-tray span { flex: 1; min-width: 200px; }
+.pending-approval-tray button { padding: 6px 12px; }
+
 /* Not a warning: the card simply was not rebuilt, because rebuilding it would
  * have thrown away typing the reviewer has not filed yet. */
 .kept-note {
@@ -452,6 +463,19 @@ button.danger:hover { background: var(--bad-soft); }
   max-width: 900px; background: var(--panel); border: 1px solid var(--border);
   border-radius: 10px; padding: 16px;
 }
+.setup-intro {
+  max-width: 900px; margin: 0 0 18px; padding: 14px 16px;
+  background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: 10px;
+}
+.setup-intro h2 { margin: 0 0 5px; font-size: 16px; }
+.setup-intro p { margin: 0; color: var(--dim); line-height: 1.5; }
+.setup-steps { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+.setup-steps li { background: var(--panel); border: 1px solid var(--accent-line); border-radius: 999px; padding: 5px 10px; font-size: 12px; }
+.caught-up {
+  margin: 0 0 14px; padding: 11px 13px; border: 1px solid var(--ok-line);
+  border-radius: 8px; background: var(--ok-soft); color: var(--text); font-size: 12.5px; line-height: 1.5;
+}
+.caught-up strong { margin-right: 6px; color: var(--ok); }
 .settings h2 {
   font-size: 13px; text-transform: uppercase; letter-spacing: 0.8px;
   color: var(--dim); margin: 22px 0 10px;
@@ -547,6 +571,12 @@ details.advanced .dim-note { margin-bottom: 12px; }
   border-radius: 6px; padding: 8px 16px; font-weight: 600; cursor: pointer;
 }
 .model-download button:disabled { cursor: not-allowed; opacity: 0.6; }
+.model-download-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.model-download .cancel-download { background: transparent; color: var(--dim); border-color: var(--border); }
+.model-download-terminal { margin: 10px 0 0; font-size: 12.5px; line-height: 1.5; }
+.model-download-terminal.failed { color: var(--bad); }
+.model-download-terminal.cancelled { color: var(--warn); }
+.model-download-terminal.completed { color: var(--ok); }
 .progress-track {
   margin-top: 10px; height: 8px; border-radius: 999px; overflow: hidden;
   background: var(--panel2); border: 1px solid var(--border);

@@ -5,7 +5,7 @@
 use crate::checker::{fs_metadata_dates, CheckError, Checker};
 use crate::config::Config;
 use crate::filter::{self, Evidence};
-use crate::ledger::{JobState, Ledger};
+use crate::ledger::{Job, JobState, Ledger};
 use crate::manifest::{write_manifest, Manifest, Pacer, MANIFEST_SCHEMA_VERSION};
 use crate::routing::{self, Route};
 use crate::sidecar::{ConvertResult, Sidecar};
@@ -412,6 +412,14 @@ impl Pipeline {
             }
         };
         *clock.sha.lock().unwrap() = Some(sha.clone());
+
+        // `write_manifest` is atomic, but the process can still die in the
+        // few instructions before the ledger reaches its terminal state.
+        // The durable delivery is authoritative on replay, so do not ask a
+        // non-deterministic model to invent a second answer for the same id.
+        if self.recover_terminal_manifest(&sha, &original_relpath) {
+            return;
+        }
 
         // The sha256 is the event's key and original_path/name live in the
         // jobs row; don't duplicate the (PII) path into the audit log.
@@ -1140,6 +1148,42 @@ impl Pipeline {
             .unwrap_or_else(|| relpath(&self.cfg.processing_dir, path))
     }
 
+    /// Reconcile the ledger from an already-durable manifest.
+    ///
+    /// Returns true only when the file's exact content hash, normalized
+    /// Processing-relative identity, manifest id, and schema all agree. A
+    /// malformed or unrelated JSON file is ignored and normal processing
+    /// continues.
+    fn recover_terminal_manifest(&self, sha: &str, original_relpath: &str) -> bool {
+        let job = match self.ledger.get(sha) {
+            Ok(Some(job)) => job,
+            Ok(None) => return false,
+            Err(error) => {
+                log::warn!("could not inspect the ledger for manifest recovery: {error}");
+                return false;
+            }
+        };
+        match reconcile_terminal_manifest(
+            &self.cfg.manifests_dir(),
+            &self.ledger,
+            &job,
+            original_relpath,
+        ) {
+            Ok(Some(target)) => {
+                if target == JobState::Emitted {
+                    self.purge_cache(sha);
+                }
+                self.emit_update(sha);
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                log::warn!("could not reconcile the ledger from a durable manifest: {error}");
+                false
+            }
+        }
+    }
+
     /// A quarantine destination that cannot collide with another flagged file.
     ///
     /// The leaf name alone discards the Processing-relative subdirectory that
@@ -1170,22 +1214,22 @@ impl Pipeline {
     }
 
     async fn flag(&self, sha: &str, path: &Path, reason: String, clock: &WorkClock) {
-        // The guarded transition is the gate, so it goes first: a straggler
-        // must not be able to retro-flag a document Flow 2 already archived,
-        // and a second flagged manifest for the same delivery would fail
-        // write_manifest's identity check anyway.
-        match self.ledger.set_state(sha, JobState::Flagged) {
-            Ok(true) => {}
-            Ok(false) => {
-                log::warn!(
-                    "not flagging {sha} ({reason}): the job is already resolved or owned elsewhere"
-                );
+        // Do not freeze the ledger before the review file and its handoff are
+        // durable. The claim is the worker-ownership gate; this state check
+        // protects against a late timeout racing an operator decision.
+        let existing = match self.ledger.get(sha) {
+            Ok(Some(job)) => job,
+            Ok(None) => return,
+            Err(error) => {
+                log::error!("could not inspect {sha} before flagging: {error}");
                 return;
             }
-            Err(e) => {
-                log::error!("could not flag {sha}: {e}");
-                return;
-            }
+        };
+        if existing.state.is_resolved() || existing.state == JobState::Flagged {
+            log::warn!(
+                "not flagging {sha} ({reason}): the job is already resolved or under review"
+            );
+            return;
         }
 
         let original_relpath = self.identity_relpath(sha, path);
@@ -1196,15 +1240,11 @@ impl Pipeline {
         // instead of silently leaving the file orphaned in Processing while the
         // manifest claims it was quarantined.
         let _ = std::fs::create_dir_all(&self.cfg.quarantine_dir);
-        let mut quarantined: Option<String> = None;
-        if path.exists() {
+        let quarantined_path = if path.exists() {
             let dest = self.quarantine_dest(&mid, path);
             let moved = std::fs::rename(path, &dest).is_ok()
-                || match std::fs::copy(path, &dest) {
-                    Ok(_) => {
-                        let _ = std::fs::remove_file(path);
-                        true
-                    }
+                || match copy_then_remove(path, &dest) {
+                    Ok(()) => true,
                     Err(e) => {
                         log::error!("failed to quarantine a flagged file: {e}");
                         let _ = self.ledger.log_event(sha, "flag", "QUARANTINE_FAILED");
@@ -1212,28 +1252,36 @@ impl Pipeline {
                     }
                 };
             if moved {
-                quarantined = Some(dest.to_string_lossy().into_owned());
+                Some(dest)
+            } else {
+                None
             }
-        }
+        } else {
+            existing
+                .quarantine_path
+                .as_deref()
+                .map(PathBuf::from)
+                .filter(|candidate| candidate.is_file())
+        };
+        let Some(quarantined_path) = quarantined_path else {
+            log::error!("flagging could not preserve the review file for {sha}");
+            return;
+        };
+        let quarantined = quarantined_path.to_string_lossy().into_owned();
 
         // Persist where the file actually went; `resubmit` reads this column
         // rather than reconstructing a name that was never unique.
-        let _ = self.ledger.update_fields(
+        if let Err(error) = self.ledger.update_fields(
             sha,
             &[
                 ("flag_reason", Some(reason.clone())),
-                ("quarantine_path", quarantined),
+                ("quarantine_path", Some(quarantined)),
             ],
-        );
-        let _ = self.ledger.log_event(sha, "flag", &reason);
-        // Also to the app log. Flagging is not an edge case — a third to a half
-        // of a real batch lands in Needs Review — and until this line the only
-        // record of *why* was the encrypted ledger and one UI card at a time.
-        // `backlog.log` is the file the user is asked to paste into a support
-        // email, and it carried none of it. The reason is a fixed prefix plus a
-        // code, never document text; the sibling branch a few lines up already
-        // logs the same value for the same reason.
-        log::warn!("flagged: {reason}");
+        ) {
+            log::error!("could not record quarantine before flagging {sha}: {error}");
+            restore_quarantined(&quarantined_path, path);
+            return;
+        }
 
         clock.parked(self.pacer.permit()).await;
         let m = Manifest {
@@ -1255,13 +1303,38 @@ impl Pipeline {
             language: None,
             duplicate_of: None,
             soft_flags: vec![],
-            flag_reason: Some(reason),
+            flag_reason: Some(reason.clone()),
             model_versions: self.model_versions.clone(),
             processed_at: chrono::Utc::now().to_rfc3339(),
         };
-        if let Err(e) = write_manifest(&self.cfg.manifests_dir(), &m) {
-            log::error!("flagged manifest write failed for {sha}: {e}");
+        if let Err(error) = write_manifest(&self.cfg.manifests_dir(), &m) {
+            log::error!("flagged manifest write failed for {sha}: {error}");
+            if restore_quarantined(&quarantined_path, path) {
+                let _ = self.ledger.update_fields(sha, &[("quarantine_path", None)]);
+            } else {
+                log::error!("the review file could not be restored after manifest failure");
+            }
+            return;
         }
+
+        match self.ledger.set_state(sha, JobState::Flagged) {
+            Ok(true) => {}
+            Ok(false) => {
+                // The manifest is the recovery authority. A replay will
+                // reconcile this narrow post-write window without rerunning
+                // conversion or naming.
+                log::warn!("flagged manifest is durable but the ledger moved before commit");
+                return;
+            }
+            Err(error) => {
+                log::error!("flagged manifest is durable but ledger commit failed: {error}");
+                return;
+            }
+        }
+        let _ = self.ledger.log_event(sha, "flag", &reason);
+        // Flagging is a normal review outcome. Keep the reason code visible in
+        // support logs without writing document text.
+        log::warn!("flagged: {reason}");
         self.emit_update(sha);
     }
 
@@ -1446,6 +1519,89 @@ fn relpath(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Reconcile every unresolved row whose exact terminal manifest is already
+/// durable. This runs before the watcher starts, so a source moved to
+/// quarantine immediately before a crash does not need to reappear in
+/// Processing to finish its ledger transition.
+pub fn reconcile_terminal_manifests(cfg: &Config, ledger: &Ledger) -> anyhow::Result<usize> {
+    let manifests_dir = cfg.manifests_dir();
+    let mut recovered = 0usize;
+    for job in ledger.unresolved_jobs()? {
+        let original_relpath = job
+            .original_relpath
+            .clone()
+            .unwrap_or_else(|| relpath(&cfg.processing_dir, Path::new(job.original_path.as_str())));
+        if let Some(target) =
+            reconcile_terminal_manifest(&manifests_dir, ledger, &job, &original_relpath)?
+        {
+            if target == JobState::Emitted && !cfg.retain_cache {
+                let _ = std::fs::remove_file(cfg.cache_dir.join(format!("{}.md", job.sha256)));
+            }
+            recovered += 1;
+        }
+    }
+    Ok(recovered)
+}
+
+fn reconcile_terminal_manifest(
+    manifests_dir: &Path,
+    ledger: &Ledger,
+    job: &Job,
+    original_relpath: &str,
+) -> anyhow::Result<Option<JobState>> {
+    let mid = manifest_id(&job.sha256, original_relpath);
+    let path = manifests_dir.join(format!("{mid}.json"));
+    let manifest: Manifest = match std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        Some(manifest) => manifest,
+        None => return Ok(None),
+    };
+    if manifest.validate().is_err()
+        || manifest.manifest_id != mid
+        || manifest.sha256 != job.sha256
+        || crate::identity::normalize_relpath(&manifest.original_relpath)
+            != crate::identity::normalize_relpath(original_relpath)
+    {
+        log::warn!("ignored a manifest that did not match its ledger delivery");
+        return Ok(None);
+    }
+
+    let target = match manifest.status.as_str() {
+        "ok" => JobState::Emitted,
+        "flagged" => JobState::Flagged,
+        "dismissed" => JobState::Dismissed,
+        _ => return Ok(None),
+    };
+    if job.state == target {
+        return Ok(None);
+    }
+    let fields: Vec<(&str, Option<String>)> = match target {
+        JobState::Emitted => vec![
+            ("final_filename", manifest.new_filename.clone()),
+            ("proposed_date", manifest.date.clone()),
+            ("date_source", manifest.date_source.clone()),
+            ("description", manifest.description.clone()),
+            ("doc_type", manifest.doc_type.clone()),
+            ("language", manifest.language.clone()),
+            ("soft_flags", Some(manifest.soft_flags.join(","))),
+            ("model_versions", Some(manifest.model_versions.to_string())),
+        ],
+        JobState::Flagged | JobState::Dismissed => vec![
+            ("flag_reason", manifest.flag_reason.clone()),
+            ("model_versions", Some(manifest.model_versions.to_string())),
+        ],
+        _ => unreachable!("a manifest always maps to a terminal state"),
+    };
+    ledger.update_fields(&job.sha256, &fields)?;
+    if !ledger.set_state(&job.sha256, target)? {
+        return Ok(None);
+    }
+    let _ = ledger.log_event(&job.sha256, "recover", "reconciled durable manifest");
+    Ok(Some(target))
+}
+
 /// Startup sweep of orphaned document text. Deletes only entries whose job is
 /// genuinely finished (emitted/dismissed) or gone from the ledger entirely; a
 /// flagged or still in-flight job keeps its evidence regardless of age.
@@ -1517,6 +1673,58 @@ fn error_code(e: &anyhow::Error) -> &'static str {
         "ENCRYPTED"
     } else {
         "ERROR"
+    }
+}
+
+fn copy_then_remove(source: &Path, destination: &Path) -> std::io::Result<()> {
+    copy_then_remove_with(source, destination, |path| std::fs::remove_file(path))
+}
+
+fn copy_then_remove_with(
+    source: &Path,
+    destination: &Path,
+    remove_source: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    std::fs::copy(source, destination)?;
+    if let Err(error) = remove_source(source) {
+        if let Err(cleanup_error) = std::fs::remove_file(destination) {
+            log::error!(
+                "failed to remove an incomplete quarantine copy after source deletion failed: \
+                 {cleanup_error}"
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Roll a quarantined file back into Processing after a pre-terminal failure.
+///
+/// Refuses to overwrite a file that appeared at the original path while the
+/// worker was writing its manifest. In that rare case the quarantined copy is
+/// retained and the error is logged rather than destroying either version.
+fn restore_quarantined(quarantined: &Path, original: &Path) -> bool {
+    if original.exists() || !quarantined.is_file() {
+        return false;
+    }
+    if let Some(parent) = original.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    if std::fs::rename(quarantined, original).is_ok() {
+        return true;
+    }
+    match std::fs::copy(quarantined, original) {
+        Ok(_) => {
+            if std::fs::remove_file(quarantined).is_ok() {
+                true
+            } else {
+                let _ = std::fs::remove_file(original);
+                false
+            }
+        }
+        Err(_) => false,
     }
 }
 
@@ -2398,6 +2606,232 @@ server.serve_forever()
         // Each gets its own flagged manifest, keyed by its own instance id.
         assert!(h.manifest(&sha_a, "acme/scan.pdf").is_some());
         assert!(h.manifest(&sha_b, "zenith/scan.pdf").is_some());
+    }
+
+    /// A terminal state is earned only after both the review file and its
+    /// manifest are durable. A transient outbox failure must leave the source
+    /// in Processing so the watcher can retry it.
+    #[tokio::test]
+    async fn failed_flag_manifest_restores_the_source_and_stays_retryable() {
+        let h = Harness::new();
+        let (sha, path) = h.seed("retry/scan.pdf", "retryable document");
+        let manifests = h.pipeline.cfg.manifests_dir();
+        std::fs::write(&manifests, b"blocks create_dir_all").unwrap();
+
+        h.pipeline.clone().process_file(path.clone()).await;
+
+        let job = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(job.state, JobState::Ingested);
+        assert!(path.exists(), "the next watcher event must find the source");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "retryable document"
+        );
+        assert!(
+            h.quarantine_entries().is_empty(),
+            "rollback must not leave a second physical copy"
+        );
+        assert!(h.pipeline.ledger.try_claim(&sha, 3_600).unwrap());
+    }
+
+    #[tokio::test]
+    async fn valid_existing_ok_manifest_recovers_ledger_without_model_work() {
+        let h = Harness::new();
+        let rel = "recover/invoice.pdf";
+        let (sha, path) = h.seed(rel, "recoverable document");
+        h.pipeline
+            .ledger
+            .set_state(&sha, JobState::Validated)
+            .unwrap();
+        let expected_name = "2024-03-05 Acme Invoice.pdf";
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: manifest_id(&sha, rel),
+            sha256: sha.clone(),
+            status: "ok".into(),
+            original_name: "invoice.pdf".into(),
+            original_relpath: rel.into(),
+            new_filename: Some(expected_name.into()),
+            description: Some("Invoice from Acme Corporation for consulting services.".into()),
+            date: Some("2024-03-05".into()),
+            date_source: Some("document".into()),
+            doc_type: Some("invoice".into()),
+            language: Some("en".into()),
+            duplicate_of: None,
+            soft_flags: vec![],
+            flag_reason: None,
+            model_versions: json!({"convertd": "test"}),
+            processed_at: "2026-07-30T00:00:00Z".into(),
+        };
+        write_manifest(&h.pipeline.cfg.manifests_dir(), &manifest).unwrap();
+
+        h.pipeline.clone().process_file(path).await;
+        let job = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(job.state, JobState::Emitted);
+        assert_eq!(job.final_filename.as_deref(), Some(expected_name));
+        assert_eq!(job.proposed_date.as_deref(), Some("2024-03-05"));
+    }
+
+    #[test]
+    fn startup_reconciles_flagged_manifest_without_a_processing_source() {
+        let h = Harness::new();
+        let rel = "recover/scan.pdf";
+        let (sha, path) = h.seed(rel, "flagged before the crash");
+        h.pipeline
+            .ledger
+            .set_state(&sha, JobState::Converted)
+            .unwrap();
+
+        let quarantined = h.pipeline.cfg.quarantine_dir.join("interrupted-scan.pdf");
+        std::fs::rename(&path, &quarantined).unwrap();
+        h.pipeline
+            .ledger
+            .update_fields(
+                &sha,
+                &[
+                    ("flag_reason", Some("UNREADABLE:scan".into())),
+                    (
+                        "quarantine_path",
+                        Some(quarantined.to_string_lossy().into_owned()),
+                    ),
+                ],
+            )
+            .unwrap();
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: manifest_id(&sha, rel),
+            sha256: sha.clone(),
+            status: "flagged".into(),
+            original_name: "scan.pdf".into(),
+            original_relpath: rel.into(),
+            new_filename: None,
+            description: None,
+            date: None,
+            date_source: None,
+            doc_type: None,
+            language: None,
+            duplicate_of: None,
+            soft_flags: vec![],
+            flag_reason: Some("UNREADABLE:scan".into()),
+            model_versions: json!({"convertd": "test"}),
+            processed_at: "2026-07-30T00:00:00Z".into(),
+        };
+        write_manifest(&h.pipeline.cfg.manifests_dir(), &manifest).unwrap();
+
+        assert!(!path.exists(), "the watcher cannot rediscover this source");
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            1
+        );
+        assert_eq!(
+            h.pipeline.ledger.get(&sha).unwrap().unwrap().state,
+            JobState::Flagged
+        );
+        assert!(quarantined.is_file());
+    }
+
+    #[test]
+    fn failed_source_delete_removes_the_cross_volume_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("processing.pdf");
+        let destination = dir.path().join("quarantine.pdf");
+        std::fs::write(&source, b"one authoritative copy").unwrap();
+
+        let error = copy_then_remove_with(&source, &destination, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "source is locked",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            source.is_file(),
+            "the retry source must remain in Processing"
+        );
+        assert!(
+            !destination.exists(),
+            "a failed move must not leave a quarantine duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_existing_manifest_does_not_bypass_model_work() {
+        let h = Harness::new();
+        let rel = "recover/invoice.pdf";
+        let (sha, path) = h.seed(rel, "recoverable document");
+        let wrong_sha = "f".repeat(64);
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: manifest_id(&sha, rel),
+            sha256: wrong_sha,
+            status: "flagged".into(),
+            original_name: "invoice.pdf".into(),
+            original_relpath: rel.into(),
+            new_filename: None,
+            description: None,
+            date: None,
+            date_source: None,
+            doc_type: None,
+            language: None,
+            duplicate_of: None,
+            soft_flags: vec![],
+            flag_reason: Some("UNREADABLE:test".into()),
+            model_versions: json!({}),
+            processed_at: "2026-07-30T00:00:00Z".into(),
+        };
+        write_manifest(&h.pipeline.cfg.manifests_dir(), &manifest).unwrap();
+
+        h.pipeline.clone().process_file(path).await;
+
+        let events = h.pipeline.ledger.events_for(&sha, 20).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.stage == "convert" && event.detail.contains("failed")),
+            "an identity mismatch must continue through real converter work: {events:?}"
+        );
+        assert!(!h
+            .pipeline
+            .ledger
+            .get(&sha)
+            .unwrap()
+            .unwrap()
+            .state
+            .is_resolved());
+    }
+
+    #[tokio::test]
+    async fn malformed_existing_manifest_does_not_bypass_model_work() {
+        let h = Harness::new();
+        let rel = "recover/malformed.pdf";
+        let (sha, path) = h.seed(rel, "recoverable document");
+        let manifest_path = h
+            .pipeline
+            .cfg
+            .manifests_dir()
+            .join(format!("{}.json", manifest_id(&sha, rel)));
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, b"{ this is not json").unwrap();
+
+        h.pipeline.clone().process_file(path).await;
+
+        let events = h.pipeline.ledger.events_for(&sha, 20).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.stage == "convert" && event.detail.contains("failed")),
+            "malformed JSON must continue through real converter work: {events:?}"
+        );
+        assert!(!h
+            .pipeline
+            .ledger
+            .get(&sha)
+            .unwrap()
+            .unwrap()
+            .state
+            .is_resolved());
     }
 
     /// P5 at the orchestrator boundary: a straggler must not be able to drag
