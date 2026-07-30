@@ -365,6 +365,15 @@ export function validateBuildDependencyLock(buildScriptSource, buildLockSource) 
   return problems;
 }
 
+export function validateRustToolchain(toolchainSource) {
+  const channel = /^\s*channel\s*=\s*"([^"]+)"\s*$/m.exec(toolchainSource)?.[1];
+  if (!channel) return ["rust-toolchain.toml must declare a channel"];
+  if (!/^\d+\.\d+\.\d+$/.test(channel)) {
+    return ["Rust must be pinned to an exact major.minor.patch version"];
+  }
+  return [];
+}
+
 function runCli() {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const workflow = readFileSync(path.join(root, ".github/workflows/release.yml"), "utf8");
@@ -374,9 +383,11 @@ function runCli() {
     path.join(root, "sidecar/build-requirements.lock"),
     "utf8",
   );
+  const toolchain = readFileSync(path.join(root, "rust-toolchain.toml"), "utf8");
   const problems = [
     ...validateReleaseWorkflow(workflow, stage),
     ...validateBuildDependencyLock(buildScript, buildLock),
+    ...validateRustToolchain(toolchain),
   ];
   if (problems.length) {
     console.error("Release workflow contract is broken:");
