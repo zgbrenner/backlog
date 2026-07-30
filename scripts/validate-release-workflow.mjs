@@ -296,6 +296,7 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   }
   const assertRetryState = (run, expectedName) => {
     const modeCheck = run.indexOf(`$release.name -ne "${expectedName}"`);
+    const retarget = run.indexOf("retarget-release-draft.ps1");
     const upload = run.indexOf("gh release upload");
     const finalAssetCheck = run.lastIndexOf("Compare-Object");
     const edit = run.indexOf("gh release edit");
@@ -309,8 +310,10 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     if (
       !run.includes("--json isDraft,name") ||
       modeCheck < 0 ||
+      retarget < 0 ||
       upload < 0 ||
-      modeCheck > upload
+      modeCheck > retarget ||
+      retarget > upload
     ) {
       problems.push(
         `interrupted ${expectedName} drafts must retain their durable signed or unsigned mode`,
@@ -422,12 +425,39 @@ export function validateReleaseTargetGuard(guardSource) {
   return problems;
 }
 
+export function validateReleaseDraftRetarget(retargetSource) {
+  const problems = [];
+  for (const required of [
+    "databaseId,isDraft,name,tagName,targetCommitish",
+    "$release.targetCommitish -notmatch '^[0-9a-fA-F]{40}$'",
+    "git ls-remote --exit-code --tags",
+    "$tagExit -ne 2",
+    "compare/$oldSha...$newSha",
+    '$comparison.status -ne "ahead"',
+    "gh api --method PATCH",
+    '-f "target_commitish=$ExpectedSha"',
+    "assert-release-tag.ps1",
+  ]) {
+    if (!retargetSource.includes(required)) {
+      problems.push(
+        "draft retargeting must allow only an untagged draft to advance to a tested descendant",
+      );
+      break;
+    }
+  }
+  return problems;
+}
+
 function runCli() {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const workflow = readFileSync(path.join(root, ".github/workflows/release.yml"), "utf8");
   const stage = readFileSync(path.join(root, "scripts/stage-release-inputs.ps1"), "utf8");
   const targetGuard = readFileSync(
     path.join(root, "scripts/assert-release-tag.ps1"),
+    "utf8",
+  );
+  const draftRetarget = readFileSync(
+    path.join(root, "scripts/retarget-release-draft.ps1"),
     "utf8",
   );
   const buildScript = readFileSync(path.join(root, "scripts/build-sidecar.ps1"), "utf8");
@@ -441,6 +471,7 @@ function runCli() {
     ...validateBuildDependencyLock(buildScript, buildLock),
     ...validateRustToolchain(toolchain),
     ...validateReleaseTargetGuard(targetGuard),
+    ...validateReleaseDraftRetarget(draftRetarget),
   ];
   if (problems.length) {
     console.error("Release workflow contract is broken:");
