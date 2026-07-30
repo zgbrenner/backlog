@@ -43,6 +43,12 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     problems.push("release workflow default permissions must be read-only");
   }
   if (
+    workflow?.concurrency?.group !== "release-v0.5.0" ||
+    workflow?.concurrency?.["cancel-in-progress"] !== true
+  ) {
+    problems.push("a newer tested release must cancel superseded packaging work");
+  }
+  if (
     String(workflow?.env?.RELEASE_SHA ?? "") !==
     "${{ github.event.workflow_run.head_sha }}"
   ) {
