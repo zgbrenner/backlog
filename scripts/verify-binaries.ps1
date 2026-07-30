@@ -91,6 +91,86 @@ function Test-CarriesStubMarker {
     return $text.Contains($StubMarker)
 }
 
+# DLLs that a stock Windows 10/11 x64 already has, so shipping them would be
+# redundant. Everything outside this list has to travel in the bundle. The
+# api-ms-win-* names are the Universal CRT, in-box since Windows 10 -- which is
+# exactly why vcruntime140.dll looks harmless next to them and is not: the UCRT
+# ships with the OS, the VC++ runtime ships with the Visual C++ Redistributable.
+$InBoxDlls = @(
+    "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "cfgmgr32.dll",
+    "combase.dll", "comctl32.dll", "comdlg32.dll", "crypt32.dll", "dbghelp.dll",
+    "dnsapi.dll", "dwmapi.dll", "gdi32.dll", "imm32.dll", "iphlpapi.dll",
+    "kernel32.dll", "kernelbase.dll", "mswsock.dll", "msvcrt.dll", "ncrypt.dll",
+    "normaliz.dll", "ntdll.dll", "ole32.dll", "oleacc.dll", "oleaut32.dll",
+    "powrprof.dll", "propsys.dll", "psapi.dll", "rpcrt4.dll", "sechost.dll",
+    "secur32.dll", "setupapi.dll", "shcore.dll", "shell32.dll", "shlwapi.dll",
+    "ucrtbase.dll", "user32.dll", "userenv.dll", "uxtheme.dll", "version.dll",
+    "winhttp.dll", "wininet.dll", "winmm.dll", "windows.storage.dll",
+    "ws2_32.dll", "wtsapi32.dll"
+)
+
+function Get-ImportedDllNames {
+    <#
+      The names in a PE's import directory, lowercased. Reads the file rather than
+      loading it, so it reports what the binary needs on a machine that does not
+      have those DLLs -- which is the only machine whose answer matters here.
+    #>
+    param([string] $Path)
+    $b = [System.IO.File]::ReadAllBytes($Path)
+    $pe = [System.BitConverter]::ToInt32($b, 0x3C)
+    $coff = $pe + 4
+    $sectionCount = [System.BitConverter]::ToUInt16($b, $coff + 2)
+    $optSize = [System.BitConverter]::ToUInt16($b, $coff + 16)
+    $opt = $coff + 20
+    $magic = [System.BitConverter]::ToUInt16($b, $opt)
+    # PE32+ has 16 more bytes of optional header before the data directories.
+    if ($magic -eq 0x20B) { $dirs = $opt + 112 } else { $dirs = $opt + 96 }
+    $importRva = [System.BitConverter]::ToUInt32($b, $dirs + 8)
+    if ($importRva -eq 0) { return @() }
+
+    $sections = @()
+    $sectionBase = $opt + $optSize
+    for ($i = 0; $i -lt $sectionCount; $i++) {
+        $o = $sectionBase + ($i * 40)
+        $virtualSize = [System.BitConverter]::ToUInt32($b, $o + 8)
+        $rawSize = [System.BitConverter]::ToUInt32($b, $o + 16)
+        $span = $virtualSize
+        if ($rawSize -gt $span) { $span = $rawSize }
+        $sections += [pscustomobject]@{
+            VAddr = [System.BitConverter]::ToUInt32($b, $o + 12)
+            Span  = $span
+            Raw   = [System.BitConverter]::ToUInt32($b, $o + 20)
+        }
+    }
+
+    function Convert-RvaToOffset {
+        param([uint32] $Rva, $Sections)
+        foreach ($s in $Sections) {
+            if ($Rva -ge $s.VAddr -and $Rva -lt ($s.VAddr + $s.Span)) {
+                return [int]($s.Raw + ($Rva - $s.VAddr))
+            }
+        }
+        return -1
+    }
+
+    $names = @()
+    $base = Convert-RvaToOffset -Rva $importRva -Sections $sections
+    if ($base -lt 0) { return @() }
+    for ($i = 0; $i -lt 4096; $i++) {
+        $entry = $base + ($i * 20)
+        if (($entry + 20) -gt $b.Length) { break }
+        $nameRva = [System.BitConverter]::ToUInt32($b, $entry + 12)
+        $firstThunk = [System.BitConverter]::ToUInt32($b, $entry + 16)
+        if ($nameRva -eq 0 -and $firstThunk -eq 0) { break }   # null terminator
+        $nameOffset = Convert-RvaToOffset -Rva $nameRva -Sections $sections
+        if ($nameOffset -lt 0) { break }
+        $end = $nameOffset
+        while ($end -lt $b.Length -and $b[$end] -ne 0) { $end++ }
+        $names += ([System.Text.Encoding]::ASCII.GetString($b, $nameOffset, $end - $nameOffset)).ToLowerInvariant()
+    }
+    return $names
+}
+
 if (-not (Test-Path $BinDir)) {
     Write-Error "binaries directory not found: $BinDir. Run RELEASING.md Build steps 1-2 first."
 }
@@ -150,7 +230,44 @@ else {
             $failures.Add("$($dll.Name) is not a valid PE image.")
         }
     }
-    Write-Host "ok    $($realDlls.Count) llama runtime DLL(s)" -ForegroundColor Green
+    Write-Host "ok    $($realDlls.Count) runtime DLL(s)" -ForegroundColor Green
+}
+
+# The dependency every "one download, nothing else to install" claim turns on.
+# Windows resolves an import from the loading module's own directory first, so a
+# DLL that travels in the bundle satisfies it; one that does not has to already be
+# on the machine. Every ggml*.dll and llama*.dll imports vcruntime140.dll and
+# msvcp140.dll, which arrive only with the VC++ Redistributable -- so before those
+# were staged here, a clean Windows could install this app, pass its own readiness
+# check, and then fail to load the naming engine, because the exe and its DLLs are
+# all present and the missing piece is one level down. Nothing else catches this:
+# every machine that builds or tests a Tauri app has the redistributable already.
+$bundledDlls = @{}
+foreach ($dll in $realDlls) { $bundledDlls[$dll.Name.ToLowerInvariant()] = $true }
+$checked = 0
+$unsatisfied = @{}
+foreach ($file in @($realDlls) + @($RequiredBinaries | ForEach-Object { Get-Item (Join-Path $BinDir $_) -ErrorAction SilentlyContinue })) {
+    if ($null -eq $file) { continue }
+    if (Test-CarriesStubMarker $file.FullName) { continue }   # already reported above
+    $checked++
+    foreach ($needed in (Get-ImportedDllNames $file.FullName)) {
+        if ($needed.StartsWith("api-ms-win-")) { continue }
+        if ($bundledDlls.ContainsKey($needed)) { continue }
+        if ($InBoxDlls -contains $needed) { continue }
+        if (-not $unsatisfied.ContainsKey($needed)) { $unsatisfied[$needed] = @() }
+        $unsatisfied[$needed] += $file.Name
+    }
+}
+if ($unsatisfied.Count -gt 0) {
+    foreach ($needed in ($unsatisfied.Keys | Sort-Object)) {
+        $needers = $unsatisfied[$needed]
+        $shown = ($needers | Select-Object -First 3) -join ", "
+        if ($needers.Count -gt 3) { $shown = "$shown and $($needers.Count - 3) more" }
+        $failures.Add("$needed is imported by $shown but is neither in $BinDir nor part of a stock Windows. Copy it from the VC++ redistributable at 'C:\Program Files\Microsoft Visual Studio\2022\<edition>\VC\Redist\MSVC\<version>\x64\Microsoft.VC143.CRT', or add it to `$InBoxDlls if it really is in-box.")
+    }
+}
+else {
+    Write-Host "ok    $checked binary/binaries import nothing a clean Windows lacks" -ForegroundColor Green
 }
 
 foreach ($note in $notes) { Write-Host "note  $note" -ForegroundColor Yellow }

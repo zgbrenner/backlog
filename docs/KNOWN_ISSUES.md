@@ -393,23 +393,35 @@ again** that calls `reset_for_reprocess`, or an `undismiss` command with the
 matching `(Dismissed, Ingested)` transition allowed. Both need a decision about
 what Flow 2 does with the already-indexed dismissed row.
 
-### 11. GitHub Actions has never executed; `scripts/ci-local.sh` is the enforcing copy
-`.github/workflows/ci.yml` is committed, is syntactically valid and is
-triggered on every push — and has never run a single step. Every run in the
-workflow's history is `conclusion: failure` within 2–17 seconds of creation,
-every job in every run reports `runner_id: 0` with an empty `runner_name`, and
-the log download for any of them is an HTTP 404 because no log was ever
-produced. That is the signature of a run that is created and then never
-assigned a runner. `zgbrenner/backlog` is a **private** repository, so it draws
-on the account's free Actions allowance rather than the unmetered public pool,
-and the allowance is spent.
+### 11. GitHub Actions runs and costs nothing, but one job cannot pass; `scripts/ci-local.sh` is still the enforcing copy
+**This item said the opposite until 0.4.4 and was believed for several releases,
+so read the correction first.** It used to record that `ci.yml` had never
+executed a step: every run failed within 2–17 seconds, every job reported
+`runner_id: 0` with an empty `runner_name`, and log downloads 404'd, which is
+the signature of a run created and never assigned a runner. That was true of a
+**private** `zgbrenner/backlog` whose free allowance was spent.
 
-Consequence, and the reason this is an item rather than a footnote: **"CI is
-green" is not a fact anyone can obtain about this repository today.** The gates
-in `ci.yml` are enforced only by `scripts/ci-local.sh`, which runs the same five
-jobs on a developer's machine. `.github/scripts/check-ci-parity.mjs` exists to
-keep the two in lockstep, so that the day Actions is switched on the workflow
-does not fail on drift accumulated while nobody could see it.
+The repository is **public** now, so Actions draws on the unmetered public pool.
+Runs execute properly — three to four minutes, real steps, real logs — and the
+timing API reports `billable_ms: 0` for every one of them, because public
+repositories are not billed on standard runners. Nobody noticed the change
+because the file's own header comment still said the runs were dying unassigned,
+which is a good argument for not writing a durable claim about live
+infrastructure into a source comment.
+
+What is actually true: **four of the five jobs pass; `Workspace (app crate)`
+cannot.** `tauri-build` resolves `bundle.resources`, whose
+`resources/models/*.gguf` glob matches nothing on a runner, and the build script
+exits 1 with `glob pattern resources/models/*.gguf path not found`. The weights
+are 639 MB and 1.8 GB and are correctly not committed, so no runner can satisfy
+it; the job would need `--no-default-features`, a stub `.gguf`, or its own
+target. Until then a red X on that job means "there are no weights here", not
+"the app crate is broken", and **"CI is green" is still not obtainable** — for a
+different reason than this item gave for four releases.
+
+The gates that matter are enforced by `scripts/ci-local.sh`, which runs the same
+five jobs on a Windows machine that does have the weights.
+`.github/scripts/check-ci-parity.mjs` keeps the two definitions in lockstep.
 
 Because "run it before you push" is a request and not a gate, the tracked
 `.githooks/` directory makes it one: `pre-push` runs the whole of
@@ -424,9 +436,14 @@ so they remain a gate against mistakes rather than against intent.
 its CI-green box explicitly unsatisfiable, in the same way as the hash-pinned
 lock in item 2.
 
-**Fix:** enable billing for Actions on the account, or make the repository
-public. Either resolves it without a code change; until one of them happens,
-the honest statement is the one above.
+**Fix:** give the workspace job something to match — a committed zero-byte
+`resources/models/.gitkeep.gguf` would satisfy the glob without shipping
+weights, at the cost of a file that exists only to appease a build script — or
+build that job with the resource glob disabled. Both are code changes on a job
+that has never gated anything, which is why neither has been made. The
+workflows are currently **disabled at the repository level** (`gh workflow
+enable ci.yml` reverses it) so that a permanently-red job does not read as a
+broken build.
 
 ## Closed since `PRODUCTION_READINESS.md` was written
 

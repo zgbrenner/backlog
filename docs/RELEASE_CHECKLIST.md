@@ -109,6 +109,16 @@ only exists for air-gapped deployment.
       the in-app readiness check still passes a marked stub, because
       `preflight.rs`'s `binary_exists` only requires a non-empty file
       (`docs/KNOWN_ISSUES.md` item 9).
+- [ ] **Nothing imports a DLL the target machine will not have.** The same
+      `pwsh scripts/verify-binaries.ps1` reads the import directory of every
+      shipped binary and fails if an imported DLL is neither staged in
+      `src-tauri/binaries/` nor part of a stock Windows. This is the check that
+      would have caught 0.4.3 shipping without `vcruntime140.dll`,
+      `vcruntime140_1.dll` and `msvcp140.dll`: every `ggml*.dll` and
+      `llama*.dll` imports them, Windows does not have them, and **no machine
+      that can build this app can observe the problem**, because building a
+      Tauri app requires the redistributable that supplies them. If a llama.cpp
+      bump adds a new import, this is what will say so.
 - [ ] `bundle.windows.webviewInstallMode` is `offlineInstaller` and
       `bundle.windows.nsis.installMode` is `currentUser` in `tauri.conf.json`.
       (Per-machine would make every passive auto-update raise a UAC prompt the

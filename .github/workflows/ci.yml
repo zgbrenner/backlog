@@ -1,12 +1,19 @@
 name: CI
 
-# NOTE: this workflow has never actually executed. Actions is triggered on
-# every push and every run dies in seconds with no runner assigned, because the
-# account's allowance for this private repo is spent (docs/KNOWN_ISSUES.md item
-# 11). `scripts/ci-local.sh` runs the same five jobs and is the copy that
-# enforces anything today; check-ci-parity.mjs keeps the two identical so this
-# file is correct on the day Actions is switched on. Do not cite it as evidence
-# that a commit is green.
+# NOTE: this workflow does execute, and costs nothing — the repository is public,
+# so runs come from the unmetered pool and the timing API reports billable_ms: 0.
+# An earlier version of this comment said it had never run at all, which was true
+# while the repo was private and its allowance was spent, and stayed here long
+# after it stopped being true. Do not write durable claims about live
+# infrastructure into a source comment; see docs/KNOWN_ISSUES.md item 11.
+#
+# Four of the five jobs pass. `Workspace (app crate)` cannot: tauri-build resolves
+# bundle.resources and the resources/models/*.gguf glob matches nothing on a
+# runner, so the build script exits 1 before any test runs. The weights are 2.4 GB
+# and are correctly not committed. `scripts/ci-local.sh` runs the same five jobs on
+# a machine that has them, and is the copy that enforces anything today;
+# check-ci-parity.mjs keeps the two identical. Do not cite a green tick here as
+# evidence that a commit is good, or a red one as evidence that it is broken.
 #
 # Every job here is designed for a Linux runner with no Windows, no sidecar
 # binaries

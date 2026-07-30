@@ -15,6 +15,51 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.4.4] — the installer was missing three DLLs it could never have noticed
+
+### Fixed
+
+**Every `ggml*.dll` and `llama*.dll` in the bundle imports `vcruntime140.dll` and
+`msvcp140.dll`, and two also import `vcruntime140_1.dll`. None of the three was
+shipped, and Windows does not have them** — they arrive with the Visual C++
+2015–2022 Redistributable. On a machine that had never installed it, every
+release up to and including 0.4.3 would install cleanly, launch, pass its own
+readiness check, and then fail to start the naming engine, because the exe and
+all 29 of its DLLs were present and the missing piece was one level below them.
+All three are now staged app-locally beside the executables that import them
+(`NOTICE.md` records the redistribution).
+
+**Why no amount of testing here would have found it:** every machine that can
+build a Tauri app has the redistributable installed, so the dependency is always
+satisfied on the machine that packages the release and never mentioned by
+anything that runs there. It is only visible by reading the import tables, which
+is now a gate — `scripts/verify-binaries.ps1` parses the import directory of
+every shipped binary and fails the release if any imported DLL is neither in the
+bundle nor part of a stock Windows. Verified by removing `vcruntime140.dll` and
+confirming it exits 1 naming the file, rather than trusting that a new check
+works.
+
+### Changed
+
+- `.githooks/pre-push` reads the ref list git feeds it and skips when every ref
+  is a commit `origin` already has. Pushing a tag straight after its branch was
+  re-running the whole three-minute suite on an identical tree, and two cargo
+  builds seconds apart contend over `target/` — the second run failed a gate the
+  first had just passed and then passed on retry with nothing changed.
+
+### Documentation
+
+- **`docs/KNOWN_ISSUES.md` item 11 was wrong, and `ci.yml`'s header comment was
+  the reason nobody noticed.** Both stated that Actions had never executed a
+  step because the private repository's allowance was spent. That was true when
+  written; the repository is public now, runs execute normally, and the timing
+  API reports `billable_ms: 0` for every one of them because public repositories
+  are not billed. The accurate statement is narrower: four of the five jobs
+  pass, and `Workspace (app crate)` cannot, because `tauri-build` resolves
+  `bundle.resources` and `resources/models/*.gguf` matches nothing on a runner
+  that has no 2.4 GB of weights. The workflows are disabled at the repository
+  level so a permanently-red job does not read as a broken build.
+
 ## [0.4.3] — the filename says whose document it is
 
 ### A character cap cannot enforce a word count

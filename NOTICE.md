@@ -40,9 +40,18 @@ ZIP, that ZIP is a redistribution and carries the same obligation.
 | Component | Version / artifact | License | Source |
 |---|---|---|---|
 | llama.cpp `llama-server.exe` | release `b10091`, `llama-b10091-bin-win-cpu-x64.zip` | MIT | <https://github.com/ggml-org/llama.cpp> |
-| llama.cpp runtime DLLs (~13: `llama*.dll`, `ggml*.dll`, `mtmd.dll`) | same release | MIT | same |
+| llama.cpp runtime DLLs (29: `llama*.dll`, `ggml*.dll`, `mtmd.dll`) | same release | MIT | same |
 | `libomp140.x86_64.dll` (LLVM OpenMP runtime, shipped in the same zip) | as distributed by llama.cpp | Apache-2.0 with LLVM exception | <https://llvm.org> |
 | Microsoft WebView2 Evergreen runtime installer | bundled by `bundle.windows.webviewInstallMode: offlineInstaller` | Microsoft WebView2 distribution terms | <https://developer.microsoft.com/microsoft-edge/webview2/> |
+| `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll` | Visual C++ 2015–2022 Redistributable 14.44.35112, `Microsoft.VC143.CRT` | Microsoft redistributable-code terms for Visual Studio | <https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files> |
+
+The Visual C++ runtime DLLs are redistributed **app-locally** — installed beside
+the executables that import them, not into the system directory — which is the
+deployment mode Microsoft's redistribution terms permit for these files. Every
+`ggml*.dll` and `llama*.dll` imports them, and Windows does not ship them, so
+without them the naming engine cannot load on a machine that has never installed
+the redistributable. `scripts/verify-binaries.ps1` fails the release if any
+imported DLL is neither bundled here nor part of a stock Windows.
 
 The exact SHA-256 of every one of these is recorded per release
 (`RELEASING.md` Build step 2, `scripts/verify-binaries.ps1`).

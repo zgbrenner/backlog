@@ -92,17 +92,30 @@ Expand-Archive llama.zip -DestinationPath llama-cpu -Force
 Copy-Item llama-cpu\llama-server.exe src-tauri\binaries\llama-server-x86_64-pc-windows-msvc.exe
 # llama-server.exe is a thin stub — it needs its runtime DLLs beside it:
 Copy-Item llama-cpu\*.dll src-tauri\binaries\
+
+# ...and those DLLs in turn need the Visual C++ runtime, which llama.cpp does not
+# ship and Windows does not have. Without these three the naming engine cannot
+# load on any machine that has never installed the redistributable — which is no
+# machine you are likely to test on, since building this app requires it.
+$crt = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.CRT"
+Copy-Item "$crt\vcruntime140.dll", "$crt\vcruntime140_1.dll", "$crt\msvcp140.dll" src-tauri\binaries\
 ```
 
 > **DLL bundling caveat.** Unlike `convertd` (a self-contained PyInstaller
-> onefile), `llama-server.exe` loads ~13 DLLs (`llama*.dll`, `ggml*.dll`,
-> `mtmd.dll`, `libomp140.x86_64.dll`). Tauri's `externalBin` only bundles the
-> single `.exe`, so those DLLs must be shipped **next to the app executable**
-> in the installed app. This is configured in `tauri.conf.json` (the llama DLLs
-> are declared as `bundle.resources` mapped to the app root). After
-> `npm run tauri build`, inspect `src-tauri/target/release/` and confirm the
-> DLLs sit alongside `BackLog.exe` and the sidecars; then install once and
-> confirm the SLM lane starts (Settings → Start with a model configured).
+> onefile), `llama-server.exe` loads 29 DLLs (`llama*.dll`, `ggml*.dll`,
+> `mtmd.dll`, `libomp140.x86_64.dll`) plus the three VC runtime files above.
+> Tauri's `externalBin` only bundles the single `.exe`, so those DLLs must be
+> shipped **next to the app executable** in the installed app. This is
+> configured in `tauri.conf.json` (`binaries/*.dll` is declared in
+> `bundle.resources`, mapped to the app root). After `npm run tauri build`,
+> inspect `src-tauri/target/release/` and confirm the DLLs sit alongside
+> `BackLog.exe` and the sidecars; then install once and confirm the SLM lane
+> starts (Settings → Start with a model configured).
+>
+> Do not verify this by launching the app on a build machine — it will work
+> there whether or not the VC runtime is bundled, because the machine has it
+> installed system-wide. `pwsh scripts/verify-binaries.ps1` reads the import
+> tables instead and is the only check that answers for a clean machine.
 
 ### Build step 3. Icon
 The full platform icon set is committed and generated from the 1024×1024
