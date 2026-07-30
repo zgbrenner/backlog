@@ -80,13 +80,17 @@ These do not stop anything. They ride along on the manifest and land in the
 | `SPAN_MISMATCH:ettin=<date>` | The optional span model proposed a different date from the one shipped. Advisory only, and only ever present if that lane is enabled — it is disabled by default. |
 | `SPAN_MISMATCH_PERSISTED` | The same mismatch survived a second attempt. Worth a spot-check. |
 | `DATE_FROM_FILE_MTIME` | No date was printed on the document, so the file's own modified date was used. The index records `date_source: metadata`, so this is never presented as if it came from the page. |
+| `DATE_PROPOSAL_DISCARDED:<value>` | The document had no date-shaped text anywhere in it, so the date BackLog proposed, `<value>`, could not be checked against anything and was thrown away in favour of the file's own modified date. Always appears together with `DATE_FROM_FILE_MTIME`. **Worth a glance if the date matters — it is a filesystem timestamp, not something read off the page.** |
 | `DATE_FROM_BODY` | The date was found deep in the document rather than in the letterhead or date line. More likely than usual to be a reference to some *other* document's date. |
 | `DATE_AMBIGUOUS_FORMAT` | The date was written numerically in a form that could be read as either day/month or month/day (`03/05/2024`). **Spot-check this one.** |
 | `DATE_IN_FUTURE` | The date is more than 30 days in the future. Normal for leases, renewals and hearing notices; suspicious for an invoice. |
 | `DATE_SOURCE_CORRECTED:<claimed>-><actual>` | The model said the date came from one place and the checker proved it came from the other. The corrected value is what shipped. |
+| `DATE_PREFERRED_FROM_DOCUMENT:<value>` | The date BackLog proposed, `<value>`, was backed only by the document's own file properties (an embedded creation date, say) — but the document itself had an unambiguous date printed near the top, so that one was used instead. An automatic upgrade in provenance, not a problem. The displaced value is kept here so the swap can be audited. |
 | `SUBJECT_UNGROUNDED` | The subject is not a phrase that appears in the document. Not wrong by itself — a good summary often is not a quote — but the one to check first when a name looks off. |
 | `SUBJECT_DATE_STRIPPED` | A date was removed from the subject, because the filename already starts with one. |
 | `SUBJECT_EXT_STRIPPED` | A file extension (`.pdf`) was removed from the subject. |
+| `SUBJECT_TRUNCATED` | The suggested subject ran past the ten-word limit a filename can carry, so it was cut to the first ten words — the form number and the party, which is what a filename is for — and any trailing separator left dangling by the cut was removed too. A trim, never an addition: nothing was invented, and the full wording is still in the file's description. |
+| `DESCRIPTION_TRIMMED_TO_ONE_SENTENCE` | The description ran past one sentence, or was cut off mid-sentence, so it was trimmed back to its first complete sentence. Also a trim, never an addition. |
 | `HUMAN_CORRECTED` | You corrected this file's name by hand in Needs Review. Recorded so the index shows which names were human-chosen. |
 
 ## 4. Readiness problems (Settings → Readiness)

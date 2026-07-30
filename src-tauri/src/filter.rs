@@ -198,10 +198,23 @@ pub fn build_evidence(
     //
     // Merging on `iso` matches how `harvest` already folds tail dates into head
     // dates, so a date found twice stays one entry.
+    // Both lanes below record `POSITION_UNKNOWN` rather than a real offset, and
+    // that matters more than it looks. `extract_dates` returns an offset relative
+    // to the string it was given, so a date found inside a salient *sentence*
+    // carries a small number that would read as "near the top of the document";
+    // an Ettin span carries no position at all. `checker.rs` prefers the earliest
+    // date in the head region on the theory that a letterhead or date line lives
+    // there, so a fabricated small offset would let a date from page five win that
+    // preference — the exact opposite of what the restriction is for. Sorting them
+    // last is honest: their position in the document genuinely is not known here.
+    const POSITION_UNKNOWN: usize = usize::MAX;
     for text in salient.iter() {
         for found in harvest::extract_dates(text) {
             if !h.dates.iter().any(|e| e.iso == found.iso) {
-                h.dates.push(found);
+                h.dates.push(harvest::FoundDate {
+                    offset: POSITION_UNKNOWN,
+                    ..found
+                });
             }
         }
     }
@@ -211,7 +224,7 @@ pub fn build_evidence(
                 h.dates.push(harvest::FoundDate {
                     iso: iso.to_string(),
                     raw: span.text.clone(),
-                    offset: 0,
+                    offset: POSITION_UNKNOWN,
                     ambiguous: false,
                 });
             }

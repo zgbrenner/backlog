@@ -164,7 +164,43 @@ impl Pipeline {
         slm: Arc<SlmLane>,
         app: tauri::AppHandle,
     ) -> Arc<Self> {
-        let model_versions = sidecar.versions().unwrap_or_else(|_| json!({}));
+        // One transient failure here used to cost the whole session, silently.
+        //
+        // `Manifest::validate` refuses an `ok` manifest whose `model_versions` is
+        // empty — provenance is not optional — but it refuses it at the *last*
+        // step, after hashing, conversion, filtering and the entire naming ladder
+        // have already run. So a single failed probe at construction meant every
+        // file in the run did all of its work and then flagged as
+        // `RUNTIME_FAIL:manifest`, for as long as the app stayed up, with nothing
+        // anywhere saying why.
+        //
+        // The probe is retried now — `Sidecar` spawns its first worker on demand,
+        // so the very first call can lose a race with a cold PyInstaller start —
+        // and a final failure is logged at `error` with what it is about to cost,
+        // rather than swallowed.
+        let model_versions = {
+            let mut probed = None;
+            for attempt in 1..=3 {
+                match sidecar.versions() {
+                    Ok(v) => {
+                        probed = Some(v);
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("sidecar version probe attempt {attempt} failed: {e}");
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+            }
+            probed.unwrap_or_else(|| {
+                log::error!(
+                    "the document reader never reported its versions, so every manifest this \
+                     session will fail provenance validation and its file will be flagged \
+                     RUNTIME_FAIL:manifest. Restart BackLog once Settings -> Readiness is green."
+                );
+                json!({})
+            })
+        };
         Arc::new(Self {
             convert_slots: Arc::new(Semaphore::new(cfg.convert_workers.max(1))),
             slm_slots: Arc::new(Semaphore::new(cfg.slm_parallel.max(1) as usize)),
@@ -474,10 +510,19 @@ impl Pipeline {
                 }
             }
         }
-        let _ = self.ledger.update_fields(
-            &sha,
-            &[("route", Some(format!("{route:?}").to_lowercase()))],
-        );
+        // Spelled out rather than `format!("{route:?}").to_lowercase()`: that
+        // made a persisted ledger value depend on the enum's `Debug` output, so
+        // renaming a variant would silently change what is already stored with no
+        // compiler error. It also allocated twice per file for three fixed
+        // strings.
+        let route_name = match route {
+            Route::Native => "native",
+            Route::Scanned => "scanned",
+            Route::Flag => "flag",
+        };
+        let _ = self
+            .ledger
+            .update_fields(&sha, &[("route", Some(route_name.to_string()))]);
 
         // ---- Convert (retry ladder row 1-2) --------------------------------
         let _ = self.ledger.mark_stage(&sha, "convert");
@@ -569,9 +614,37 @@ impl Pipeline {
         self.emit_update(&sha);
 
         // ---- Name + Validate (retry ladder rows 3-5) -----------------------
-        let (fs_dates, modified_iso) = fs_metadata_dates(&path);
+        // Evidence is the document's own embedded metadata. The file's mtime and
+        // ctime are deliberately **not** in here.
+        //
+        // They used to be, and it let the laziest possible answer through: a
+        // model that ignores "do NOT use today's date" and proposes today was
+        // validated against the file's own timestamp, because a file that just
+        // landed in the watched folder was modified today. The name shipped with
+        // `date_source: "metadata"` — true, and useless. Measured on a
+        // 40-document run before this changed: 25 of 29 completed documents were
+        // named with the day of the run rather than the date on the page, several
+        // of them documents whose own description quoted the real date correctly.
+        //
+        // It is circular as well as wrong. `filter.rs` only ever shows the model
+        // `doc_meta_dates` (see `assemble_bundle`'s FILE METADATA DATES section),
+        // so the model never sees the mtime and cannot be reading it — a match is
+        // always coincidence, never evidence. And the mtime is the *fallback*
+        // source, reached below through `modified_iso`, so treating it as
+        // evidence let it validate a guess and pre-empt the honest fallback that
+        // would have flagged it.
+        //
+        // A document whose real date lives only in its embedded properties is
+        // unaffected: those are in `doc_meta_dates`, are shown to the model, and
+        // still validate. `README.md`'s guarantee is unchanged in substance and
+        // now says "embedded metadata" where it used to say "the file's
+        // metadata".
+        // `dedup` only collapses *adjacent* equals, which was doing nothing
+        // useful when two unrelated sources were concatenated here. It is worth
+        // keeping now that there is one source: convertd reports `created` and
+        // `modified` next to each other and they are usually the same date.
+        let (_fs_dates, modified_iso) = fs_metadata_dates(&path);
         let mut meta_dates = filtered.doc_meta_dates;
-        meta_dates.extend(fs_dates);
         meta_dates.dedup();
 
         let checker = Checker::new(self.cfg.max_filename_len);
@@ -735,6 +808,16 @@ impl Pipeline {
                         && c.ocr_mean_conf < OCR_CONF_FLOOR
                         && attempt < self.cfg.max_stage_attempts
                     {
+                        // Also to the app log. A scanner producing systematically
+                        // weak OCR costs the naming lane extra attempts, which is
+                        // the throughput bottleneck — and the pattern was
+                        // invisible across a batch, because this path ends in a
+                        // document that ships fine and so nothing else mentions
+                        // it anywhere outside the encrypted ledger.
+                        log::info!(
+                            "convert attempt {attempt}: ocr confidence {:.2} below floor, escalating",
+                            c.ocr_mean_conf
+                        );
                         let _ = self.ledger.log_event(
                             sha,
                             "convert",
@@ -839,6 +922,11 @@ impl Pipeline {
                             violation = Some(format!(
                                 "your date disagrees with a high-confidence extracted DATE span ({ed}); re-examine the evidence spans"
                             ));
+                            // Same reasoning as the OCR escalation above: this
+                            // path accepts the document either way, so the
+                            // ledger was the only place a persistent
+                            // Ettin/model disagreement showed up at all.
+                            log::info!("name attempt {attempt}: span mismatch, re-prompting");
                             let _ =
                                 self.ledger
                                     .log_event(sha, "name", "span mismatch, re-prompting");
@@ -1138,6 +1226,14 @@ impl Pipeline {
             ],
         );
         let _ = self.ledger.log_event(sha, "flag", &reason);
+        // Also to the app log. Flagging is not an edge case — a third to a half
+        // of a real batch lands in Needs Review — and until this line the only
+        // record of *why* was the encrypted ledger and one UI card at a time.
+        // `backlog.log` is the file the user is asked to paste into a support
+        // email, and it carried none of it. The reason is a fixed prefix plus a
+        // code, never document text; the sibling branch a few lines up already
+        // logs the same value for the same reason.
+        log::warn!("flagged: {reason}");
 
         clock.parked(self.pacer.permit()).await;
         let m = Manifest {
@@ -1678,9 +1774,10 @@ mod tests {
                 }
             };
             let ev = outcome.evidence;
-            let (fs_dates, modified_iso) = crate::checker::fs_metadata_dates(&path);
+            // Mirrors `process_inner`: embedded metadata is evidence, the file's
+            // own timestamps are not.
+            let (_fs_dates, modified_iso) = crate::checker::fs_metadata_dates(&path);
             let mut meta_dates = outcome.doc_meta_dates;
-            meta_dates.extend(fs_dates);
             meta_dates.dedup();
 
             eprintln!("\n### {name}");

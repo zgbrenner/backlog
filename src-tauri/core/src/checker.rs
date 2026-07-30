@@ -87,6 +87,31 @@ const FUTURE_SOFT_DAYS: i64 = 30;
 /// Beyond this byte offset a date is body text, not letterhead or a date line.
 const HEAD_REGION_BYTES: usize = 1500;
 
+/// How many times `Ledger::reserve_name` may disambiguate one composed name with
+/// a `" (n)"` suffix before it gives up and the document is flagged.
+///
+/// Lives here, next to the length budget that has to hold room for the suffix,
+/// because the two are one decision: raising the cap widens the longest possible
+/// suffix, and a `FILENAME_TAIL_RESERVE` that no longer covers it would silently
+/// produce names past `max_filename_len`. A test below asserts they agree.
+///
+/// 500 was the previous value and became reachable when the undated-document
+/// fallback started naming a whole day's backfill from one mtime: several hundred
+/// copies of one templated form filed on one fallback day share a composed name
+/// exactly. 2,000 is generous for the thousand-file batches this is built for,
+/// while staying far away from where the upward probe's cost matters — the search
+/// is O(k) per document and so O(k²) across k identical names, which at 2,000 is
+/// about two million indexed point lookups spread over two thousand calls, and at
+/// 10,000 would be fifty million.
+pub const MAX_NAME_COLLISIONS: u32 = 2000;
+
+/// Characters held back from `max_filename_len` for what gets appended after the
+/// composed base name: the widest collision suffix, the dot, and an extension.
+///
+/// `" (2000)"` is 7, the dot is 1, and the longest extension `RE_TRAILING_EXT`
+/// recognises is 4 (`docx`), rounded up to 6 for headroom.
+const FILENAME_TAIL_RESERVE: usize = 14;
+
 // --- subject shape -------------------------------------------------------
 const SUBJECT_MIN_WORDS: usize = 2;
 const SUBJECT_MAX_WORDS: usize = 10;
@@ -352,6 +377,36 @@ impl Checker {
                 } else {
                     return Err(CheckError::DateNotInEvidence(out.date.clone()));
                 }
+            } else if let Some(preferred) = (!in_doc && source == Source::Model)
+                .then(|| Self::date_printed_on_the_page(harvest))
+                .flatten()
+            {
+                // The date printed on the document outranks the document's
+                // embedded properties.
+                //
+                // A model handed both a dated page and a `created` property will
+                // often take the property — measured on a stratified corpus, 14 of
+                // 16 documents with a date on page one were named from metadata
+                // instead, several of them claiming `date_source: "document"`
+                // while proposing a date that appears nowhere in the text. The
+                // result is a filename stamped with the day the file was made
+                // rather than the day the document is *about*, which is the one
+                // thing the name exists to tell you.
+                //
+                // This is deterministic and it is not the model's answer being
+                // trusted: `harvest.dates` is regex evidence read from the
+                // document text, so the substituted date provably appears on the
+                // page — strictly better provenance than what it replaces. Only
+                // unambiguous dates in the head region qualify, because that is
+                // where a letterhead or date line lives; a date deep in the body
+                // is far likelier to be a reference to some *other* document's
+                // date, which is exactly what `DATE_FROM_BODY` exists to warn
+                // about.
+                let d = NaiveDate::parse_from_str(&preferred.iso, "%Y-%m-%d")
+                    .map_err(|_| CheckError::BadDate(preferred.iso.clone()))?;
+                Self::range_check(d, &preferred.iso, source, &mut soft_flags)?;
+                soft_flags.push(format!("DATE_PREFERRED_FROM_DOCUMENT:{}", out.date));
+                (preferred.iso.clone(), "document".to_string())
             } else {
                 let src = if in_doc { "document" } else { "metadata" };
                 if src != out.date_source {
@@ -398,8 +453,7 @@ impl Checker {
 
         // ---- compose -------------------------------------------------------
         let base_name = format!("{date_iso} {subject}");
-        // Reserve room for " (99)" collision suffix + "." + a long extension.
-        if base_name.chars().count() + 12 > self.max_filename_len {
+        if base_name.chars().count() + FILENAME_TAIL_RESERVE > self.max_filename_len {
             return Err(CheckError::TooLong(
                 base_name.chars().count(),
                 self.max_filename_len,
@@ -414,6 +468,20 @@ impl Checker {
             base_name,
             soft_flags,
         })
+    }
+
+    /// The earliest unambiguous date the harvest found in the head region, if any.
+    ///
+    /// "Head region" is where a letterhead, a date line or a filing stamp sits.
+    /// Restricting to it — and to unambiguous forms, so a coin-flip reading of
+    /// `04/05/2023` never wins this way — is what keeps this a conservative
+    /// preference rather than a licence to pick any number off the page.
+    fn date_printed_on_the_page(harvest: &Harvest) -> Option<&harvest::FoundDate> {
+        harvest
+            .dates
+            .iter()
+            .filter(|f| !f.ambiguous && f.offset <= HEAD_REGION_BYTES)
+            .min_by_key(|f| f.offset)
     }
 
     /// Name the document from its own modified time, and say so.
@@ -1550,6 +1618,150 @@ mod tests {
                 assert_eq!(words, 10, "an over-long subject keeps the first 10 words");
             }
         }
+    }
+
+    /// A date printed on the page beats the file's embedded `created` property.
+    ///
+    /// This is the case that made most filenames wrong: handed both a dated page
+    /// and a `created` property, the model takes the property — measured, 14 of 16
+    /// documents with a date on page one were named from metadata instead — and
+    /// the file ends up stamped with the day it was *made* rather than the day it
+    /// is *about*.
+    #[test]
+    fn a_date_printed_on_the_page_outranks_embedded_metadata() {
+        let c = Checker::new(200);
+        let mut out = ok_out();
+        // What the model proposed: the file's own creation date, which is real
+        // metadata evidence — just not the document's date.
+        out.date = "2026-07-29".into();
+        out.date_source = "document".into();
+
+        let v = c
+            .check(
+                &out,
+                &harvest_with(&["2021-01-20"]),
+                &["2026-07-29".to_string()],
+                "2026-07-29",
+                None,
+            )
+            .expect("a document with a date on the page must be nameable");
+        assert_eq!(
+            v.date_iso, "2021-01-20",
+            "the date on the page must win over the created property"
+        );
+        assert_eq!(v.date_source, "document");
+        assert!(
+            v.soft_flags
+                .contains(&"DATE_PREFERRED_FROM_DOCUMENT:2026-07-29".to_string()),
+            "the displaced proposal must be recorded: {:?}",
+            v.soft_flags
+        );
+
+        // With no date on the page there is nothing to prefer, so the metadata
+        // path is unchanged — this is what `metadata_evidence_path_corrects_the_source`
+        // covers and it must keep working.
+        let v = c
+            .check(
+                &out,
+                &Harvest::default(),
+                &["2026-07-29".to_string()],
+                "2026-07-29",
+                None,
+            )
+            .expect("metadata-only evidence is still valid");
+        assert_eq!(v.date_iso, "2026-07-29");
+        assert_eq!(v.date_source, "metadata");
+
+        // A human's date is never displaced.
+        let v = c
+            .check_human(
+                &out,
+                &harvest_with(&["2021-01-20"]),
+                &["2026-07-29".to_string()],
+                "2026-07-29",
+                None,
+            )
+            .expect("a human override must be honored");
+        assert_eq!(
+            v.date_iso, "2026-07-29",
+            "a person who typed a date meant it"
+        );
+    }
+
+    /// The preference is deliberately narrow: only unambiguous dates, and only
+    /// from the head region where a letterhead or date line lives. A date deep in
+    /// the body is more likely a reference to another document, and an ambiguous
+    /// `04/05/2023` is a coin flip that should not win this way.
+    #[test]
+    fn the_document_date_preference_ignores_ambiguous_and_deep_dates() {
+        // Deep in the body: past the head region, so not preferred.
+        let deep = Harvest {
+            dates: vec![harvest::FoundDate {
+                iso: "2021-01-20".into(),
+                raw: "January 20, 2021".into(),
+                offset: HEAD_REGION_BYTES + 1,
+                ambiguous: false,
+            }],
+            ..Default::default()
+        };
+        assert!(Checker::date_printed_on_the_page(&deep).is_none());
+
+        // Ambiguous slash form in the head region: also not preferred.
+        let ambiguous = Harvest {
+            dates: vec![harvest::FoundDate {
+                iso: "2023-04-05".into(),
+                raw: "04/05/2023".into(),
+                offset: 10,
+                ambiguous: true,
+            }],
+            ..Default::default()
+        };
+        assert!(Checker::date_printed_on_the_page(&ambiguous).is_none());
+
+        // The earliest qualifying date wins — the letterhead, not a later mention.
+        let two = Harvest {
+            dates: vec![
+                harvest::FoundDate {
+                    iso: "2021-03-03".into(),
+                    raw: "3 March 2021".into(),
+                    offset: 900,
+                    ambiguous: false,
+                },
+                harvest::FoundDate {
+                    iso: "2021-01-20".into(),
+                    raw: "January 20, 2021".into(),
+                    offset: 40,
+                    ambiguous: false,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            Checker::date_printed_on_the_page(&two).map(|f| f.iso.as_str()),
+            Some("2021-01-20")
+        );
+    }
+
+    /// The length budget must cover the widest suffix the ledger can actually
+    /// append, and nothing else connects the two numbers.
+    ///
+    /// Before this existed, the reserve was a bare `12` with a comment saying
+    /// `" (99)"` while `reserve_name` could already emit `" (500)"` — six
+    /// characters, not five. It fit by one character, by coincidence of the
+    /// constants rather than by anything checking. Raising the collision cap
+    /// without widening the reserve would have produced names past
+    /// `max_filename_len` silently, because the length gate runs on the base name
+    /// before any suffix exists and `reserve_name` never re-checks length.
+    #[test]
+    fn the_filename_reserve_covers_the_widest_collision_suffix() {
+        let widest_suffix = format!(" ({MAX_NAME_COLLISIONS})").chars().count();
+        // The longest extension RE_TRAILING_EXT recognises.
+        let longest_ext = "docx".len();
+        assert!(
+            FILENAME_TAIL_RESERVE >= widest_suffix + ".".len() + longest_ext,
+            "reserve {FILENAME_TAIL_RESERVE} cannot hold ' ({MAX_NAME_COLLISIONS})' \
+             ({widest_suffix}) + '.' + '{longest_ext}-char extension'"
+        );
     }
 
     /// The guarantee the description rule makes is that what ships is exactly one

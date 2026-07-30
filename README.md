@@ -187,10 +187,20 @@ you can point at, and by a test.
   the move itself fails, that is surfaced as `QUARANTINE_FAILED` and the source
   is left where it is rather than orphaned.
 - **No model-proposed date ships unless it appears verbatim in the document
-  text or in the file's metadata.** This is `checker.rs`'s
+  text or in the document's own embedded metadata.** This is `checker.rs`'s
   `DateNotInEvidence` rule and it is the product's central promise. A human
   override in the review pane is recorded as `date_source: "human"`, so the
   index distinguishes a name a person chose from one the model proposed.
+
+  "Embedded metadata" means the properties inside the file — a PDF
+  `CreationDate`, a Word `dcterms:created` — which `convertd` reads and the
+  evidence bundle shows the model. It deliberately does **not** include the
+  file's own modified and created *timestamps*. Those are the fallback below,
+  and counting them as evidence let the laziest possible answer through: a file
+  that just arrived in the Processing folder was modified today, so a model that
+  proposed today's date was "validated" against the filesystem and the real date
+  on the page was lost. The model is never shown those timestamps, so a match
+  was always coincidence rather than reading.
 - **Undated documents fall back to the file modified date** with
   `date_source: metadata` and a `DATE_FROM_FILE_MTIME` note — honestly labeled
   in the index, never presented as if it came from the page.

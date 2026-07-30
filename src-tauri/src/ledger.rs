@@ -734,8 +734,15 @@ impl Ledger {
             }
             n += 1;
             candidate = format!("{base} ({n})");
-            if n > 500 {
-                anyhow::bail!("collision resolution runaway for '{base}'");
+            if n > crate::checker::MAX_NAME_COLLISIONS {
+                // The cap and the filename length budget that has to hold room
+                // for this suffix are one decision, so the number lives beside
+                // that budget in `checker.rs` rather than here.
+                anyhow::bail!(
+                    "collision resolution runaway for '{base}': more than \
+                     {} documents share this date and subject",
+                    crate::checker::MAX_NAME_COLLISIONS
+                );
             }
         }
     }

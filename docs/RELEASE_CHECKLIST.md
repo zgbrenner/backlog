@@ -34,13 +34,17 @@ it.
       passes.
 - [ ] `cargo test --manifest-path src-tauri/Cargo.toml --workspace --all-targets`
       passes.
-- [ ] Sidecar and model-lock unit tests pass under 64-bit Python 3.11:
-      `python -m pytest sidecar/tests models/tests`.
+- [ ] Sidecar and model-lock unit tests pass under 64-bit Python 3.11 — 99 tests,
+      no third-party runner needed:
+      `python -m unittest discover -s sidecar/tests -t sidecar/tests` and
+      `python -m unittest discover -s models/tests -t models/tests`.
 - [ ] Every Power Automate example validates against both manifest schemas, and
       the schemas match the emitter:
       `pip install -r power-automate/requirements-dev.txt` then
-      `python power-automate/validate_examples.py`. (Without that install it
-      dies with `ModuleNotFoundError: jsonschema`.)
+      `python power-automate/validate_examples.py`. `scripts/ci-local.sh` now
+      finds an interpreter that already has `jsonschema` and names that install
+      command if none does, so this no longer surfaces as a bare
+      `ModuleNotFoundError`.
 - [ ] `package-lock.json`, `rust-toolchain.toml`, `src-tauri/Cargo.lock` and
       `sidecar/requirements.lock` are committed and match the release build.
 - [ ] `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`

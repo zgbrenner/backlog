@@ -72,10 +72,54 @@ step frontend "npm run check" npm run check
 step frontend "UI harness" npm run harness:shots
 
 # --- python -----------------------------------------------------------------
-# numpy stays absent on purpose: the sidecar's classify/salience lanes promise
-# a dependency-free fallback, and installing it here would hide the regression.
-step python "pytest" python3 -m pytest sidecar/tests models/tests -q
-step python "Power Automate manifest contract" python3 power-automate/validate_examples.py
+# Run by stdlib `unittest`, not pytest. Every test under those two directories
+# imports nothing outside the standard library, so requiring a third-party test
+# runner bought nothing and cost the gate its ability to run: `python3 -m pytest`
+# died with "No module named pytest" on the release machine — the only machine
+# that ever runs this script — so a 99-test suite was silently not a gate.
+#
+# `-t` points at the start directory itself because neither directory has an
+# __init__.py, and plain `discover -s dir` then fails with "Start directory is
+# not importable".
+#
+# Note on numpy: this used to claim "numpy stays absent on purpose", so that the
+# sidecar's dependency-free classify/salience fallback stayed covered. That was
+# not true of the ambient interpreter (numpy 2.4.4 is importable here), and
+# `convertd.py` imports it lazily inside the ops, so this gate does not prove
+# the fallback either way. It runs the suite; it does not pin the environment.
+step python "unittest (sidecar)" \
+  python3 -m unittest discover -s sidecar/tests -t sidecar/tests -q
+step python "unittest (models)" \
+  python3 -m unittest discover -s models/tests -t models/tests -q
+
+# The manifest contract genuinely needs a third-party package
+# (power-automate/requirements-dev.txt pins jsonschema). Rather than dying with
+# a bare ModuleNotFoundError — which docs/RELEASE_CHECKLIST.md had resorted to
+# documenting as expected — find an interpreter that has it, and if none does,
+# say which command installs it.
+python_with_jsonschema() {
+  local candidate
+  for candidate in python3 python ./sidecar/.venv-build/Scripts/python.exe; do
+    if command -v "$candidate" >/dev/null 2>&1 &&
+      "$candidate" -c "import jsonschema" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+validate_power_automate() {
+  local py
+  if ! py="$(python_with_jsonschema)"; then
+    echo "no interpreter on this machine can import jsonschema." >&2
+    echo "install it with:  python3 -m pip install -r power-automate/requirements-dev.txt" >&2
+    return 1
+  fi
+  "$py" power-automate/validate_examples.py
+}
+
+step python "Power Automate manifest contract" validate_power_automate
 
 # --- version-drift ----------------------------------------------------------
 step version-drift "versions agree" node .github/scripts/check-versions.mjs

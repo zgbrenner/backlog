@@ -66,47 +66,118 @@ and model fabrication stays measurable. Where the document does contain dates, a
 mismatched proposal is still a hard rejection
 (`checker::tests::rejects_hallucinated_date`, unchanged and passing).
 
-**One refinement left undone.** When the harvest is empty but the document's
-*embedded* properties carry a real date (a PDF `CreationDate`), that date would
-be a better answer than the file's mtime. `checker.rs` cannot currently tell an
-embedded document date from a filesystem timestamp, because `pipeline.rs` merges
-both into one list before handing it over. Splitting them is a signature change
-across ~15 call sites for a case that is already honestly labelled, so it is
-recorded here rather than rushed.
+**The refinement this originally deferred landed in 0.4.2.** `pipeline.rs` no
+longer merges filesystem timestamps into the evidence list, so `checker.rs` sees
+only the document's embedded properties and the two are no longer conflated — and
+it needed no signature change, only removing the merge. The paragraph that used
+to sit here estimated a change across fifteen call sites; the actual fix was one
+line. See item 0b.
 
-### 0b. The file's own mtime validates a model that proposes today's date
-`README.md`'s guarantee is that a model-proposed date must appear "verbatim in
-the document text **or in the file's metadata**", and `pipeline.rs` builds that
-metadata list by extending the document's embedded dates with
-`fs_metadata_dates` — the file's mtime and ctime, in both local and UTC
-readings. So a model that ignores "Do NOT use today's date" and proposes today
-is validated against the file's own timestamp, and the name ships with
-`date_source: "metadata"` and a `DATE_SOURCE_CORRECTED:document->metadata` soft
-flag. It is honestly labelled and, for a document that does carry a real date,
-wrong.
+### 0b. ~~The file's own mtime validates a model that proposes today's date~~ — fixed in 0.4.2
+**Fixed, and the diagnosis below was only half right.** Filesystem timestamps no
+longer reach the evidence list: `pipeline.rs` passes the document's *embedded*
+metadata and leaves the mtime to the fallback, which already received it
+separately. `README.md`'s guarantee now says "embedded metadata" and explains why
+a timestamp cannot be the evidence for itself.
 
-Measured on a 40-document stratified run: 25 of 29 completed documents carried
-`DATE_SOURCE_CORRECTED`, most of them named `2026-07-29` — the day of the run.
-Names like `2026-07-29 Return prepared and filed on 08 12 2022 - …` show the
-shape of it plainly: the model *read* the real date into its own description and
-still proposed today for the date field.
+That alone changed almost nothing, which is the interesting part. The synthetic
+corpus's fixtures were generated the same day, so their *embedded* `created`
+property also said today — a model proposing today matched genuine embedded
+evidence, exactly as the guarantee allows. The original attribution of "25 of 29
+documents named with the run date" to filesystem timestamps was wrong; embedded
+metadata was the larger cause.
 
-**How much of that is the test rig.** The fixtures were copied into the watched
-folder immediately before the run, so every mtime was that day and every lazy
-answer matched. On a real OneDrive backfill files keep their true mtimes, which
-are usually nearer the document's own date, so both the frequency and the size
-of the error will be lower. It is not an artefact, though — only amplified.
+The fix that actually moved the number was ordering, not evidence: **a date
+printed on the page now outranks the document's embedded properties**
+(`Checker::date_printed_on_the_page`). Handed both, the model usually took the
+property, and several proposals claimed `date_source: "document"` while naming a
+date that appears nowhere in the text. The substituted date is regex evidence read
+from the document, so its provenance is strictly better than what it replaces, and
+the displaced proposal is recorded as `DATE_PREFERRED_FROM_DOCUMENT:<value>`. Only
+unambiguous head-region dates qualify — a date deep in the body is more likely a
+reference to another document, which is what `DATE_FROM_BODY` has always warned
+about.
 
-**Fix, and why it is not done here.** Stop treating filesystem timestamps as
-evidence: pass the document's *embedded* metadata dates as the evidence list and
-leave mtime to the explicit fallback, which already receives it separately as
-`file_modified_iso`. A model proposing today would then be refused, re-asked
-with the violation quoted, and would usually find the real date. That is close
-to a one-line change in `pipeline.rs`, and it is not made here because it
-narrows a guarantee `README.md` states in those words — file metadata *is*
-advertised as valid evidence. Narrowing it is a product decision about what
-"metadata" ought to mean, not a bug fix to slip into a patch release, and it
-wants its own measured run over a corpus with realistic mtimes.
+Measured on the same 40 documents: documents named with the run date fell from
+**37 of 40 to 16 of 40**, and documents with a date on page one went from **2 of
+16 to 16 of 16**. The remaining sixteen are ten fixtures that carry no date at
+all, where the mtime is the correct answer, plus six whose date sits past the
+harvest window — see item 0c. Those six are the only genuine misses left on this
+sample.
+
+### 0c. The harvest cannot see a date in the middle of a long document
+`harvest::harvest` scans the first 6,000 and last 2,500 characters. A date on page
+three of a nine-page document falls in neither, so nothing downstream can prefer
+it: measured, only 2 of 8 documents whose date sits deep in the body were named
+from it, against 16 of 16 when the date is on page one.
+
+The window, not the page number, is what decides it — which is why this is worth
+fixing rather than accepting. Against the corpus generator's ground truth, both
+`dated_deep` documents that succeeded have their date on page 3 or earlier, and
+all six that failed have it on pages 4 to 7 of 6- to 12-page files. The single
+apparent exception (a failure whose date is on page 3) is in a 9-page file whose
+earlier pages are long enough to push it past 6,000 characters. These six are the
+only genuine date misses in the whole 40-document sample.
+
+The salience lane does read the whole document and `filter.rs` folds any dates it
+finds back into the harvest, but those arrive with no usable position — an offset
+from `extract_dates` is relative to the sentence it was given, not the document —
+so they are recorded as position-unknown and deliberately excluded from the
+head-region preference. They still count as evidence; they just cannot win the
+letterhead tie-break.
+
+**Fix:** give the folded dates a real document offset, by locating the salient
+sentence in the markdown before extracting from it. That makes a mid-document date
+orderable and lets the same preference reach it. Not done here because it is a
+change to how evidence positions are computed, and it wants its own measured run
+rather than being bundled into a release already carrying three date-handling
+changes.
+
+### 0d. Three in ten filenames do not name the party at all
+Measured on the 40-document sample, scoring each new filename against the
+document's own `Taxpayer / Entity:` line: 18 name the party exactly, 8 name a
+correct prefix cut short, 2 garble it, and **12 do not contain it at all**.
+
+This is a budget problem, not a reading problem. `SUBJECT_MAX_WORDS` is ten, and
+`Form 8829 - Expenses for Business Use of Your Home` is exactly ten words, so a
+model that leads with the form's full legal title has nothing left for the party.
+The date is right and the document type is right; the filename simply does not
+say whose it is, which is half of why anyone renames a file.
+
+**Fix:** state in the naming prompt that the party outranks the form's full
+title — `Form 8829 - Marcus Alvarez` over
+`Form 8829 - Expenses for Business Use of Your Home`. Cheap to try, but it moves
+the one instruction the model follows most literally, so it needs its own
+measured 40-document run rather than being folded into a release whose changes
+were all in the checker. Not attempted here.
+
+### 0e. A party cut short by filename length is recorded nowhere
+`SUBJECT_TRUNCATED` reports the ten-word subject cap. It is **not** the flag for
+a name cut by `compose`'s `max_filename_len` trim, which is a separate mechanism
+and currently records nothing at all — measured, it fired on only 2 of the 8
+documents whose party was actually cut in the filename, and on 2 of the 18 whose
+party was complete.
+
+Neither is wrong about what it claims, but the effect is that a user looking at
+`... - Ironwood & Vance.pdf` has no indication that `Roofing` was dropped, and no
+way to tell that filename from one where the party genuinely is `Ironwood &
+Vance`. A `SUBJECT_TRIMMED_TO_FILENAME_LENGTH` note at the point of the trim
+would close it. Small and self-contained; not done here only because it belongs
+with 0d.
+
+### 0f. Character-level garbling of a party name is undetectable
+Two of the 40 documents had their party altered rather than shortened:
+`Cross & Daughters Bakery` was named `Cross & Daubs`, and `Whitmore &
+Associates` became `Whitmore &Associes`. A third is borderline — `Derrick Pena`
+became `Derrick Pén`, acquiring an acute accent that appears nowhere in the
+source.
+
+Neither carries a soft flag, and none of the checker's rules can catch this:
+`SUBJECT_UNGROUNDED` tests whether the subject is a phrase from the document, but
+these subjects mostly *are*, and the check is not per-token. A 0.6B model
+mis-transcribing a proper noun is a known limit of the model tier rather than a
+logic error, so the honest options are a substring check of the party against the
+document text, or accepting it and documenting the rate. Recorded, not fixed.
 
 ### 1. The shipped sidecars are not built by anything reproducible
 `src-tauri/binaries/` is gitignored and empty on a fresh clone. A release

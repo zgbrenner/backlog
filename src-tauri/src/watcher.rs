@@ -148,7 +148,19 @@ async fn wait_stable(path: &Path) -> bool {
         last = Some(size);
         tokio::time::sleep(Duration::from_millis(STABILITY_INTERVAL_MS)).await;
     }
-    log::warn!("file never stabilized: {path:?}");
+    // A file that reaches here gets no ledger row, no manifest and no quarantine
+    // copy — it simply is not in the batch. The path is scrubbed to
+    // `[path under C: (+n levels)]` by design, which left the operator of a
+    // thousand-file overnight run with fewer manifests than files and nothing to
+    // reconcile against. The extension and the last size observed are not the
+    // sensitive part, and they are usually enough to identify which scan it was.
+    log::warn!(
+        "file never stabilized after {} tries, so it is not in this batch \
+         (extension {:?}, last size {} bytes): {path:?}",
+        STABILITY_PROBES * 10,
+        path.extension().unwrap_or_default(),
+        last.unwrap_or(0)
+    );
     false
 }
 

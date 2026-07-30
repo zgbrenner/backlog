@@ -15,6 +15,114 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.4.2] — a date on the page beats a date in the file's properties
+
+### Filesystem timestamps are no longer evidence
+
+**Fixed — `pipeline.rs` merged the file's own mtime and ctime into the list of
+dates the checker validates a proposal against.** A model that proposed today's
+date was therefore *correct*: the file had been copied into Processing today, so
+today was in evidence. The tripwire that exists to catch fabricated dates could
+not fire on the most likely fabrication.
+
+The mtime never needed to be there. `check_with` already receives it separately
+as the fallback for a genuinely undated document, so removing it from the
+evidence list costs nothing and closes the loop where a filesystem timestamp was
+the evidence for itself. `README.md`'s guarantee now says "**embedded**
+metadata" and says why.
+
+**This alone changed almost nothing, which is worth recording.** The synthetic
+corpus was generated the same day it was measured, so the fixtures' *embedded*
+`created` property also said today — a model proposing today was matching real
+embedded evidence, exactly as the guarantee allows. The earlier attribution of
+"25 of 29 documents named with the run date" to filesystem timestamps was wrong.
+
+### A date printed on the page now outranks the document's properties
+
+**Added — `Checker::date_printed_on_the_page`.** Handed both a date in the text
+and a date in the PDF/DOCX properties, the model usually took the property, and
+several proposals claimed `date_source: "document"` while naming a date that
+appears nowhere in the text. When a proposal is supported only by embedded
+metadata and the document itself carries an unambiguous date in its head region,
+that printed date is substituted and the displaced proposal is recorded as
+`DATE_PREFERRED_FROM_DOCUMENT:<value>`.
+
+The substitution is strictly a provenance upgrade — regex evidence read out of
+the document replacing a property the reader cannot see. Only unambiguous
+head-region dates qualify: a date deep in the body is more likely a reference to
+*another* document, which is what `DATE_FROM_BODY` has always warned about.
+
+**Measured on a 40-document stratified sample, 0.6B + 1.7B, `slm_parallel: 1`:**
+
+| | 0.4.1 | 0.4.2 |
+|---|---|---|
+| named `ok` | 40 of 40 | 40 of 40 |
+| named with the run date instead of the document's own | 37 of 40 | **16 of 40** |
+| documents with a date on page one, named from it | 2 of 16 | **16 of 16** |
+
+The naming *rate* is unchanged — 0.4.1 already got every document named. What
+changed is whether the date in the name belongs to the document.
+
+The remaining sixteen break down as ten fixtures that carry no date at all,
+where the mtime is the correct answer, and **six** whose only date sits past the
+harvest window — now recorded as `docs/KNOWN_ISSUES.md` item 0c rather than
+folded into this release. Those six are the only genuine misses on the sample.
+
+**Fixed — folded dates carried a fabricated position that could win that
+preference.** `filter.rs` folds dates found by the salience and Ettin lanes back
+into the harvest so they count as evidence. An offset from `extract_dates` is
+relative to the sentence it was given, not to the document, so a date from page
+five arrived with a small offset that read as "near the top" — and an Ettin span
+arrived with a hardcoded `0`. Both now record `POSITION_UNKNOWN`. They still
+count as evidence; they cannot win the letterhead tie-break, because their real
+position genuinely is not known at that point.
+
+### Measured for the first time, and not fixed
+
+The date half of a filename is now measured to death. The **party** half never
+had been, so it was scored against each document's own `Taxpayer / Entity:` line
+across the same 40: **18 exact, 8 a correct prefix cut short, 2 garbled, and 12
+with no party in the filename at all.**
+
+Nothing in this release addresses it, and the results are recorded as
+`docs/KNOWN_ISSUES.md` items 0d, 0e and 0f rather than being described as
+anything other than open:
+
+- **0d — three in ten filenames name no party.** A budget problem, not a reading
+  problem: the subject is capped at ten words and
+  `Form 8829 - Expenses for Business Use of Your Home` is exactly ten. The fix is
+  to tell the prompt the party outranks the form's full legal title, which moves
+  the instruction the model follows most literally and wants its own measured run.
+- **0e — a party cut to fit the filename length records nothing.**
+  `SUBJECT_TRUNCATED` reports the ten-word subject cap, a different mechanism; it
+  fired on only 2 of the 8 documents whose party was actually cut.
+- **0f — character-level garbling is undetectable.**
+  `Cross & Daughters Bakery` was named `Cross & Daubs`. No existing rule catches
+  a mis-transcribed proper noun.
+
+### Smaller things
+
+- **`MAX_NAME_COLLISIONS` raised from 500 to 2,000**, and moved next to the
+  filename length budget that must reserve room for its ` (2000)` suffix, since
+  the two are one decision. A new test derives the reserve from the constant, so
+  raising the cap again without widening the reserve fails rather than silently
+  truncating.
+- **A flagged document now logs why.** `flag()` wrote a manifest and a ledger row
+  but no log line, so the app log — the first thing anyone reads — showed a batch
+  with unexplained gaps.
+- **`Pipeline::new` retries `sidecar.versions()` three times.** A cold convertd
+  unpacking itself to `%TEMP%` could lose the very first handshake, which took
+  the model-version stamp out of every manifest in the run.
+- **The app log now records the two silent re-tries**: an OCR-confidence
+  escalation and a span-mismatch re-prompt were both invisible in a run that
+  looked merely slow.
+- **`route` is persisted through an explicit `match`** rather than a `Debug`
+  lowercasing that would have followed a renamed variant into the database.
+- **A file that never stabilizes now logs its extension and last observed size.**
+  It gets no ledger row, no manifest and no quarantine copy, so an operator
+  reconciling 1,000 files against fewer manifests previously had a scrubbed path
+  and nothing else.
+
 ## [0.4.1] — the things 0.4.0 measured and left broken
 
 ### Documents stopped being quarantined for obeying their own schema
