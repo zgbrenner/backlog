@@ -432,7 +432,13 @@ if ($tagExit -eq 0) {
   return
 }
 if ($tagExit -ne 2) { throw "tag lookup failed" }
-$draftJson = & gh release view $Tag --json isDraft,tagName,targetCommitish
+$draftExit = 1
+for ($attempt = 1; $attempt -le 8; $attempt++) {
+  $draftJson = & gh release view $Tag --json isDraft,tagName,targetCommitish
+  $draftExit = $LASTEXITCODE
+  if ($draftExit -eq 0) { break }
+  Start-Sleep -Seconds 3
+}
 $draft = $draftJson | ConvertFrom-Json
 if (-not $draft.isDraft) { throw "not a draft" }
 if ($draft.tagName -ne $Tag) { throw "wrong tag name" }
@@ -450,6 +456,16 @@ test("a draft target that is not compared with the tested SHA is rejected", () =
   );
   assert.match(
     validateReleaseTargetGuard(driftingDraft).join("\n"),
+    /real tag or an exact-SHA GitHub draft/,
+  );
+});
+
+test("draft lookup retries are required after a GitHub target mutation", () => {
+  const noConsistencyRetry = validReleaseTargetGuard
+    .replace("for ($attempt = 1; $attempt -le 8; $attempt++) {", "if ($true) {")
+    .replace("  Start-Sleep -Seconds 3\n", "");
+  assert.match(
+    validateReleaseTargetGuard(noConsistencyRetry).join("\n"),
     /real tag or an exact-SHA GitHub draft/,
   );
 });

@@ -44,8 +44,18 @@ if ($tagExit -ne 2) {
 
 # A GitHub draft created with --target does not create its tag until the draft
 # is published. In that state, verify the immutable draft target instead.
-$draftJson = & gh release view $Tag --json isDraft,tagName,targetCommitish 2>$null
-$draftExit = $LASTEXITCODE
+$draftJson = $null
+$draftExit = 1
+for ($attempt = 1; $attempt -le 8; $attempt++) {
+    $draftJson = & gh release view $Tag --json isDraft,tagName,targetCommitish 2>$null
+    $draftExit = $LASTEXITCODE
+    if ($draftExit -eq 0) {
+        break
+    }
+    if ($attempt -lt 8) {
+        Start-Sleep -Seconds 3
+    }
+}
 if ($draftExit -ne 0) {
     throw "Could not resolve release tag or draft $Tag"
 }
