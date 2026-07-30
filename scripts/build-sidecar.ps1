@@ -5,8 +5,17 @@
 .DESCRIPTION
   Creates an isolated Python 3.11 venv (the ML deps have no 3.13/3.14 wheels),
   installs the pinned requirements, freezes the resolved set to
-  sidecar/requirements.lock, runs PyInstaller, smoke-tests the binary, and copies
-  it to src-tauri/binaries/ with the target-triple suffix Tauri expects.
+  sidecar/requirements.lock, runs PyInstaller in --onedir mode, smoke-tests the
+  built convertd.exe, and stages the whole output directory (convertd.exe plus
+  its _internal/ tree of DLLs and data files) to src-tauri/binaries/convertd/.
+
+  --onedir rather than --onefile: a --onefile exe re-extracts its entire ~250 MB
+  bundle to a fresh %TEMP%\_MEI* folder on EVERY launch, which a
+  virus-scanned corporate machine turns into a 34-52s startup and ~250 MB of
+  temp garbage per run. --onedir extracts nothing at runtime, so convertd
+  starts in ~1-2s. The directory output can no longer travel through Tauri's
+  externalBin (which only stages a single file); it ships through
+  bundle.resources instead -- see tauri.conf.json and src-tauri/src/lib.rs.
 
   Python 3.11 is obtained via `uv` (userspace, no admin) by default. Pass
   -Python to use a specific interpreter instead.
@@ -14,12 +23,11 @@
 .EXAMPLE
   pwsh scripts/build-sidecar.ps1
 .EXAMPLE
-  pwsh scripts/build-sidecar.ps1 -Clean -TargetTriple x86_64-pc-windows-msvc
+  pwsh scripts/build-sidecar.ps1 -Clean
 #>
 [CmdletBinding()]
 param(
     [string]$Python = "",
-    [string]$TargetTriple = "x86_64-pc-windows-msvc",
     [switch]$Clean
 )
 
@@ -105,7 +113,7 @@ try {
     #    (CMap tables) and pptx (its default template) are the same story for
     #    the markitdown parser extras.
     Write-Host "Running PyInstaller (slim, torch-free profile)..." -ForegroundColor Cyan
-    & $VenvPy -m PyInstaller --clean --noconfirm --onefile --name convertd `
+    & $VenvPy -m PyInstaller --clean --noconfirm --onedir --name convertd `
         --collect-all rapidocr `
         --collect-all lingua `
         --collect-all markitdown `
@@ -120,8 +128,14 @@ try {
         convertd.py
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed." }
 
-    $built = Join-Path $SidecarDir "dist/convertd.exe"
+    # --onedir output is a directory: dist/convertd/convertd.exe plus its
+    # _internal/ tree of DLLs and data files. Both must survive staging intact
+    # (see step 5) or convertd fails to start on the target machine.
+    $builtDir = Join-Path $SidecarDir "dist/convertd"
+    $built = Join-Path $builtDir "convertd.exe"
     if (-not (Test-Path $built)) { throw "Expected build output missing: $built" }
+    $builtInternal = Join-Path $builtDir "_internal"
+    if (-not (Test-Path $builtInternal)) { throw "Expected build output missing: $builtInternal" }
 
     # 4. Smoke test: drive real documents through one warm process.
     #    `ping` returns {} and every heavy component sits behind a lazy
@@ -181,15 +195,25 @@ try {
     }
     Write-Host "Smoke test passed: versions + docx/pdf convert + png OCR." -ForegroundColor Green
 
-    # 5. Place it where Tauri's externalBin expects it.
+    # 5. Place it where Tauri's bundle.resources expects it. convertd is no
+    #    longer an externalBin single file, so there is no target-triple
+    #    suffix here -- tauri.conf.json stages the whole directory verbatim
+    #    via "binaries/convertd/": "convertd/". Clean the staging dir first so
+    #    a file removed from a later PyInstaller run (e.g. a dropped
+    #    --collect-all) doesn't linger from a previous build and mask a
+    #    regression.
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-    $dest = Join-Path $BinDir "convertd-$TargetTriple.exe"
-    Copy-Item -Force $built $dest
-    $sha = (Get-FileHash -Algorithm SHA256 $dest).Hash.ToLower()
+    $destDir = Join-Path $BinDir "convertd"
+    if (Test-Path $destDir) {
+        Remove-Item -Recurse -Force $destDir
+    }
+    Copy-Item -Recurse -Force $builtDir $destDir
+    $destExe = Join-Path $destDir "convertd.exe"
+    $sha = (Get-FileHash -Algorithm SHA256 $destExe).Hash.ToLower()
     Write-Host ""
     Write-Host "convertd sidecar built:" -ForegroundColor Green
-    Write-Host "  $dest"
-    Write-Host "  SHA-256: $sha"
+    Write-Host "  $destDir"
+    Write-Host "  convertd.exe SHA-256: $sha"
     Write-Host "  Now stage llama-server (see RELEASING.md step 2) and run 'npm run tauri build'."
 }
 finally {

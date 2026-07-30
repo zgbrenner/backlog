@@ -5,11 +5,14 @@
 # gitignored (built/downloaded for a release). The trust core needs none of
 # this: `cargo test -p backlog-core`.
 #
-# The stub names must carry the *host* target triple, because that is what
-# tauri-build resolves externalBin against. Hardcoding the Windows triple made
-# this script a no-op on a Linux/macOS dev box or CI runner — the build still
-# failed with "resource path binaries/convertd-<host-triple> doesn't exist".
-# The Windows triple is always staged too, so a cross-build stays covered.
+# The llama-server stub name must carry the *host* target triple, because
+# that is what tauri-build resolves its externalBin entry against. Hardcoding
+# the Windows triple made this script a no-op on a Linux/macOS dev box or CI
+# runner — the build still failed with "resource path
+# binaries/llama-server-<host-triple> doesn't exist". The Windows triple is
+# always staged too, so a cross-build stays covered. convertd carries no
+# triple suffix any more (see below) -- it ships as a bundle.resources
+# directory tree, not an externalBin entry.
 #
 # Each stub carries STUB_MARKER rather than being zero bytes. A zero-byte file
 # is indistinguishable from a truncated real build, so the realistic accident —
@@ -39,24 +42,36 @@ stub() { # stub <path>
   printf '%s' "$STUB_MARKER" > "$1"
 }
 
-stage() { # stage <triple>
+stage() { # stage <triple> -- llama-server only; convertd is no longer a
+          # triple-suffixed externalBin exe (see below).
   local triple="$1" ext=""
   case "$triple" in *windows*) ext=".exe" ;; esac
-  for tool in convertd llama-server; do
-    local f="$bin/${tool}-${triple}${ext}"
-    # An already-present REAL binary must survive. This script gets run
-    # casually, and clobbering a freshly built convertd.exe with a marker on
-    # the release machine would be a silent, expensive regression.
-    if [ ! -e "$f" ]; then
-      stub "$f"
-    elif [ ! -s "$f" ]; then
-      stub "$f" # upgrade a legacy zero-byte stub in place
-    fi
-  done
+  local f="$bin/llama-server-${triple}${ext}"
+  # An already-present REAL binary must survive. This script gets run
+  # casually, and clobbering a freshly built llama-server.exe with a marker on
+  # the release machine would be a silent, expensive regression.
+  if [ ! -e "$f" ]; then
+    stub "$f"
+  elif [ ! -s "$f" ]; then
+    stub "$f" # upgrade a legacy zero-byte stub in place
+  fi
 }
 
 stage "$host"
 stage x86_64-pc-windows-msvc
+
+# convertd ships as a bundle.resources directory tree (PyInstaller --onedir
+# output: convertd.exe plus a _internal/ folder), not a triple-suffixed
+# externalBin exe. tauri-build's "binaries/convertd/": "convertd/" glob just
+# needs the directory to exist with at least one file in it; a stubbed
+# convertd.exe alone is enough, and (as above) a real one must survive.
+convertd_exe="$bin/convertd/convertd.exe"
+mkdir -p "$(dirname "$convertd_exe")"
+if [ ! -e "$convertd_exe" ]; then
+  stub "$convertd_exe"
+elif [ ! -s "$convertd_exe" ]; then
+  stub "$convertd_exe"
+fi
 
 # bundle.resources globs binaries/*.dll; an empty glob is a hard error there.
 if [ ! -s "$bin/_placeholder.dll" ]; then

@@ -361,10 +361,25 @@ pub async fn run_with(
         );
     }
 
-    // Bounded and short: these are liveness probes, not the real per-request
-    // timeout used once the pipeline is running, so clamp well below
-    // `cfg.sidecar_timeout_secs` regardless of how that's configured.
-    let probe_timeout = Duration::from_secs(cfg.sidecar_timeout_secs.clamp(1, 5));
+    // Bounded, but no longer arbitrarily short. These are liveness probes, so
+    // they must not hang Settings forever — but a probe that gives up before
+    // the sidecar can physically answer reports a working install as broken,
+    // which is the worse failure: it is indistinguishable from a corrupt one
+    // and the suggested remedy (reinstall) cannot help.
+    //
+    // The old ceiling was five seconds, calibrated on a warm developer machine.
+    // `convertd` is a ~250 MB PyInstaller bundle; on a managed machine whose
+    // antivirus scans every file it unpacks, a cold start measured 34-52s on
+    // every launch, not just the first. So "Document reader answers" read
+    // Blocked on an install whose sidecar was perfectly good — and because the
+    // timed-out child kept unpacking in the background, the llama-server probe
+    // that runs next inherited a contended disk and crossed the same ceiling,
+    // reporting the naming engine as blocked too. Two red rows, one cause,
+    // neither of them the actual component.
+    //
+    // Honor the configured per-request timeout, with a ceiling high enough for
+    // a cold antivirus-scanned start and low enough to still be a probe.
+    let probe_timeout = Duration::from_secs(cfg.sidecar_timeout_secs.clamp(1, 60));
 
     let sidecar_ok = if sidecar_found {
         let executable = paths.sidecar.clone();

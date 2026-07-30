@@ -38,13 +38,13 @@
       "icons/icon.ico"
     ],
     "externalBin": [
-      "binaries/convertd",
       "binaries/llama-server"
     ],
     "resources": {
       "resources/*": "resources/",
       "resources/models/*.gguf": "resources/models/",
-      "binaries/*.dll": "./"
+      "binaries/*.dll": "./",
+      "binaries/convertd/": "convertd/"
     },
     "windows": {
       "webviewInstallMode": {

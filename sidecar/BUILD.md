@@ -1,11 +1,24 @@
 # Building the convertd sidecar binary
 
-The Tauri app expects a single-file executable named `convertd` (or
-`convertd.exe`) in `src-tauri/binaries/`, matching `externalBin` in
-`tauri.conf.json`. Tauri requires target-triple suffixed copies, e.g.
-`convertd-x86_64-pc-windows-msvc.exe`.
+The Tauri app expects a PyInstaller **onedir** tree at
+`src-tauri/binaries/convertd/` — `convertd.exe` beside its `_internal/`
+folder — which `tauri.conf.json` ships through `bundle.resources`, not
+`externalBin`. On Windows the resource root is the directory holding the app
+executable, so the installed layout is `<install dir>\convertd\convertd.exe`.
+
+It used to be a single `--onefile` executable, and that is why it moved: a
+onefile exe unpacks its whole ~250 MB payload into a fresh `%TEMP%\_MEI*`
+directory on *every* launch. On a machine whose antivirus scans each unpacked
+file that measured 34-52 seconds per start, which is longer than the readiness
+probe waits, so a perfectly good install reported its document reader as
+blocked — and left a quarter-gigabyte of temp behind each time. A onedir tree
+unpacks nothing and starts in about a second. `externalBin` can only carry one
+file, hence `bundle.resources`.
 
 ## Steps (run on the target OS)
+
+Prefer `scripts/build-sidecar.ps1`, which does all of this, smoke-tests the
+result against real fixtures and stages it. The equivalent by hand:
 
 ```
 cd sidecar
@@ -13,7 +26,7 @@ python -m venv .venv
 .venv\Scripts\activate            # Windows
 pip install -r requirements.txt pyinstaller
 
-pyinstaller --onefile --name convertd \
+pyinstaller --onedir --name convertd \
   --collect-all rapidocr \
   --collect-all lingua \
   --collect-all markitdown \
@@ -27,8 +40,10 @@ pyinstaller --onefile --name convertd \
   --collect-all pptx \
   convertd.py
 
-# Windows example:
-copy dist\convertd.exe ..\src-tauri\binaries\convertd-x86_64-pc-windows-msvc.exe
+# Windows example: stage the whole tree, not one file. Clear the destination
+# first so a stale _internal/ entry cannot survive into a release.
+rmdir /s /q ..\src-tauri\binaries\convertd 2>nul
+xcopy /e /i /y dist\convertd ..\src-tauri\binaries\convertd
 ```
 
 ## Runtime environment variables

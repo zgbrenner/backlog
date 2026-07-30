@@ -9,7 +9,11 @@ members = ["core"]
 
 [lib]
 name = "backlog_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# No cdylib: Tauri emits it for mobile targets this app does not build, and a
+# debug cdylib of this crate exceeds the PE 64k export-ordinal limit, so GNU
+# linkers refuse it ("export ordinal too large") and no windows-gnu build of
+# the app or its tests can link at all.
+crate-type = ["staticlib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

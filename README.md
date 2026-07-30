@@ -162,10 +162,13 @@ person using BackLog.
 
 ### 3. Sidecar binary
 
-See `sidecar/BUILD.md`. Produces `convertd(.exe)`; place it in
-`src-tauri/binaries/` with the target-triple suffix Tauri expects, e.g.
-`convertd-x86_64-pc-windows-msvc.exe`. Place `llama-server` (and its DLLs) the
-same way — `RELEASING.md` Build steps 1-2.
+See `sidecar/BUILD.md`. Produces a PyInstaller **onedir** tree; stage all of it
+at `src-tauri/binaries/convertd/`, so `convertd.exe` sits beside its
+`_internal/` folder. It ships through `bundle.resources`, not `externalBin`,
+which can only carry a single file. `llama-server` *is* a single file and still
+takes the target-triple suffix Tauri expects, e.g.
+`llama-server-x86_64-pc-windows-msvc.exe`, staged with its DLLs —
+`RELEASING.md` Build steps 1-2.
 
 ### 4. In-app configuration (Settings tab)
 

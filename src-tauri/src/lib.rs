@@ -90,7 +90,61 @@ pub(crate) fn binary(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, Stri
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let resource_candidate = resource(app, name).with_file_name(name);
+    // llama-server still ships through `externalBin`: Tauri copies its single
+    // exe next to the main executable, so the generic exe_dir candidates in
+    // `resolve_binary` already find it and `resource(app, name)` is a
+    // harmless last resort. convertd cannot travel that way any more --
+    // PyInstaller's `--onedir` output is a directory tree (`convertd.exe`
+    // plus a `_internal/` folder of DLLs and data files PyInstaller loads at
+    // startup), and `externalBin` only ever stages a single file. It ships
+    // through `bundle.resources` instead (tauri.conf.json's
+    // `"binaries/convertd/": "convertd/"`), which lands one path segment
+    // deeper than an externalBin exe: on Windows `resource_dir()` *is*
+    // `exe_dir` (the directory containing the main executable — see Tauri's
+    // `PathResolver::resource_dir` docs), so the installed layout is
+    // `<exe_dir>/convertd/convertd.exe`, not `<exe_dir>/convertd.exe`.
+    // `cargo run` never runs the resource-copy step that produces that
+    // layout, so the dev fallback instead points straight at the onedir tree
+    // scripts/build-sidecar.ps1 stages under src-tauri/binaries/convertd/.
+    let resource_candidate = if name == "convertd" {
+        let convertd_exe = if cfg!(windows) {
+            "convertd.exe"
+        } else {
+            "convertd"
+        };
+        if cfg!(debug_assertions) {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("binaries")
+                .join("convertd")
+                .join(convertd_exe)
+        } else {
+            match exe_dir.as_deref() {
+                Some(dir) => dir.join("convertd").join(convertd_exe),
+                None => Path::new("convertd").join(convertd_exe),
+            }
+        }
+    } else {
+        resource(app, name).with_file_name(name)
+    };
+    // convertd is resolved against that path and nothing else. `resolve_binary`
+    // tries `<exe_dir>/<name>.exe` *before* the resource candidate, which is
+    // right for an externalBin sidecar and actively harmful here: upgrading
+    // over a `--onefile` install leaves a stale 248 MB `convertd.exe` sitting
+    // beside the app, and that stale copy would win. The app would keep
+    // working, so nothing would look broken — it would just go on unpacking a
+    // quarter of a gigabyte on every launch, which is the entire failure this
+    // layout exists to remove. A silent revert is worse than a loud miss.
+    if name == "convertd" {
+        if resource_candidate.is_file() {
+            return Ok(resource_candidate);
+        }
+        if cfg!(debug_assertions) {
+            return Ok(PathBuf::from(name));
+        }
+        // Name the file the installer should have written, so the failure
+        // points somewhere the user can actually look.
+        return Ok(resource_candidate);
+    }
     // `cargo tauri dev` runs the binary out of target/debug, where the
     // sidecars are not staged; a shipped build must never take that path.
     resolve_binary(
@@ -896,8 +950,13 @@ async fn review_only_pipeline(
 /// Upper bound on the one convertd probe an approval is allowed to wait for,
 /// matching `preflight::run_with`'s liveness probe. Not the per-request
 /// timeout: nothing in the review path converts a document.
+///
+/// The ceiling tracks preflight's deliberately — see the note there. A five
+/// second bound made an approval fail on exactly the machines where a cold
+/// convertd start is slowest, which is also where the reviewer most needs the
+/// approval to go through.
 fn review_probe_timeout(cfg: &Config) -> Duration {
-    Duration::from_secs(cfg.sidecar_timeout_secs.clamp(1, 5))
+    Duration::from_secs(cfg.sidecar_timeout_secs.clamp(1, 60))
 }
 
 #[tauri::command]

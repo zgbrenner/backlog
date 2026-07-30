@@ -23,12 +23,22 @@
       bundle.resources *.dll glob is non-empty — is absent;
     * its SHA-256 matches -Expected, when supplied.
 
+  convertd ships as a PyInstaller --onedir directory tree
+  (binaries/convertd/convertd.exe plus a binaries/convertd/_internal/ folder
+  of DLLs and data files) rather than a single externalBin exe, so it gets its
+  own check: convertd.exe is verified exactly like the other binaries, and
+  _internal/ is verified present and non-empty. The hundreds of files inside
+  _internal are not individually PE-checked -- many of them are legitimately
+  non-PE (ONNX models, fonts, .dat/.json metadata PyInstaller drops there), so
+  a blanket MZ-header check on that tree would fail on real, correct builds.
+
 .PARAMETER Expected
   Optional map of file name -> SHA-256, e.g. the hashes recorded in the
   release evidence per RELEASING.md Build step 2 and docs/RELEASE_CHECKLIST.md:
 
       pwsh scripts/verify-binaries.ps1 -Expected @{
         "llama-server-x86_64-pc-windows-msvc.exe" = "B2D9...DEE"
+        "convertd/convertd.exe" = "A1C4...F09"
       }
 
   Names not present in the map are checked for shape only, and reported as
@@ -57,11 +67,12 @@ if (-not $BinDir) { $BinDir = Join-Path $PSScriptRoot "..\src-tauri\binaries" }
 # Kept byte-identical in scripts/dev-stubs.sh and scripts/dev-stubs.ps1.
 $StubMarker = "BACKLOG-DEV-STUB-DO-NOT-SHIP"
 
-# The two externalBin sidecars, by the exact target-triple names tauri-build
+# The externalBin sidecar, by the exact target-triple name tauri-build
 # resolves. The llama runtime DLLs are checked as a group instead, since their
-# names move with the llama.cpp release.
+# names move with the llama.cpp release. convertd is no longer externalBin --
+# it ships as a bundle.resources directory tree and is checked separately
+# below, at its fixed (non-triple-suffixed) path.
 $RequiredBinaries = @(
-    "convertd-x86_64-pc-windows-msvc.exe",
     "llama-server-x86_64-pc-windows-msvc.exe"
 )
 
@@ -207,6 +218,66 @@ foreach ($name in $RequiredBinaries) {
     else {
         $notes.Add("$name is not hash-pinned. Record $hash in the release evidence.")
         Write-Host "ok    $name  ($length bytes, SHA-256 $hash)" -ForegroundColor Green
+    }
+}
+
+# convertd ships as a bundle.resources directory tree (PyInstaller --onedir
+# output), not a triple-suffixed externalBin exe, so it is checked separately
+# from $RequiredBinaries at its fixed path.
+$convertdName = "convertd/convertd.exe"
+$convertdPath = Join-Path $BinDir "convertd\convertd.exe"
+if (-not (Test-Path $convertdPath)) {
+    $failures.Add("$convertdName is missing. See RELEASING.md Build steps 1-2 (scripts/build-sidecar.ps1).")
+}
+else {
+    $length = (Get-Item $convertdPath).Length
+    if ($length -eq 0) {
+        $failures.Add("$convertdName is zero bytes.")
+    }
+    elseif (Test-CarriesStubMarker $convertdPath) {
+        $failures.Add("$convertdName is a dev stub from scripts/dev-stubs.*, not a real binary.")
+    }
+    elseif (-not (Test-IsPortableExecutable $convertdPath)) {
+        $failures.Add("$convertdName is not a valid PE image (no MZ/PE header) - truncated or wrong file.")
+    }
+    else {
+        $hash = (Get-FileHash $convertdPath -Algorithm SHA256).Hash
+        if ($Expected.ContainsKey($convertdName)) {
+            if ($hash -ne $Expected[$convertdName].ToUpperInvariant()) {
+                $failures.Add("$convertdName SHA-256 $hash does not match the recorded $($Expected[$convertdName]).")
+            }
+            else {
+                Write-Host "ok    $convertdName  ($length bytes, SHA-256 pinned)" -ForegroundColor Green
+            }
+        }
+        else {
+            $notes.Add("$convertdName is not hash-pinned. Record $hash in the release evidence.")
+            Write-Host "ok    $convertdName  ($length bytes, SHA-256 $hash)" -ForegroundColor Green
+        }
+    }
+}
+
+# _internal/ carries convertd's Python runtime, native .pyd extensions, and
+# every --collect-all payload (ONNX models, CMap tables, the pptx default
+# template, ...) -- PyInstaller's onedir bootloader adds this directory to its
+# own DLL search path at startup, so convertd.exe cannot import anything from
+# it unless the whole tree survived staging intact. Its files are not
+# individually PE-checked: most legitimately are not PE images (data files,
+# fonts, ONNX weights), so a blanket MZ-header check here would fail on real,
+# correct builds. An empty or missing _internal/ means the onedir tree was
+# truncated, and convertd would fail to even start on the target machine with
+# no useful error to point at.
+$convertdInternal = Join-Path $BinDir "convertd\_internal"
+if (-not (Test-Path $convertdInternal)) {
+    $failures.Add("convertd/_internal is missing. The --onedir build output was not staged intact; re-run scripts/build-sidecar.ps1.")
+}
+else {
+    $internalCount = (Get-ChildItem -Path $convertdInternal -Recurse -File -ErrorAction SilentlyContinue).Count
+    if ($internalCount -eq 0) {
+        $failures.Add("convertd/_internal is empty. The --onedir build output was not staged intact; re-run scripts/build-sidecar.ps1.")
+    }
+    else {
+        Write-Host "ok    convertd/_internal  ($internalCount file(s))" -ForegroundColor Green
     }
 }
 

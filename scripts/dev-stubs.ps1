@@ -31,7 +31,6 @@ $StubMarker = "BACKLOG-DEV-STUB-DO-NOT-SHIP"
 $bin = Join-Path $PSScriptRoot "..\src-tauri\binaries"
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
 foreach ($f in @(
-    "convertd-x86_64-pc-windows-msvc.exe",
     "llama-server-x86_64-pc-windows-msvc.exe",
     "_placeholder.dll"
 )) {
@@ -43,6 +42,20 @@ foreach ($f in @(
         Set-Content -Path $p -Value $StubMarker -Encoding ascii -NoNewline
     }
 }
+
+# convertd ships as a bundle.resources directory tree (PyInstaller --onedir
+# output), not a triple-suffixed externalBin exe, so tauri-build's
+# "binaries/convertd/": "convertd/" glob just needs the directory to exist
+# with at least one file in it -- a single stubbed convertd.exe is enough to
+# unblock a build. It is deliberately not staged with a placeholder
+# _internal/, which real code never reads before spawning the process.
+$convertdDir = Join-Path $bin "convertd"
+New-Item -ItemType Directory -Force -Path $convertdDir | Out-Null
+$convertdExe = Join-Path $convertdDir "convertd.exe"
+if ((-not (Test-Path $convertdExe)) -or ((Get-Item $convertdExe).Length -eq 0)) {
+    Set-Content -Path $convertdExe -Value $StubMarker -Encoding ascii -NoNewline
+}
+
 Write-Host "Dev stub sidecar binaries created in src-tauri/binaries/." -ForegroundColor Green
 Write-Host "They carry the marker '$StubMarker' and will fail scripts/verify-binaries.ps1."
 Write-Host "Real binaries: scripts/build-sidecar.ps1 (convertd) + RELEASING.md (llama-server)."

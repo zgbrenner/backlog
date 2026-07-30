@@ -57,3 +57,4 @@ sidecar/build/
 
 # Browser UI harness output (screenshots + built bundle)
 dist-harness/
+.venv311/
