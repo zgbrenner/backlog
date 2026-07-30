@@ -51,7 +51,8 @@ evidence attached to the release record.
 ## Windows packaging evidence
 
 - [ ] The release workflow ran on `windows-2022` with Node 22, Python 3.11 x64,
-      and the toolchain from `rust-toolchain.toml`.
+      the toolchain from `rust-toolchain.toml`, and the hash-verified NASM
+      2.16.03 archive.
 - [ ] `npm ci`, Cargo `--locked` resolution, and
       `sidecar/requirements.lock` were used.
 - [ ] `scripts/stage-release-inputs.ps1` verified the primary model and the

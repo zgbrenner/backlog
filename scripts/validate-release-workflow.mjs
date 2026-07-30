@@ -9,6 +9,9 @@ const PRIMARY_SHA256 =
   "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031";
 const LLAMA_SHA256 =
   "b2d991bdd37258bb51309f50e9fb7a52a16fe662ba71b2cbbbbb9303b47b5dee";
+const NASM_VERSION = "2.16.03";
+const NASM_SHA256 =
+  "3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6";
 
 const stepRun = (step) => String(step?.run ?? "");
 const normalizedIf = (step) => String(step?.if ?? "").replaceAll(/\s+/g, "");
@@ -121,6 +124,15 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   }
 
   const allRuns = steps.map(stepRun).join("\n");
+  if (
+    !allRuns.includes(`$nasmVersion = "${NASM_VERSION}"`) ||
+    !allRuns.includes(NASM_SHA256) ||
+    !allRuns.includes("www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/") ||
+    !allRuns.includes("Get-FileHash") ||
+    !allRuns.includes("Expand-Archive")
+  ) {
+    problems.push("release workflow must fetch and verify the exact NASM archive");
+  }
   for (const [label, command] of [
     ["locked npm install", "npm ci"],
     ["frontend validation", "npm run check"],
