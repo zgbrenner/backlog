@@ -133,6 +133,16 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   ) {
     problems.push("release workflow must fetch and verify the exact NASM archive");
   }
+  if (
+    !allRuns.includes("$actualPerl = perl --version") ||
+    !allRuns.includes("$perlExit = $LASTEXITCODE") ||
+    !allRuns.includes("built for MSWin32-x64") ||
+    /perl --version\s*\|\s*Select-Object/i.test(allRuns)
+  ) {
+    problems.push(
+      "release workflow must verify native x64 Perl without truncating the live process output",
+    );
+  }
   for (const [label, command] of [
     ["locked npm install", "npm ci"],
     ["frontend validation", "npm run check"],

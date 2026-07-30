@@ -113,8 +113,13 @@ jobs:
             $env:Path = "$path;$env:Path"
             $path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
-          perl --version | Select-Object -First 2
-          if ($LASTEXITCODE -ne 0) { throw "native Perl is unavailable" }
+          $actualPerl = perl --version
+          $perlExit = $LASTEXITCODE
+          $perlText = $actualPerl -join "`n"
+          if ($perlExit -ne 0 -or $perlText -notmatch "built for MSWin32-x64") {
+            throw "Expected native x64 Strawberry Perl, got $perlText"
+          }
+          $actualPerl | Select-Object -First 2
           $actualNasm = nasm -v
           if ($LASTEXITCODE -ne 0 -or $actualNasm -notmatch "^NASM version $([regex]::Escape($nasmVersion))(\s|$)") {
             throw "Expected NASM $nasmVersion, got $actualNasm"
