@@ -30,7 +30,10 @@ pub struct Config {
     /// Empty string disables the Ettin lane gracefully.
     pub ettin_model_dir: String,
 
-    /// Worker pool sizes.
+    /// How many `convertd` processes to run, and therefore how many documents
+    /// can be converted at once. Each worker is a separate Python process at
+    /// roughly 195 MB resident, so this is a memory knob as well as a
+    /// throughput one — see `convert_workers_ram_ceiling`.
     pub convert_workers: usize,
 
     /// Maximum wait for one convertd request. A timed-out process is killed
@@ -128,9 +131,36 @@ fn normalize_path_text(text: &str) -> String {
 }
 
 fn default_convert_workers() -> usize {
-    std::thread::available_parallelism()
+    let by_cpu = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).clamp(1, 6))
-        .unwrap_or(2)
+        .unwrap_or(2);
+    by_cpu.min(convert_workers_ram_ceiling(total_ram_gib()))
+}
+
+/// How many `convertd` workers installed RAM can hold.
+///
+/// This became a real constraint the moment `Sidecar` grew a process pool.
+/// Before that, `convert_workers` only sized a semaphore and every request
+/// funnelled through one child, so the value cost nothing in memory however
+/// large it was. Now each worker is its own Python process — measured at
+/// ~195 MB resident once MarkItDown and RapidOCR are loaded, plus a ~10 MB
+/// PyInstaller bootstrap stub — so six of them is roughly 1.2 GB.
+///
+/// On an 8 GB machine that does not fit: Windows takes ~3 GB, the two model
+/// servers take ~3.4 GB at `slm_parallel: 1`, and the app and WebView2 another
+/// ~0.4 GB, which leaves about 1.4 GB. Two workers fit inside that with room to
+/// spare; six do not, and the failure mode is the whole batch thrashing rather
+/// than any single thing reporting an error.
+///
+/// A CPU-derived value below the ceiling still wins — this only caps.
+fn convert_workers_ram_ceiling(gib: Option<u64>) -> usize {
+    match gib {
+        Some(g) if g <= 9 => 2,  // 8 GB class: ~400 MB of sidecars
+        Some(g) if g <= 17 => 4, // 16 GB class
+        Some(_) => 6,
+        // Unknown RAM is not a reason to gamble on behalf of the smaller machine.
+        None => 2,
+    }
 }
 
 /// Total physical RAM in GiB, or `None` if the OS will not say.
@@ -504,6 +534,24 @@ mod tests {
         }
         // Unknown RAM must not gamble on behalf of the smaller machine.
         assert_eq!(slm_parallel_for_ram(None), 2);
+    }
+
+    /// Each `convertd` worker is a ~195 MB Python process now that `Sidecar`
+    /// pools them, so six of them is ~1.2 GB and does not fit on 8 GB beside
+    /// Windows, the two model servers and the app.
+    #[test]
+    fn convert_workers_are_capped_by_installed_ram() {
+        for (gib, expected) in [(4u64, 2usize), (8, 2), (9, 2), (12, 4), (17, 4), (32, 6)] {
+            assert_eq!(
+                convert_workers_ram_ceiling(Some(gib)),
+                expected,
+                "{gib} GiB should cap at {expected}"
+            );
+        }
+        assert_eq!(convert_workers_ram_ceiling(None), 2);
+        // The live default must never exceed the ceiling for this machine.
+        assert!(default_convert_workers() <= convert_workers_ram_ceiling(total_ram_gib()));
+        assert!(default_convert_workers() >= 1, "one worker is the floor");
     }
 
     /// `backlog.config.json` outlives the installer, so a machine that ran an

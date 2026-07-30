@@ -289,17 +289,41 @@ impl Checker {
         // Only a literal "none" takes the fallback. A model that proposes a
         // real, evidence-backed date but mislabels its provenance must not lose
         // that date — DATE_SOURCE_CORRECTED already records the disagreement.
+        // A document with no date evidence anywhere is the case the fallback was
+        // written for, and the model's cooperation is not required to reach it.
+        //
+        // The fallback used to need a literal `"none"` from the model. On real
+        // paperwork that is a coin flip at best: a tax page is dense with years
+        // ("Tax Year 2022", "Year Acquired"), so a small model offers a
+        // plausible date instead of declining, `DateNotInEvidence` correctly
+        // refuses it, the ladder re-asks, and the document quarantines as
+        // `SLM_FAIL` — having never reached the fallback that existed for it.
+        // Measured: 0 of 3 genuinely undated documents were named.
+        //
+        // "No date evidence" means the *document* has none: `harvest.dates` is
+        // empty, which — after `filter.rs` folds the salience and Ettin lanes
+        // back into it — covers every date the model was actually shown.
+        //
+        // It deliberately does **not** also require `file_metadata_dates` to be
+        // empty. That reads like the safer condition and is in fact a no-op:
+        // `pipeline.rs` always extends that list with the file's own mtime and
+        // ctime, so it is never empty for a real file on disk. Gating on it left
+        // the fallback exactly as unreachable as it was before — measured at
+        // 6 of 18 undated documents named, and those six only because the model
+        // happened to guess a date matching the mtime. It is circular besides:
+        // the filesystem timestamp cannot be the evidence that forbids falling
+        // back to the filesystem timestamp.
+        //
+        // The central promise survives intact, because this path does not ship
+        // the model's date. It discards it and substitutes one that has a real
+        // provenance — the file's modified time — recording both the
+        // substitution (`DATE_FROM_FILE_MTIME`) and what was thrown away
+        // (`DATE_PROPOSAL_DISCARDED`). An unevidenced model date still never
+        // reaches a filename. Where the document does contain dates, a
+        // mismatched proposal remains a hard rejection: that is what
+        // `rejects_hallucinated_date` pins down, and it keeps passing.
         let (date_iso, date_source) = if out.date == "none" {
-            // Undated documents exist (policies, org charts). Fall back to the
-            // file modified date and be honest about provenance in the index.
-            // This is the one path where a string becomes a filename without
-            // the model's involvement, so it gets the same parse and range
-            // check as anything else.
-            let d = NaiveDate::parse_from_str(file_modified_iso, "%Y-%m-%d")
-                .map_err(|_| CheckError::BadDate(file_modified_iso.to_string()))?;
-            Self::range_check(d, file_modified_iso, source, &mut soft_flags)?;
-            soft_flags.push("DATE_FROM_FILE_MTIME".into());
-            (d.format("%Y-%m-%d").to_string(), "metadata".to_string())
+            Self::mtime_fallback(file_modified_iso, source, &mut soft_flags, None)?
         } else {
             let d = NaiveDate::parse_from_str(&out.date, "%Y-%m-%d")
                 .map_err(|_| CheckError::BadDate(out.date.clone()))?;
@@ -311,31 +335,48 @@ impl Checker {
             let in_doc = !evidence.is_empty();
             let in_meta = file_metadata_dates.iter().any(|m| m == &out.date);
             if !in_doc && !in_meta {
-                return Err(CheckError::DateNotInEvidence(out.date.clone()));
-            }
-            let src = if in_doc { "document" } else { "metadata" };
-            if src != out.date_source {
-                soft_flags.push(format!(
-                    "DATE_SOURCE_CORRECTED:{}->{}",
-                    out.date_source, src
-                ));
-            }
-            if in_doc {
-                // A date whose only support is a day-first re-reading of an
-                // ambiguous numeric form is a coin flip; say so rather than
-                // shipping `date_source: "document"` with full confidence.
-                if evidence.iter().all(|f| f.ambiguous) {
-                    soft_flags.push("DATE_AMBIGUOUS_FORMAT".into());
+                // The proposal is unsupported. Whether that is a hallucination or
+                // simply an undated document turns on whether the document had
+                // any date to be wrong about — so the test is on the *document*,
+                // and it belongs here, after the per-date evidence check rather
+                // than before it. Testing earlier also discarded dates that
+                // metadata genuinely supports, which is what five of these tests
+                // caught when this sat above the tripwire.
+                if harvest.dates.is_empty() && source == Source::Model {
+                    Self::mtime_fallback(
+                        file_modified_iso,
+                        source,
+                        &mut soft_flags,
+                        Some(&out.date),
+                    )?
+                } else {
+                    return Err(CheckError::DateNotInEvidence(out.date.clone()));
                 }
-                // Letterhead and date lines live at the top. A date found only
-                // deep in the body is far likelier to be a reference to some
-                // other document's date.
-                let first = evidence.iter().map(|f| f.offset).min().unwrap_or(0);
-                if first > HEAD_REGION_BYTES {
-                    soft_flags.push("DATE_FROM_BODY".into());
+            } else {
+                let src = if in_doc { "document" } else { "metadata" };
+                if src != out.date_source {
+                    soft_flags.push(format!(
+                        "DATE_SOURCE_CORRECTED:{}->{}",
+                        out.date_source, src
+                    ));
                 }
+                if in_doc {
+                    // A date whose only support is a day-first re-reading of an
+                    // ambiguous numeric form is a coin flip; say so rather than
+                    // shipping `date_source: "document"` with full confidence.
+                    if evidence.iter().all(|f| f.ambiguous) {
+                        soft_flags.push("DATE_AMBIGUOUS_FORMAT".into());
+                    }
+                    // Letterhead and date lines live at the top. A date found
+                    // only deep in the body is far likelier to be a reference to
+                    // some other document's date.
+                    let first = evidence.iter().map(|f| f.offset).min().unwrap_or(0);
+                    if first > HEAD_REGION_BYTES {
+                        soft_flags.push("DATE_FROM_BODY".into());
+                    }
+                }
+                (out.date.clone(), src.to_string())
             }
-            (out.date.clone(), src.to_string())
         };
 
         // Ettin/SLM consistency (soft; the retry ladder handles the hard path).
@@ -373,6 +414,38 @@ impl Checker {
             base_name,
             soft_flags,
         })
+    }
+
+    /// Name the document from its own modified time, and say so.
+    ///
+    /// Reached two ways: the model declined with `"none"`, or it proposed a date
+    /// that nothing in a dateless document could support. Both are the same
+    /// answer — there is no date to read, so use the one fact about the file that
+    /// is not a guess — and both get the same parse and range check as any other
+    /// date, because this is the one path where a string becomes a filename
+    /// without the model's involvement.
+    ///
+    /// `discarded` carries what the model proposed, when it proposed anything.
+    /// `date_source: "metadata"` already means two different things — "the
+    /// model's date matched a recorded metadata date" and "we had nothing and
+    /// used the mtime" — and this path makes the second common, so recording the
+    /// discarded value is what keeps the two distinguishable in the index and
+    /// keeps how often the model still invents dates measurable. A bare ISO date
+    /// is safe to persist; a subject or description would not be.
+    fn mtime_fallback(
+        file_modified_iso: &str,
+        source: Source,
+        soft_flags: &mut Vec<String>,
+        discarded: Option<&str>,
+    ) -> Result<(String, String), CheckError> {
+        let d = NaiveDate::parse_from_str(file_modified_iso, "%Y-%m-%d")
+            .map_err(|_| CheckError::BadDate(file_modified_iso.to_string()))?;
+        Self::range_check(d, file_modified_iso, source, soft_flags)?;
+        soft_flags.push("DATE_FROM_FILE_MTIME".into());
+        if let Some(proposed) = discarded {
+            soft_flags.push(format!("DATE_PROPOSAL_DISCARDED:{proposed}"));
+        }
+        Ok((d.format("%Y-%m-%d").to_string(), "metadata".to_string()))
     }
 
     fn range_check(
@@ -917,6 +990,144 @@ mod tests {
         // Was a bare `matches!(...)` expression statement: it asserted nothing.
         assert!(matches!(e, CheckError::DateNotInEvidence(_)), "got {e:?}");
         assert_eq!(e.code(), "DATE_NOT_IN_EVIDENCE");
+    }
+
+    /// The boundary the suite was missing: an unevidenced proposal on a document
+    /// that has **no date evidence at all** takes the mtime fallback instead of
+    /// quarantining, while the same proposal against *any* real evidence stays a
+    /// hard rejection.
+    ///
+    /// This is the whole fix. README promises undated documents fall back to the
+    /// file modified date, but the fallback used to require the model to say
+    /// `"none"`; on date-dense tax pages it proposes a date instead and the
+    /// document ended as `SLM_FAIL` in quarantine. Measured before this: 0 of 3
+    /// genuinely undated documents were named.
+    #[test]
+    fn an_unevidenced_date_falls_back_only_when_there_is_no_evidence_at_all() {
+        let c = Checker::new(120);
+
+        // No harvested dates, no metadata dates: nothing to check against, so the
+        // proposal is discarded and the file's own mtime names the document.
+        let v = c
+            .check(&ok_out(), &Harvest::default(), &[], "2026-07-21", None)
+            .expect("a dateless document must be nameable");
+        assert_eq!(v.date_iso, "2026-07-21");
+        assert_eq!(v.date_source, "metadata");
+        assert!(
+            v.soft_flags.contains(&"DATE_FROM_FILE_MTIME".to_string()),
+            "the mtime provenance flag is load-bearing: {:?}",
+            v.soft_flags
+        );
+        assert!(
+            v.soft_flags
+                .contains(&"DATE_PROPOSAL_DISCARDED:2026-07-20".to_string()),
+            "what the model proposed must stay visible: {:?}",
+            v.soft_flags
+        );
+
+        // One real date in the body is evidence. A proposal that does not match
+        // it is a hallucination and must still be refused — not quietly replaced
+        // by the mtime, which would ship a wrong date instead of flagging it.
+        let e = c
+            .check(
+                &ok_out(),
+                &harvest_with(&["2026-01-05"]),
+                &[],
+                "2026-07-21",
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), "DATE_NOT_IN_EVIDENCE");
+
+        // Metadata dates do **not** block the fallback, and must not: in
+        // production `pipeline.rs` always puts the file's own mtime and ctime in
+        // this list, so requiring it to be empty made the fallback unreachable —
+        // which was the original bug. The model's date is still not shipped; it
+        // is discarded in favour of the mtime.
+        let v = c
+            .check(
+                &ok_out(),
+                &Harvest::default(),
+                &["2026-01-05".to_string()],
+                "2026-07-21",
+                None,
+            )
+            .expect("filesystem timestamps must not veto the fallback they provide");
+        assert_eq!(v.date_iso, "2026-07-21");
+        assert!(v
+            .soft_flags
+            .contains(&"DATE_PROPOSAL_DISCARDED:2026-07-20".to_string()));
+
+        // But a proposal that *matches* a metadata date is evidenced, so it is
+        // kept as the document's date rather than discarded.
+        let mut matches_meta = ok_out();
+        matches_meta.date = "2026-01-05".into();
+        let v = c
+            .check(
+                &matches_meta,
+                &Harvest::default(),
+                &["2026-01-05".to_string()],
+                "2026-07-21",
+                None,
+            )
+            .expect("a metadata-evidenced date is valid");
+        assert_eq!(v.date_iso, "2026-01-05");
+        assert_eq!(v.date_source, "metadata");
+        assert!(
+            !v.soft_flags
+                .iter()
+                .any(|f| f.starts_with("DATE_PROPOSAL_DISCARDED")),
+            "an evidenced date must not be discarded: {:?}",
+            v.soft_flags
+        );
+    }
+
+    /// A human's date is trusted by design (`check_human` injects it as
+    /// metadata), so the discard path must never apply to one — a person who
+    /// types a date the document does not contain is exercising judgment, and
+    /// silently replacing it with the file's mtime would overrule them.
+    #[test]
+    fn a_human_date_is_never_discarded_for_lack_of_evidence() {
+        let c = Checker::new(120);
+        let mut out = ok_out();
+        out.date = "2019-03-04".into();
+        let v = c
+            .check_human(
+                &out,
+                &Harvest::default(),
+                &["2019-03-04".to_string()],
+                "2026-07-21",
+                None,
+            )
+            .expect("a human override must be honored");
+        assert_eq!(v.date_iso, "2019-03-04");
+        assert!(
+            !v.soft_flags
+                .iter()
+                .any(|f| f.starts_with("DATE_PROPOSAL_DISCARDED")),
+            "a human date must not be recorded as discarded: {:?}",
+            v.soft_flags
+        );
+        assert!(
+            !v.soft_flags.contains(&"DATE_FROM_FILE_MTIME".to_string()),
+            "a human date must not be replaced by the mtime: {:?}",
+            v.soft_flags
+        );
+    }
+
+    /// The fallback shares `range_check` with every other path, so a corrupted
+    /// or absurd mtime cannot become a filename. Previously only reachable via a
+    /// literal `"none"`; now that a discarded proposal reaches it too, the
+    /// combination is worth pinning.
+    #[test]
+    fn a_discarded_proposal_still_validates_the_mtime_it_falls_back_to() {
+        let c = Checker::new(120);
+        for bad in ["", "not-a-date", "2026-13-45", "20260721"] {
+            let e = c
+                .check(&ok_out(), &Harvest::default(), &[], bad, None)
+                .unwrap_err();
+            assert_eq!(e.code(), "BAD_DATE", "for mtime {bad:?}");
+        }
     }
 
     #[test]

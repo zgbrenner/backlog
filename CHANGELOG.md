@@ -15,6 +15,95 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.4.1] — the two things 0.4.0 measured and left broken
+
+### Undated documents are named again
+
+**Fixed — the mtime fallback fired only when the model volunteered `"none"`.**
+`README.md` promises that undated documents fall back to the file modified date.
+The branch existed and was tested, but reaching it required the model to decline;
+on tax pages dense with years a 0.6B/1.7B model proposes a plausible date
+instead, `DateNotInEvidence` correctly refuses it, the ladder re-asks, and the
+document quarantines as `SLM_FAIL` — having never reached the fallback that
+exists for precisely that case. Measured before: **0 of 3** genuinely undated
+fixtures named.
+
+`check_with` now converts a would-be `DateNotInEvidence` into the fallback when
+the document itself carried no date. Three things made that safe rather than a
+loophole:
+
+- **It sits after the per-date evidence check, not before it.** An earlier
+  version gated ahead of the tripwire and discarded dates that metadata
+  genuinely supported; five existing tests caught it. That is the difference
+  between "this date is unsupported" and "this document has no date."
+- **It does not require `file_metadata_dates` to be empty.** That reads safer and
+  is a no-op: `pipeline.rs` always extends that list with the file's own mtime
+  and ctime, so it is never empty for a real file. Gating on it left the fallback
+  as unreachable as before — measured at 6 of 18, and those six only because the
+  model happened to guess the mtime. It is also circular: a filesystem timestamp
+  cannot be the evidence that forbids falling back to the filesystem timestamp.
+- **The central promise is untouched.** This path does not ship the model's date.
+  It discards it and substitutes one with real provenance, recording both
+  `DATE_FROM_FILE_MTIME` and `DATE_PROPOSAL_DISCARDED:<what was proposed>` — so
+  the two meanings of `date_source: "metadata"` stay distinguishable in the index,
+  and how often the model fabricates dates stays measurable. Where the document
+  does contain dates, a mismatched proposal is still a hard rejection;
+  `rejects_hallucinated_date` is unchanged and passing.
+
+**Fixed — `harvest.dates` did not include every date the model was shown.**
+`harvest::harvest` scans the first 6,000 and last 2,500 characters, but
+`filter.rs` shows the model salient sentences drawn from the *whole* document and
+Ettin spans from the first 8,000. A date outside the harvest window could
+therefore appear in the bundle while the checker had no record of it. That was
+already a latent way to reject a correct, evidenced answer; it became
+load-bearing the moment an empty harvest started licensing the fallback, because
+a document whose only date sat at character 7,000 would have looked dateless.
+`build_evidence` now folds those lanes back into the harvest.
+
+### Conversion is no longer serialized app-wide
+
+**Fixed — `Sidecar` held one convertd process behind one mutex for an entire
+request/response round trip**, so every conversion, OCR, probe and langid call in
+the app queued behind every other one, and `Config::convert_workers` sized a
+semaphore that bought queue depth and no parallelism at all. convertd's main loop
+is `while True: readline()`, strictly one request per process, so the fix is more
+processes rather than more requests down one pipe.
+
+`Sidecar` now runs a pool. A condvar free-list rather than one mutex per slot: an
+intermediate version scanned slots and then blocked on a rotating one, which let
+a caller sit behind a long OCR while a different worker went idle — the fairness
+loss it was meant to remove. Workers are handed out through an RAII `Checkout`,
+so the several ways `call` can leave — success, four failures, or a panic in
+serde or a caller — all return or retire the worker; without it any missed path
+would have cost the pool a worker permanently and a long backfill would grind
+down with nothing in the log to explain it.
+
+Measured, warm pool, conversion stage alone: 13 documents in 3.2 s on one worker
+and 2.4 s on four (1.33x). Not 4x because these fixtures are small text-layer
+PDFs where the JSON round trip dominates; the gain grows with per-document work,
+which is what scanned pages running escalating OCR passes are.
+
+**`Config::convert_workers` is now capped by installed RAM** as well as by cores.
+Before the pool the value cost nothing in memory however large it was, since one
+process served everything. Now each worker is its own ~195 MB Python process, so
+six of them is ~1.2 GB and does not fit on 8 GB beside Windows, the two model
+servers and the app: <=9 GiB caps at 2, <=17 GiB at 4, above that 6.
+
+### Honest about what this did not fix
+
+Pooling conversion did not shorten the end-to-end batch, and `docs/SIZING.md`
+says so with the numbers. With `slm_parallel: 1` the naming lane sets the wall
+clock, so converted documents queue behind a single naming slot; a 12-file batch
+measured 34.3 s/file before and 40.25 s/file after with four workers, the
+difference being CPU the extra workers took from llama-server. Conversion
+parallelism pays off only where `slm_parallel` can also rise, which is a function
+of RAM. The benchmark is `#[ignore]`d and measures the conversion stage in
+isolation for exactly that reason.
+
+The remaining failures on undated fixtures are subject and description
+rejections, not date ones — a naming-quality limit of a small model on sparse
+"draft working notes" pages rather than an unreachable rule.
+
 ## [0.4.0] — sized for the machine it actually runs on
 
 0.3.0 proved the release procedure worked. This release is what happened when

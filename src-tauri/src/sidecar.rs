@@ -1,15 +1,21 @@
-//! Client for the `convertd` Python sidecar: one warm process, newline-
+//! Client for the `convertd` Python sidecar: a pool of warm processes, newline-
 //! delimited JSON over stdin/stdout, no terminal window. Ops:
 //!   pdf_probe | convert | ocr | langid | classify | salience | ettin_spans | ping
 //! Respawn-on-death is handled here; the pipeline replays the job from the
 //! ledger on RUNTIME_FAIL.
+//!
+//! A pool rather than one process because convertd's main loop is
+//! `while True: readline()` — strictly one request at a time — so a single
+//! warm process made every conversion in the app queue behind every other one
+//! however large `Config::convert_workers` was. Each worker is its own ~195 MB
+//! Python process, which is why that setting is capped against installed RAM.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::mpsc::Receiver;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -177,9 +183,40 @@ pub struct Sidecar {
     /// `sidecar/convertd.py`'s `_gliclass`/`_granite` loaders), which live
     /// under app-data rather than beside the exe, are actually found.
     models_dir: Option<std::path::PathBuf>,
-    inner: Mutex<Option<Proc>>,
+    /// Idle worker processes, plus how many exist in total.
+    ///
+    /// This used to be a single `Mutex<Option<Proc>>`, which made every sidecar
+    /// op in the app — probe, convert, OCR, langid — queue behind every other
+    /// one, because `call` holds the lock across the blocking `recv_timeout`.
+    /// `convert_workers` sized a semaphore in `pipeline.rs` and therefore bought
+    /// queue depth and no parallelism whatsoever: measured at ~34 s/file with
+    /// fifteen cores idle. convertd's main loop is `while True: readline()`,
+    /// strictly one request at a time per process, so the fix has to be more
+    /// processes rather than more requests down one pipe.
+    ///
+    /// A checked-out worker is *absent* from `idle` and owned by the caller for
+    /// the round trip, which is what makes a failed worker easy to retire: the
+    /// caller simply never returns it, `Proc::drop` kills the child, and `live`
+    /// drops so the next checkout spawns a replacement.
+    pool: Mutex<PoolState>,
+    /// Signalled whenever a worker is returned or retired. A free-list with a
+    /// condvar rather than one mutex per slot: with per-slot mutexes a caller
+    /// that found every slot busy had to pick one and block on it, and could
+    /// then sit behind a long OCR while a different worker went idle beside it.
+    available: Condvar,
+    max_workers: usize,
     counter: std::sync::atomic::AtomicU64,
     pub timeout: Duration,
+}
+
+#[derive(Default)]
+struct PoolState {
+    /// Spawned and ready. Popped on checkout, pushed back on success.
+    idle: Vec<Proc>,
+    /// Spawned and not yet retired, whether idle or checked out. Bounded by
+    /// `max_workers`; counted separately from `idle.len()` because a checked-out
+    /// worker is in neither collection.
+    live: usize,
 }
 
 struct Proc {
@@ -213,12 +250,123 @@ impl Sidecar {
         Self {
             exe,
             models_dir: None,
-            inner: Mutex::new(None),
+            pool: Mutex::new(PoolState::default()),
+            available: Condvar::new(),
+            // One worker unless a caller opts in. The three short-lived
+            // diagnostic probes (`get_diagnostics`, `preflight`, the review-only
+            // pipeline) want exactly one, and so does every test; only the
+            // long-lived pipeline sidecar pools.
+            max_workers: 1,
             counter: std::sync::atomic::AtomicU64::new(1),
             timeout,
         }
     }
 
+    /// Run up to `workers` convertd processes, converting that many documents at
+    /// once.
+    ///
+    /// Each worker is a separate Python process at roughly 195 MB resident once
+    /// MarkItDown and RapidOCR have loaded, so this is a memory decision as much
+    /// as a throughput one — `Config::convert_workers` is capped against
+    /// installed RAM for that reason. Builder-style, and clamped to at least one
+    /// so a nonsense value cannot produce a `Sidecar` that can never answer.
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.max_workers = workers.max(1);
+        self
+    }
+
+    fn lock_pool(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        // Poison is recovered rather than propagated: one panicking caller must
+        // not take the whole pool down with it. `Checkout::drop` runs during that
+        // caller's unwind and leaves the pool structurally sound either way.
+        self.pool.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Take a worker out of the pool, spawning one if there is room.
+    ///
+    /// Waits on the condvar when `max_workers` are already out, so whichever
+    /// worker is returned next satisfies whichever caller is waiting — rather
+    /// than a caller pre-committing to one worker and then sitting behind a long
+    /// OCR while a different one goes idle beside it.
+    fn checkout(&self) -> anyhow::Result<Checkout<'_>> {
+        let mut state = self.lock_pool();
+        loop {
+            if let Some(proc) = state.idle.pop() {
+                return Ok(Checkout {
+                    sidecar: self,
+                    proc: Some(proc),
+                });
+            }
+            if state.live < self.max_workers {
+                // Reserve the slot before releasing the lock so two callers
+                // cannot both decide there is room for the last worker.
+                state.live += 1;
+                drop(state);
+                return match self.spawn() {
+                    Ok(proc) => Ok(Checkout {
+                        sidecar: self,
+                        proc: Some(proc),
+                    }),
+                    Err(e) => {
+                        // Give the reservation back, or the pool shrinks by one
+                        // every time a spawn fails and eventually serves nobody.
+                        self.lock_pool().live -= 1;
+                        self.available.notify_one();
+                        Err(e)
+                    }
+                };
+            }
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// A worker on loan from the pool, returned on drop.
+///
+/// RAII rather than an explicit check-in because `call` can leave by several
+/// paths — success, four kinds of failure, and a panic in `serde` or a caller's
+/// own code. Without this, any path that missed the check-in would silently cost
+/// the pool one worker for the life of the process, and a long backfill would
+/// grind down to nothing with no error to explain it.
+struct Checkout<'a> {
+    sidecar: &'a Sidecar,
+    /// `None` once `retire` has been called: the worker is not coming back and
+    /// its slot should be freed for a replacement.
+    proc: Option<Proc>,
+}
+
+impl Checkout<'_> {
+    fn proc(&mut self) -> &mut Proc {
+        // Only `retire` clears this, and it consumes the borrow, so a retired
+        // checkout is never used again.
+        self.proc.as_mut().expect("checked-out worker")
+    }
+
+    /// Discard this worker instead of returning it: wedged, dead, or out of sync
+    /// with its own response stream. `Proc::drop` kills the child; the next
+    /// checkout spawns a clean replacement.
+    fn retire(&mut self) {
+        self.proc = None;
+    }
+}
+
+impl Drop for Checkout<'_> {
+    fn drop(&mut self) {
+        {
+            let mut state = self.sidecar.lock_pool();
+            match self.proc.take() {
+                Some(proc) => state.idle.push(proc),
+                None => state.live -= 1,
+            }
+        }
+        self.sidecar.available.notify_one();
+    }
+}
+
+impl Sidecar {
     /// Sets the models directory injected into every spawned process as
     /// `BACKLOG_MODELS_DIR`. Builder-style so existing call sites (and the
     /// unix-only tests below, which never load a real model) are unaffected
@@ -303,17 +451,21 @@ impl Sidecar {
         let id = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut guard = self.inner.lock().unwrap();
+        // Ids stay globally unique across the pool. Nothing requires that — a
+        // worker only ever sees its own requests, on its own private channel —
+        // but it keeps a stray line traceable to one call rather than to one
+        // call per worker.
+        let mut checkout = self.checkout()?;
 
-        // Lazy spawn / respawn if dead.
-        let need_spawn = match guard.as_mut() {
-            None => true,
-            Some(p) => matches!(p.child.try_wait(), Ok(Some(_)) | Err(_)),
-        };
-        if need_spawn {
-            *guard = Some(self.spawn()?);
+        // A worker can have died on its own between checkouts (crash, killed by
+        // the OS under memory pressure). Retire it and take a fresh one rather
+        // than writing a request into a closed pipe.
+        if matches!(checkout.proc().child.try_wait(), Ok(Some(_)) | Err(_)) {
+            checkout.retire();
+            drop(checkout);
+            checkout = self.checkout()?;
         }
-        let proc = guard.as_mut().unwrap();
+        let proc = checkout.proc();
 
         let req = Request { id, op, args };
         let mut line = serde_json::to_string(&req)?;
@@ -354,18 +506,22 @@ impl Sidecar {
                 }
                 Ok(resp.data)
             }
-            // Drop the wedged/broken process (its Drop kills it); the next call
-            // respawns a clean one.
+            // Retire the wedged/broken worker instead of returning it to the
+            // pool; `Checkout::drop` frees its slot and `Proc::drop` kills the
+            // child, so the next checkout spawns a clean replacement. A wedged
+            // worker must never go back into circulation: its next response
+            // would arrive against a stale id and be discarded, leaving it one
+            // reply behind forever.
             Wake::Timeout => {
-                *guard = None;
+                checkout.retire();
                 anyhow::bail!("sidecar '{op}' timed out after {:?}", self.timeout);
             }
             Wake::ReadErr(e) => {
-                *guard = None;
+                checkout.retire();
                 anyhow::bail!("sidecar read error during '{op}': {e}");
             }
             Wake::Closed => {
-                *guard = None;
+                checkout.retire();
                 anyhow::bail!("sidecar closed stream during '{op}'");
             }
         }
@@ -484,6 +640,243 @@ pub struct EttinSpan {
     pub score: f64,
     #[serde(default)]
     pub iso: Option<String>, // normalized, DATE spans only
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A stand-in worker that spawns and then blocks reading stdin, which is all
+    /// the pool's bookkeeping cares about. `checkout` spawns as part of
+    /// reserving, so these tests need a real executable — but not a real
+    /// convertd: nothing here sends a request or waits for a reply.
+    ///
+    /// `sort` on Windows and `cat` on unix both consume stdin until EOF and stay
+    /// alive until killed, which is exactly the lifecycle a convertd worker has.
+    fn stdin_reader() -> std::path::PathBuf {
+        #[cfg(windows)]
+        return std::path::PathBuf::from("sort");
+        #[cfg(not(windows))]
+        return std::path::PathBuf::from("cat");
+    }
+
+    fn pool(workers: usize) -> Arc<Sidecar> {
+        Arc::new(
+            Sidecar::with_timeout(stdin_reader(), Duration::from_millis(50)).with_workers(workers),
+        )
+    }
+
+    /// The whole point of the change: N workers means N documents in flight.
+    /// Before it, `call` held one mutex across the entire round trip, so a
+    /// second caller waited for the first no matter how large `convert_workers`
+    /// was.
+    #[test]
+    fn a_pool_admits_one_caller_per_worker_and_makes_the_rest_wait() {
+        let sidecar = pool(3);
+        let a = sidecar.checkout().expect("reserved slot 1");
+        let b = sidecar.checkout().expect("reserved slot 2");
+        let c = sidecar.checkout().expect("reserved slot 3");
+        assert_eq!(sidecar.lock_pool().live, 3);
+
+        // A fourth caller must wait rather than share a worker, because convertd
+        // handles exactly one request at a time per process.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let sidecar = sidecar.clone();
+            std::thread::spawn(move || {
+                let _held = sidecar.checkout();
+                let _ = tx.send(());
+            })
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "a fourth caller must not be admitted while three workers are out"
+        );
+
+        // Whichever worker comes back must satisfy the waiter. This is the
+        // property a per-slot mutex could not provide: there, a waiter picked
+        // one slot up front and could sit behind it while another went idle.
+        drop(b);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "returning any worker must release the waiting caller"
+        );
+        waiter.join().expect("waiter must not panic");
+        drop((a, c));
+    }
+
+    /// A single worker is still strictly serialized, which is what every
+    /// short-lived diagnostic probe and every other test relies on.
+    #[test]
+    fn the_default_pool_is_one_worker() {
+        let sidecar = pool(1);
+        let held = sidecar.checkout().expect("reserved the only slot");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sidecar2 = sidecar.clone();
+        let waiter = std::thread::spawn(move || {
+            let _held = sidecar2.checkout();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "one worker must admit one caller at a time"
+        );
+        drop(held);
+        assert!(rx.recv_timeout(Duration::from_secs(10)).is_ok());
+        waiter.join().unwrap();
+
+        // `with_workers(0)` must not produce a pool that can never answer.
+        let clamped =
+            Sidecar::with_timeout(stdin_reader(), Duration::from_millis(10)).with_workers(0);
+        assert_eq!(clamped.max_workers, 1);
+    }
+
+    /// Retiring a worker must free its slot. If it did not, every timeout would
+    /// permanently shrink the pool and a long backfill would grind to a halt
+    /// with nothing in the log to explain it.
+    #[test]
+    fn retiring_a_worker_frees_its_slot_for_a_replacement() {
+        let sidecar = pool(1);
+        let mut held = sidecar.checkout().expect("reserved the only slot");
+        assert_eq!(sidecar.lock_pool().live, 1);
+        held.retire();
+        drop(held);
+        let state = sidecar.lock_pool();
+        assert_eq!(state.live, 0, "a retired worker must not hold its slot");
+        assert!(
+            state.idle.is_empty(),
+            "a retired worker must not go back into circulation"
+        );
+    }
+
+    /// Times the same conversions through one worker and through several, using
+    /// the real `convertd`.
+    ///
+    /// `#[ignore]` because it needs the built sidecar and real documents. It
+    /// exists because the end-to-end batch cannot show this: with `slm_parallel`
+    /// low, naming is the binding constraint, so pooling conversion leaves the
+    /// wall clock unchanged and the win is invisible exactly where you would
+    /// look for it. This measures the conversion stage on its own.
+    ///
+    /// ```powershell
+    /// $env:BACKLOG_E2E_CONVERTD = "$env:LOCALAPPDATA\BackLog\convertd.exe"
+    /// $env:BACKLOG_E2E_DOCS     = "C:\path\to\a\folder\of\documents"
+    /// cargo test -p backlog --lib convert_throughput -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs the built convertd and a folder of real documents"]
+    fn convert_throughput_scales_with_workers() {
+        let exe = std::path::PathBuf::from(
+            std::env::var("BACKLOG_E2E_CONVERTD").expect("BACKLOG_E2E_CONVERTD must be set"),
+        );
+        let docs = std::path::PathBuf::from(
+            std::env::var("BACKLOG_E2E_DOCS").expect("BACKLOG_E2E_DOCS must be set"),
+        );
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&docs)
+            .expect("document folder must exist")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        files.sort();
+        assert!(files.len() >= 4, "need at least four documents to compare");
+
+        let run = |workers: usize| -> Duration {
+            let sidecar = Arc::new(
+                Sidecar::with_timeout(exe.clone(), Duration::from_secs(120)).with_workers(workers),
+            );
+
+            // Warm every worker before timing anything. `convertd` is a
+            // PyInstaller one-file build: the first request to a fresh worker
+            // pays for unpacking to %TEMP% and starting a Python interpreter,
+            // seconds of it. Timing that would measure N cold starts against
+            // one and conclude, wrongly, that pooling is slower — which is
+            // exactly what the first version of this test reported. The app
+            // holds one pool across a whole backfill, so startup is paid once
+            // and amortised to nothing; steady state is the honest comparison.
+            let warm: Vec<_> = (0..workers)
+                .map(|_| {
+                    let sidecar = sidecar.clone();
+                    std::thread::spawn(move || {
+                        let _ = sidecar.call("ping", serde_json::json!({}));
+                    })
+                })
+                .collect();
+            for h in warm {
+                h.join().expect("warmup must not panic");
+            }
+            assert_eq!(
+                sidecar.lock_pool().live,
+                workers,
+                "every worker should be spawned and idle before timing"
+            );
+
+            let started = std::time::Instant::now();
+            let handles: Vec<_> = files
+                .iter()
+                .map(|path| {
+                    let path = path.clone();
+                    let sidecar = sidecar.clone();
+                    std::thread::spawn(move || {
+                        // Any real op that does actual work; `convert` is the one
+                        // the pipeline spends its time in.
+                        let _ = sidecar.call(
+                            "convert",
+                            serde_json::json!({
+                                "path": path.to_string_lossy(),
+                                "head_pages": 10,
+                                "tail_pages": 3,
+                            }),
+                        );
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("no conversion thread may panic");
+            }
+            started.elapsed()
+        };
+
+        let one = run(1);
+        let many = run(4);
+        let speedup = one.as_secs_f64() / many.as_secs_f64();
+        eprintln!(
+            "\n=== {} documents | 1 worker: {:.1}s | 4 workers: {:.1}s | speedup {:.2}x ===\n",
+            files.len(),
+            one.as_secs_f64(),
+            many.as_secs_f64(),
+            speedup
+        );
+        assert!(
+            many < one,
+            "four workers must beat one: {:.1}s vs {:.1}s",
+            many.as_secs_f64(),
+            one.as_secs_f64()
+        );
+    }
+
+    /// A panic while holding a worker must not cost the pool a slot. `call` can
+    /// leave by several paths and RAII is what makes all of them safe.
+    #[test]
+    fn a_panicking_caller_returns_its_worker() {
+        let sidecar = pool(2);
+        let sidecar2 = sidecar.clone();
+        let panicked = std::thread::spawn(move || {
+            let _held = sidecar2.checkout().expect("reserved a slot");
+            panic!("caller explodes mid-round-trip");
+        })
+        .join();
+        assert!(panicked.is_err(), "the thread was supposed to panic");
+
+        // Poison recovered, slot returned, pool still fully usable.
+        let a = sidecar
+            .checkout()
+            .expect("pool survives a panicking caller");
+        let b = sidecar.checkout().expect("both slots still available");
+        assert_eq!(sidecar.lock_pool().live, 2);
+        drop((a, b));
+    }
 }
 
 #[cfg(test)]

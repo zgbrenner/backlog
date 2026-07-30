@@ -141,7 +141,7 @@ pub fn build_evidence(
     ettin_enabled: bool,
     token_budget: usize,
 ) -> anyhow::Result<FilterOutcome> {
-    let h = harvest::harvest(markdown);
+    let mut h = harvest::harvest(markdown);
 
     // 5b: language gate on a head sample.
     let lang_sample: String = markdown.chars().take(1500).collect();
@@ -182,6 +182,41 @@ pub fn build_evidence(
     } else {
         Vec::new()
     };
+
+    // Fold every date the model is about to be *shown* back into the harvest.
+    //
+    // `harvest::harvest` only scans the first 6000 and last 2500 characters, but
+    // the two lanes above reach past that window: salience draws sentences from
+    // the whole markdown, and Ettin reads the first 8000 characters. So a date
+    // could appear in the bundle while `harvest.dates` had no record of it —
+    // and `checker.rs` treats `harvest.dates` as the ledger of what the document
+    // demonstrably contains. That mismatch is load-bearing now that an empty
+    // harvest is what licenses the file-mtime fallback: without this, a document
+    // whose only date sits at character 7000 would look dateless to the checker,
+    // and a correct, evidenced answer would be discarded in favour of the file's
+    // modified time.
+    //
+    // Merging on `iso` matches how `harvest` already folds tail dates into head
+    // dates, so a date found twice stays one entry.
+    for text in salient.iter() {
+        for found in harvest::extract_dates(text) {
+            if !h.dates.iter().any(|e| e.iso == found.iso) {
+                h.dates.push(found);
+            }
+        }
+    }
+    for span in ettin_spans.iter() {
+        if let Some(iso) = span.iso.as_deref() {
+            if !h.dates.iter().any(|e| e.iso == iso) {
+                h.dates.push(harvest::FoundDate {
+                    iso: iso.to_string(),
+                    raw: span.text.clone(),
+                    offset: 0,
+                    ambiguous: false,
+                });
+            }
+        }
+    }
 
     // ---- assemble, budget-bounded (chars/4 ~ tokens) ----------------------
     let bundle = assemble_bundle(

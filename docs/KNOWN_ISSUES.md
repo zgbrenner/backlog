@@ -16,7 +16,7 @@ Release-blocking gates that are simply *work to do on a Windows machine* live in
 
 ## Open
 
-### 0. The undated-document fallback depends on the model volunteering "none"
+### 0. ~~The undated-document fallback depends on the model volunteering "none"~~ — fixed in 0.4.1
 `README.md`'s behavior guarantees say "**Undated documents fall back to the file
 modified date** with `date_source: metadata` and a `DATE_FROM_FILE_MTIME` note".
 That is implemented and tested — but the trigger is narrower than the sentence
@@ -42,13 +42,37 @@ The refusal is not wrong — the checker is doing its job, and quarantine plus a
 which reads as a property of undated documents when it is really a property of
 models that decline to guess.
 
-**Fix:** either make the fallback deterministic — when the evidence harvest
-found no dates anywhere and the model's proposal fails `DateNotInEvidence`,
-prefer the mtime over a rejection — or reword the guarantee to say it depends on
-the model returning `none`. The first is a change to the trust core and wants
-its own test pass over a real corpus; the second is honest today. Deliberately
-not fixed in 0.4.0 rather than changing `checker.rs` on the strength of a
-14-document sample.
+**Fixed in 0.4.1**, by the first of those two routes. `check_with` now converts
+a would-be `DateNotInEvidence` into the mtime fallback when the document itself
+carried no date — `harvest.dates` empty, which after `filter.rs` folds the
+salience and Ettin lanes into it covers every date the model was shown. It is
+placed *after* the per-date evidence check, not before: an earlier version
+gated ahead of the tripwire and discarded dates that metadata genuinely
+supported, which five existing tests caught.
+
+The condition deliberately does **not** also require `file_metadata_dates` to be
+empty. That sounds safer and is a no-op — `pipeline.rs` always extends that list
+with the file's own mtime and ctime, so it is never empty for a real file, and
+gating on it left the fallback as unreachable as before (measured: 6 of 18
+undated documents named, and those six only because the model happened to guess
+the mtime). It is circular besides: a filesystem timestamp cannot be the
+evidence that forbids falling back to the filesystem timestamp.
+
+The central promise is intact. This path does not ship the model's date — it
+discards it and substitutes one with real provenance, recording both
+`DATE_FROM_FILE_MTIME` and `DATE_PROPOSAL_DISCARDED:<what the model said>`, so
+the two meanings of `date_source: "metadata"` stay distinguishable in the index
+and model fabrication stays measurable. Where the document does contain dates, a
+mismatched proposal is still a hard rejection
+(`checker::tests::rejects_hallucinated_date`, unchanged and passing).
+
+**One refinement left undone.** When the harvest is empty but the document's
+*embedded* properties carry a real date (a PDF `CreationDate`), that date would
+be a better answer than the file's mtime. `checker.rs` cannot currently tell an
+embedded document date from a filesystem timestamp, because `pipeline.rs` merges
+both into one list before handing it over. Splitting them is a signature change
+across ~15 call sites for a case that is already honestly labelled, so it is
+recorded here rather than rushed.
 
 ### 1. The shipped sidecars are not built by anything reproducible
 `src-tauri/binaries/` is gitignored and empty on a fresh clone. A release

@@ -97,11 +97,38 @@ affects the value written on a fresh install.
 
 ## Throughput
 
-The naming lane is not the bottleneck. **`Sidecar` serializes every conversion
-through a single `convertd` process** — `call()` holds one mutex for the whole
-request/response round trip — so document conversion is one-at-a-time no matter
-what `convert_workers` says. Raising `convert_workers` buys queue depth, not
-parallelism.
+`Sidecar` runs a pool of `convert_workers` convertd processes, so that many
+documents convert at once. Until 0.4.1 it held a single process behind one mutex
+for the whole request/response round trip, and `convert_workers` bought queue
+depth rather than parallelism.
+
+Measured on this corpus, warm pool, conversion stage only
+(`convert_throughput_scales_with_workers`):
+
+| Workers | 13 documents |
+|---|---|
+| 1 | 3.2 s |
+| 4 | 2.4 s (1.33x) |
+
+1.33x rather than 4x because these fixtures are small text-layer PDFs where the
+per-request JSON round trip, not the conversion, dominates. The gain grows with
+per-document work — a scanned page running three escalating RapidOCR passes is
+seconds of CPU, and that is what parallelises.
+
+**Warm the pool before timing anything.** convertd is a PyInstaller one-file
+build, so a worker's first request pays for unpacking to `%TEMP%` and starting a
+Python interpreter. Timing that measures N cold starts against one and concludes
+pooling is *slower* — the first version of the benchmark above reported 0.75x for
+exactly that reason. A real backfill holds one pool across the whole run, so
+startup is paid once.
+
+**On this workload the naming lane, not conversion, sets the wall clock.** With
+`slm_parallel: 1` on an 8 GB machine, converted documents queue behind a single
+naming slot, so pooling conversion alone leaves the end-to-end time roughly
+unchanged — a 12-file batch measured 34.3 s/file before the pool and 40.25 s/file
+after it with four workers, the difference being CPU the extra workers took from
+llama-server. Conversion parallelism pays off when `slm_parallel` can also rise,
+which is a function of RAM.
 
 Measured, `slm_parallel: 1`, `convert_workers: 1`, mixed synthetic tax corpus of
 2–12 page PDFs and DOCX:
@@ -151,6 +178,18 @@ documents of that run:
 | date only on page 3+ | 4 | 2 | 0 | 2 |
 | ambiguous date only | 1 | 1 | 0 | 0 |
 | **no date anywhere** | **3** | **0** | 0 | **3** |
+
+That undated row is what 0.4.1 fixes; see `docs/KNOWN_ISSUES.md` item 0. Those
+documents now take the mtime fallback and carry `DATE_FROM_FILE_MTIME` plus
+`DATE_PROPOSAL_DISCARDED:<what the model proposed>`. The remaining failures on
+undated fixtures are subject and description rejections, not date ones — a
+separate naming-quality limit of a 0.6B/1.7B model on sparse "draft working
+notes" pages, not a rule that cannot be reached.
+
+Run-to-run variance is worth knowing before reading too much into any single
+number here: the same 12 documents have produced 2, 4 and 7 successes across
+runs. llama.cpp's slot assignment and batching shift the numerics even at
+`temperature: 0`. Compare configurations on tens of documents, not twelve.
 
 That run was stopped at 14 of 40 on purpose: a failing document costs three
 naming attempts instead of one, so a failure-weighted sample runs several times

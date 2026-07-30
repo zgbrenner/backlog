@@ -854,7 +854,12 @@ async fn start_pipeline(
             binary(&app, "convertd")?,
             Duration::from_secs(cfg.sidecar_timeout_secs),
         )
-        .with_models_dir(model_download::resolve_models_dir(&app)),
+        .with_models_dir(model_download::resolve_models_dir(&app))
+        // Matches `convert_slots` below, so the semaphore that admits documents
+        // to the convert stage and the number of processes that can serve them
+        // are the same number. They were not before: one process served every
+        // document while the semaphore cheerfully admitted six.
+        .with_workers(cfg.convert_workers),
     );
     let slm = Arc::new(SlmLane::new(
         binary(&app, "llama-server")?,
