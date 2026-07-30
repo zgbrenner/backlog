@@ -291,6 +291,7 @@ jobs:
             --title "BackLog v0.5.0" `
             --notes-file "$env:RUNNER_TEMP\release-notes.md"
           if ($LASTEXITCODE -ne 0) { throw "Stable release publication failed" }
+          ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
 
       - name: Publish unsigned prerelease
         if: steps.release-mode.outputs.signed == 'false'
@@ -341,3 +342,4 @@ jobs:
             --title "BackLog v0.5.0 (unsigned prerelease)" `
             --notes-file "$env:RUNNER_TEMP\release-notes.md"
           if ($LASTEXITCODE -ne 0) { throw "Prerelease publication failed" }
+          ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
