@@ -258,6 +258,10 @@ jobs:
             if ($release.name -ne "BackLog v0.5.0") {
               throw "Existing draft was created in a different release mode; refusing to modify it"
             }
+            ./scripts/retarget-release-draft.ps1 `
+              -Tag $env:TAG `
+              -ExpectedSha $env:RELEASE_SHA `
+              -ExpectedName "BackLog v0.5.0"
             ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
             $existingAssets = @(gh release view $env:TAG --json assets --jq ".assets[].name")
             if ($LASTEXITCODE -ne 0) { throw "Could not inspect the existing signed draft" }
@@ -309,6 +313,10 @@ jobs:
             if ($release.name -ne "BackLog v0.5.0 (unsigned prerelease)") {
               throw "Existing draft was created in a different release mode; refusing to modify it"
             }
+            ./scripts/retarget-release-draft.ps1 `
+              -Tag $env:TAG `
+              -ExpectedSha $env:RELEASE_SHA `
+              -ExpectedName "BackLog v0.5.0 (unsigned prerelease)"
             ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
             $existingAssets = @(gh release view $env:TAG --json assets --jq ".assets[].name")
             if ($LASTEXITCODE -ne 0) { throw "Could not inspect the existing unsigned draft" }

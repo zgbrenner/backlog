@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   validateBuildDependencyLock,
+  validateReleaseDraftRetarget,
   validateReleaseWorkflow,
   validateReleaseTargetGuard,
   validateRustToolchain,
@@ -102,6 +103,7 @@ jobs:
         run: |
           $release = gh release view "$tag" --json isDraft,name | ConvertFrom-Json
           if ($release.name -ne "BackLog v0.5.0") { throw "different release mode" }
+          ./scripts/retarget-release-draft.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA" -ExpectedName "BackLog v0.5.0"
           ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
           gh release upload "$tag" "$installer"
           gh release create "$tag" "BackLog_0.5.0_x64-setup.exe" "BackLog_0.5.0_x64-setup.exe.sig" "latest.json" --target "$env:RELEASE_SHA" --draft
@@ -115,6 +117,7 @@ jobs:
         run: |
           $release = gh release view "$tag" --json isDraft,name | ConvertFrom-Json
           if ($release.name -ne "BackLog v0.5.0 (unsigned prerelease)") { throw "different release mode" }
+          ./scripts/retarget-release-draft.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA" -ExpectedName "BackLog v0.5.0 (unsigned prerelease)"
           ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
           gh release upload "$tag" "$installer"
           gh release create "$tag" "$installer" --target "$env:RELEASE_SHA" --draft --notes "Unsigned installer; v0.4.4 remains the stable updater"
@@ -236,6 +239,17 @@ test("an interrupted draft must retain its original signed or unsigned mode", ()
     .replace('          if ($release.name -ne "BackLog v0.5.0 (unsigned prerelease)") { throw "different release mode" }\n', "");
   assert.match(
     validateReleaseWorkflow(modeBlind, validStageScript).join("\n"),
+    /durable signed or unsigned mode/,
+  );
+});
+
+test("an interrupted draft must be ancestry-checked before its asset is replaced", () => {
+  const unsafeRetry = validWorkflow.replaceAll(
+    /^          \.\/scripts\/retarget-release-draft\.ps1.*\n/gm,
+    "",
+  );
+  assert.match(
+    validateReleaseWorkflow(unsafeRetry, validStageScript).join("\n"),
     /durable signed or unsigned mode/,
   );
 });
@@ -423,5 +437,31 @@ test("a draft target that is not compared with the tested SHA is rejected", () =
   assert.match(
     validateReleaseTargetGuard(driftingDraft).join("\n"),
     /real tag or an exact-SHA GitHub draft/,
+  );
+});
+
+const validDraftRetarget = `
+gh release view $Tag --json databaseId,isDraft,name,tagName,targetCommitish
+if ($release.targetCommitish -notmatch '^[0-9a-fA-F]{40}$') { throw "not immutable" }
+git ls-remote --exit-code --tags origin "refs/tags/$Tag"
+if ($tagExit -ne 2) { throw "tag exists or lookup failed" }
+gh api "repos/$env:GITHUB_REPOSITORY/compare/$oldSha...$newSha"
+if ($comparison.status -ne "ahead") { throw "not a descendant" }
+gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/releases/$id" -f "target_commitish=$ExpectedSha"
+./scripts/assert-release-tag.ps1
+`;
+
+test("an untagged draft may advance only to a tested descendant", () => {
+  assert.deepEqual(validateReleaseDraftRetarget(validDraftRetarget), []);
+});
+
+test("draft retargeting without a remote ancestry check is rejected", () => {
+  const unchecked = validDraftRetarget.replace(
+    'if ($comparison.status -ne "ahead") { throw "not a descendant" }\n',
+    "",
+  );
+  assert.match(
+    validateReleaseDraftRetarget(unchecked).join("\n"),
+    /only an untagged draft to advance to a tested descendant/,
   );
 });
