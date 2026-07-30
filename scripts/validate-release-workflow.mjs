@@ -416,6 +416,8 @@ export function validateReleaseTargetGuard(guardSource) {
     "$tagExit -eq 0",
     "$tagExit -ne 2",
     "--json isDraft,tagName,targetCommitish",
+    "for ($attempt = 1; $attempt -le 8; $attempt++)",
+    "Start-Sleep -Seconds 3",
     "$draft.isDraft",
     "$draft.tagName -ne $Tag",
     "$draft.targetCommitish.ToLowerInvariant()",
