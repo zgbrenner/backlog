@@ -94,7 +94,10 @@ a commit or a push except the hooks on your own machine.
   gets bypassed with `--no-verify` and then guards nothing.
 - **pre-push** — the whole of `./scripts/ci-local.sh`, all five jobs, about three
   minutes. This is the replacement for Actions, and the last point at which a
-  broken commit is still cheap.
+  broken commit is still cheap. It skips when every ref you are pushing is a
+  commit `origin` already has — `git push origin v1.2.3` straight after pushing
+  the branch is the same tree the gates just passed, and running them twice both
+  wastes three minutes and lets two cargo builds fight over `target/`.
 
 Both are skippable when you mean it — `BACKLOG_SKIP_HOOKS=1 git push`, or
 `git push --no-verify` — and each prints how when it fails. `.githooks/` is

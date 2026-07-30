@@ -27,9 +27,37 @@ fi
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
-echo "pre-push: running every gate (scripts/ci-local.sh, ~3 min). BACKLOG_SKIP_HOOKS=1 skips."
+# git feeds this hook one line per ref: <local ref> <local oid> <remote ref> <remote oid>.
+# Read it once into a variable rather than consuming the pipe, because the global-hook
+# handoff at the bottom has to replay it — a hook that drains stdin and then execs
+# another one hands that one an empty pipe and it silently checks nothing.
+pushed_refs="$(cat)"
 
-if ! bash scripts/ci-local.sh; then
+# Nothing to validate if every ref being pushed is a commit origin already has. That is
+# the ordinary `git push origin <tag>` right after pushing the branch: same commit, same
+# tree, gates already run. Re-running three minutes of cargo there teaches people to
+# reach for --no-verify, and back-to-back runs collide over target/ file locks besides.
+needs_gates=0
+while read -r _local_ref local_oid _remote_ref _remote_oid; do
+  [ -n "${local_oid:-}" ] || continue
+  case "$local_oid" in
+    *[!0]*) ;;      # a real object
+    *) continue ;;  # all-zero oid: a deletion, nothing to check
+  esac
+  # Empty means no remote-tracking ref reaches it, so it has never been validated here.
+  # Stale tracking refs make this err toward running the gates, which is the safe side.
+  if [ -z "$(git branch -r --contains "$local_oid" 2>/dev/null)" ]; then
+    needs_gates=1
+  fi
+done <<EOF
+$pushed_refs
+EOF
+
+if [ "$needs_gates" = "0" ] && [ -n "$pushed_refs" ]; then
+  echo "pre-push: nothing new to validate — every ref here is a deletion, or a commit origin already has and the gates ran on it then. Skipping."
+else
+  echo "pre-push: running every gate (scripts/ci-local.sh, ~3 min). BACKLOG_SKIP_HOOKS=1 skips."
+  if ! bash scripts/ci-local.sh; then
   cat <<'EOF' >&2
 
 pre-push: the gates above are what CI would have caught, if CI ran for this
@@ -43,7 +71,8 @@ Push anyway, on purpose:
   BACKLOG_SKIP_HOOKS=1 git push ...
   git push --no-verify
 EOF
-  exit 1
+    exit 1
+  fi
 fi
 
 # A repo-local core.hooksPath supersedes a global one, so any machine-wide hook
@@ -54,6 +83,8 @@ global_hooks="$(git config --global --get core.hooksPath || true)"
 if [ -n "$global_hooks" ]; then
   global_hook="$global_hooks/$(basename "$0")"
   if [ -x "$global_hook" ] && ! [ "$global_hook" -ef "$0" ]; then
-    exec "$global_hook" "$@"
+    exec "$global_hook" "$@" <<EOF
+$pushed_refs
+EOF
   fi
 fi
