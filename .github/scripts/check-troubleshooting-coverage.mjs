@@ -59,6 +59,8 @@ const NOT_CODES = new Set([
   "install_dir",
   "llama_port",
   "llama_server",
+  "slm_primary_gguf",
+  "slm_escalation_gguf",
   "CARGO_PKG_VERSION", // env!() lookup in get_diagnostics, not a code
 ]);
 

@@ -39,7 +39,8 @@ Intake (SharePoint) --Flow 1--> Processing folder (OneDrive-synced)
       convertd sidecar (Python, slim/torch-free): MarkItDown, pdfium,
                 RapidOCR, Lingua (GLiClass/granite/Ettin naming enhancements
                 degrade to deterministic fallbacks; not shipped by default)
-      llama-server sidecar: Qwen3-0.6B primary, 1.7B escalation,
+      llama-server sidecar: bundled Qwen3-0.6B primary,
+                optional Qwen3-1.7B escalation,
                 JSON-schema-constrained chat completions
                                       |
                        deterministic checker (Rust)
@@ -83,21 +84,17 @@ pwsh scripts/install-hooks.ps1        # or: bash scripts/install-hooks.sh
 ```
 
 Points this clone's `core.hooksPath` at the tracked `.githooks/` directory. It
-is one command, it is idempotent, and it is the only quality gate this
-repository has. `.github/workflows/ci.yml` does run — the repository is public,
-so Actions is unmetered and costs nothing — but it cannot be the authority:
-`Workspace (app crate)` fails on every runner because `tauri-build` resolves
-`bundle.resources` and `resources/models/*.gguf` matches nothing without the
-2.4 GB of weights, which are correctly not committed. A red X on that job is the
-expected state, not a broken build (`docs/KNOWN_ISSUES.md` item 11) — so nothing
-checks a commit or a push except the hooks on your own machine.
+is one command and is idempotent. GitHub Actions also runs the same gates on
+this public repository at no billable-minute cost. Its workspace job uses the
+marker fixture from `scripts/dev-stubs.sh`, so Tauri's model-resource glob is
+satisfied without putting a large model in source control.
 
 - **pre-commit** — `cargo fmt --check` plus the five gates that only read files
   (versions agree, troubleshooting coverage, button labels, CI parity, dev-stub
   marker). About two seconds, deliberately: a pre-commit hook that takes minutes
   gets bypassed with `--no-verify` and then guards nothing.
 - **pre-push** — the whole of `./scripts/ci-local.sh`, all five jobs, about three
-  minutes. This is the replacement for Actions, and the last point at which a
+  minutes. This predicts hosted CI and is the last point at which a
   broken commit is still cheap. It skips when every ref you are pushing is a
   commit `origin` already has — `git push origin v1.2.3` straight after pushing
   the branch is the same tree the gates just passed, and running them twice both
@@ -124,30 +121,33 @@ bash scripts/dev-stubs.sh        # or: pwsh scripts/dev-stubs.ps1
 ```
 
 These are marked `BACKLOG-DEV-STUB-DO-NOT-SHIP` and
-`scripts/verify-binaries.ps1` refuses to package them, so they cannot reach a
-release by accident. The deterministic trust core needs none of this:
+the guarded GitHub release workflow runs `scripts/verify-binaries.ps1`, which
+refuses to package them. A direct local `npm run tauri build` does not run that
+release gate, so use it only for development unless you have staged and
+verified the real release inputs described in `RELEASING.md`. The deterministic
+trust core needs none of this:
 `cargo test -p backlog-core` works on a bare checkout.
 
 ```
 npm run tauri dev      # development
-npm run tauri build    # production installer (Windows)
+npm run tauri build    # local Windows package; not authorized for publication
 ```
 
 ### 2. Models
 
-**Normally there is nothing to do here.** The app downloads the two Qwen3 GGUFs
-itself: Settings → Readiness → **Download models (~2.4 GB)**. The download is
-resumable, cancellable, and SHA-256-verified against `models.lock.json`. That
-button exists so the person running this never opens a terminal.
+The Windows installer already contains the verified Qwen3 0.6B primary model.
+On first launch BackLog moves it into the per-user app-data model directory, so
+the first document can be processed offline without a second download.
 
-The files land in `%APPDATA%\ai.sonomos.backlog\models`, which is also where
-the app rehomes the default model paths at startup — they are **not** in the
-installer (`tauri.conf.json`'s `bundle.resources` maps only `resources/*` and
-`binaries/*.dll`). A path you set yourself through Settings → Browse is honored
-untouched.
+The Qwen3 1.7B escalation model is optional. It can improve difficult
+documents, but costs about 1.8 GB of disk space and additional memory while
+running. Install it from Settings with **Download models**. The transfer can be
+cancelled and resumed, and BackLog SHA-256-verifies it before use. If it is
+absent, readiness stays honest and the primary model safely handles escalation
+attempts.
 
-To stage them from a connected machine instead (air-gapped deployment, or
-producing the lockfile for a release):
+Release maintainers can reproduce or audit the model lock from a connected
+staging machine:
 
 ```
 cd models
@@ -157,9 +157,8 @@ python download_models.py --verify-only  # re-verify, no network, no Hub client
 ```
 
 Those two are the only flags. Commit `models.lock.json`; the weights stay
-untracked. Copy the two `.gguf` files into
-`%APPDATA%\ai.sonomos.backlog\models` on the deployment machine, or point
-Settings at wherever you put them.
+untracked. This is a release-maintenance path, not an installation step for the
+person using BackLog.
 
 ### 3. Sidecar binary
 
@@ -173,7 +172,8 @@ same way — `RELEASING.md` Build steps 1-2.
 - Processing folder: the OneDrive-synced folder Flow 1 fills
 - Outbox folder: OneDrive-synced; manifests land in `<outbox>/_manifests`
 - Quarantine folder: local, not synced
-- GGUF paths for the two SLM tiers (default to the app-data models dir)
+- GGUF paths for the bundled primary and optional escalation tier (advanced;
+  the defaults are set by the installer)
 - Ettin model dir: leave blank — the shipped sidecar ignores it. See
   `training/README.md`.
 
@@ -192,7 +192,8 @@ on disk. Flagged files keep their cache until you resolve them. To retain the
 corpus for Ettin training, set `"retain_cache": true` in `backlog.config.json`;
 `cache_ttl_days` (default 7) sweeps orphaned entries on startup.
 
-Hit Start. The watcher sweeps existing files, then processes on arrival.
+Hit Start. **Processing** is the watched intake folder: the watcher sweeps
+existing files, then processes new arrivals.
 BackLog runs as a system-tray appliance: closing the window hides it and the
 pipeline keeps running in the background — quit from the tray menu.
 
@@ -219,6 +220,12 @@ you can point at, and by a test.
   on another volume) with a machine-readable reason and a `NeedsReview` row. If
   the move itself fails, that is surfaced as `QUARANTINE_FAILED` and the source
   is left where it is rather than orphaned.
+- **Needs Review means a person must decide.** BackLog does not silently file a
+  document without a trustworthy date; it keeps the document visible for
+  review.
+- **Done is a handoff, not a SharePoint receipt.** It means BackLog wrote the
+  manifest for Power Automate. The downstream flow owns the later SharePoint
+  copy, rename, and index completion.
 - **No model-proposed date ships unless it appears verbatim in the document
   text or in the document's own embedded metadata.** This is `checker.rs`'s
   `DateNotInEvidence` rule and it is the product's central promise. A human
@@ -276,20 +283,19 @@ models/                 download script, lockfile, GBNF grammar copy
 training/               Ettin silver labeling + fine-tune (not shipped)
 power-automate/         Flow 1 and Flow 2 build sheets + manifest schemas
 scripts/                sidecar build, dev stubs, release binary verification,
-                        ci-local.sh (the five gates, and what actually runs them),
+                        ci-local.sh (local mirror of the five hosted gates),
                         install-hooks (points core.hooksPath at .githooks/)
 .githooks/              tracked git hooks: pre-commit (fast subset, ~2s) and
-                        pre-push (all five gates) — the only enforcement there is
-.github/                the same five jobs as a workflow, for the day Actions works
+                        pre-push (all five gates)
+.github/                authoritative hosted CI and guarded release workflows
 ```
 
 ## Tests
 
 `./scripts/ci-local.sh` runs everything below in one pass, on Linux, with no
-Windows, no sidecar binaries and no model weights. `.githooks/pre-push` runs it
-for you on every push once you have done Setup step 0;
-`.github/workflows/ci.yml` describes the same five jobs but has never been
-assigned a runner, so nothing else runs them (`docs/KNOWN_ISSUES.md` item 11).
+Windows, real sidecars, or model weights. `.githooks/pre-push` runs it for you
+on every push once you have done Setup step 0; the public GitHub workflow runs
+the same gates with deterministic marker resources.
 
 ```
 cd src-tauri
@@ -304,9 +310,11 @@ npm run check           # tsc --noEmit + vite build
 npm run harness:shots   # renders the real UI in headless Chromium against a
                         # mock Tauri IPC; exits non-zero on any console error,
                         # so it is a smoke test, not just a screenshotter
-python -m pytest sidecar/tests models/tests
+python -m unittest discover -s sidecar/tests -t sidecar/tests
+python -m unittest discover -s models/tests -t models/tests
 pip install -r power-automate/requirements-dev.txt
 python power-automate/validate_examples.py
+node --test scripts/release-contract.test.mjs scripts/validate-release-workflow.test.mjs
 ```
 
 The trust core is separated out precisely so it needs none of the above: no

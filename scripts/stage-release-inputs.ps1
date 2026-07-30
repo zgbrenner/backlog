@@ -1,0 +1,140 @@
+<#
+.SYNOPSIS
+  Download and stage the hash-pinned model and llama.cpp runtime for a Windows
+  release build.
+
+.DESCRIPTION
+  This script is intentionally release-only. It downloads the exact primary
+  model and llama.cpp archive, verifies both before copying anything into the
+  Tauri bundle, rejects the development marker, and stages the Visual C++
+  runtime files imported by llama.cpp. It never downloads the optional 1.7B
+  escalation model.
+#>
+[CmdletBinding()]
+param(
+    [string] $DownloadDir = "",
+    [switch] $Clean
+)
+
+$ErrorActionPreference = "Stop"
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$BinDir = Join-Path $RepoRoot "src-tauri\binaries"
+$ModelDir = Join-Path $RepoRoot "src-tauri\resources\models"
+$Model = Join-Path $ModelDir "Qwen3-0.6B-Q8_0.gguf"
+
+$StubMarker = "BACKLOG-DEV-STUB-DO-NOT-SHIP"
+$PrimaryModelUrl = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf?download=true"
+$PrimaryModelSha256 = "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031"
+$LlamaArchiveUrl = "https://github.com/ggml-org/llama.cpp/releases/download/b10091/llama-b10091-bin-win-cpu-x64.zip"
+$LlamaArchiveSha256 = "b2d991bdd37258bb51309f50e9fb7a52a16fe662ba71b2cbbbbb9303b47b5dee"
+$LlamaServerSha256 = "78af9cfb34f346b0de1e4f9c1577061cb3d55e8be55c8d540fde878e56bd0fe2"
+
+if (-not $DownloadDir) {
+    $tempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+    $DownloadDir = Join-Path $tempRoot "backlog-release-inputs"
+}
+
+if ($Clean) {
+    if (Test-Path $BinDir) { Remove-Item -Recurse -Force $BinDir }
+    if (Test-Path $DownloadDir) { Remove-Item -Recurse -Force $DownloadDir }
+}
+New-Item -ItemType Directory -Force $BinDir, $ModelDir, $DownloadDir | Out-Null
+
+function Test-CarriesStubMarker {
+    param([Parameter(Mandatory)][string] $Path)
+    $markerBytes = [Text.Encoding]::ASCII.GetBytes($StubMarker)
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        if ($stream.Length -lt $markerBytes.Length) { return $false }
+        $head = [byte[]]::new($markerBytes.Length)
+        $read = $stream.Read($head, 0, $head.Length)
+        if ($read -ne $head.Length) { return $false }
+        return [Text.Encoding]::ASCII.GetString($head) -eq $StubMarker
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Assert-Hash {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Expected,
+        [Parameter(Mandatory)][string] $Label
+    )
+    $actual = (Get-FileHash $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $Expected) {
+        throw "$Label hash mismatch: expected $Expected, computed $actual"
+    }
+}
+
+# Download to a temporary path and verify before replacing the bundle resource.
+$modelDownload = Join-Path $DownloadDir "Qwen3-0.6B-Q8_0.gguf.download"
+Invoke-WebRequest -Uri $PrimaryModelUrl -OutFile $modelDownload -UseBasicParsing
+$expected = "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031"
+if ((Get-FileHash $modelDownload -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+    throw "Primary model hash mismatch"
+}
+if (Test-CarriesStubMarker $modelDownload) {
+    throw "Primary model contains $StubMarker"
+}
+Move-Item -Force $modelDownload $Model
+
+$llamaArchive = Join-Path $DownloadDir "llama-b10091-bin-win-cpu-x64.zip"
+Invoke-WebRequest -Uri $LlamaArchiveUrl -OutFile $llamaArchive -UseBasicParsing
+Assert-Hash $llamaArchive $LlamaArchiveSha256 "llama.cpp archive"
+
+$llamaDir = Join-Path $DownloadDir "llama-cpu"
+if (Test-Path $llamaDir) { Remove-Item -Recurse -Force $llamaDir }
+Expand-Archive $llamaArchive -DestinationPath $llamaDir
+
+$servers = @(Get-ChildItem $llamaDir -Recurse -File -Filter "llama-server.exe")
+if ($servers.Count -ne 1) {
+    throw "Expected exactly one llama-server.exe in the pinned archive; found $($servers.Count)"
+}
+$server = $servers[0]
+Assert-Hash $server.FullName $LlamaServerSha256 "llama-server.exe"
+if (Test-CarriesStubMarker $server.FullName) {
+    throw "llama-server.exe contains $StubMarker"
+}
+Copy-Item $server.FullName (Join-Path $BinDir "llama-server-x86_64-pc-windows-msvc.exe")
+
+$runtimeDlls = @(Get-ChildItem $server.Directory.FullName -File -Filter "*.dll")
+if ($runtimeDlls.Count -eq 0) {
+    throw "Pinned llama.cpp archive contains no runtime DLLs beside llama-server.exe"
+}
+Copy-Item $runtimeDlls.FullName $BinDir
+
+# The pinned llama runtime imports the VC143 CRT. Locate the exact redist that
+# ships with the runner's installed MSVC toolchain and stage its three required
+# files app-locally; verify-binaries.ps1 then reads every import table and fails
+# if any non-Windows DLL is still unresolved.
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) { throw "vswhere.exe is missing from the Windows runner" }
+$vsInstall = (& $vswhere -latest -products * `
+    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+    -property installationPath).Trim()
+if (-not $vsInstall) { throw "Visual Studio C++ build tools are not installed" }
+$redistRoot = Join-Path $vsInstall "VC\Redist\MSVC"
+$crtFiles = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
+$crtDir = Get-ChildItem $redistRoot -Directory |
+    Sort-Object Name -Descending |
+    ForEach-Object { Join-Path $_.FullName "x64\Microsoft.VC143.CRT" } |
+    Where-Object {
+        $candidate = $_
+        ($crtFiles | Where-Object { -not (Test-Path (Join-Path $candidate $_)) }).Count -eq 0
+    } |
+    Select-Object -First 1
+if (-not $crtDir) {
+    throw "No installed VC143 redist contains all required CRT files"
+}
+foreach ($name in $crtFiles) {
+    Copy-Item (Join-Path $crtDir $name) $BinDir
+}
+
+Assert-Hash $Model $PrimaryModelSha256 "staged primary model"
+Write-Host "Staged hash-verified release inputs:" -ForegroundColor Green
+Write-Host "  primary model  $PrimaryModelSha256"
+Write-Host "  llama archive  $LlamaArchiveSha256"
+Write-Host "  llama server   $LlamaServerSha256"
+Write-Host "  runtime DLLs   $($runtimeDlls.Count + $crtFiles.Count)"

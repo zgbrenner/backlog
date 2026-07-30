@@ -4,23 +4,21 @@ name: CI
 # so runs come from the unmetered pool and the timing API reports billable_ms: 0.
 # An earlier version of this comment said it had never run at all, which was true
 # while the repo was private and its allowance was spent, and stayed here long
-# after it stopped being true. Do not write durable claims about live
-# infrastructure into a source comment; see docs/KNOWN_ISSUES.md item 11.
+# after it stopped being true.
 #
-# Four of the five jobs pass. `Workspace (app crate)` cannot: tauri-build resolves
-# bundle.resources and the resources/models/*.gguf glob matches nothing on a
-# runner, so the build script exits 1 before any test runs. The weights are 2.4 GB
-# and are correctly not committed. `scripts/ci-local.sh` runs the same five jobs on
-# a machine that has them, and is the copy that enforces anything today;
-# check-ci-parity.mjs keeps the two identical. Do not cite a green tick here as
-# evidence that a commit is good, or a red one as evidence that it is broken.
+# The workspace job stages marker-stamped resource fixtures before compiling.
+# This satisfies Tauri's compile-time bundle globs without downloading large
+# model weights; the Windows release workflow replaces them with hash-verified
+# release inputs and refuses the marker. `scripts/ci-local.sh` runs the same five
+# jobs, and check-ci-parity.mjs keeps the load-bearing commands aligned.
 #
 # Every job here is designed for a Linux runner with no Windows, no sidecar
 # binaries
 # and no GGUF weights, because that is the whole reason `backlog-core` was
 # extracted and the reason DPAPI is behind `cfg(windows)`. What CI cannot do is
-# build the NSIS installer or exercise the DPAPI key path — those stay manual
-# and are gated by docs/RELEASE_CHECKLIST.md.
+# build the NSIS installer or exercise the DPAPI key path. The guarded Windows
+# release workflow owns packaging, while deployment sign-off remains in
+# docs/RELEASE_CHECKLIST.md.
 
 on:
   push:
@@ -89,13 +87,11 @@ jobs:
         with:
           workspaces: src-tauri
           key: workspace
-      # tauri-build validates `externalBin` and the `bundle.resources` DLL glob
-      # at compile time, so without these placeholders the app crate does not
-      # reach a single test. They are marker-stamped and
-      # scripts/verify-binaries.ps1 refuses a marked file, so a stub can pass
-      # this job and still never pass a release. Runtime preflight does not
-      # refuse one yet — docs/KNOWN_ISSUES.md item 9.
-      - name: Stage dev stub sidecars
+      # tauri-build validates `externalBin` and every `bundle.resources` glob
+      # at compile time, so without these deterministic placeholders the app
+      # crate does not reach a single test. The release job stages the real,
+      # hash-verified inputs and fails closed on this marker.
+      - name: Stage dev resource stubs
         run: bash scripts/dev-stubs.sh
       # verify-binaries.ps1 cannot run on a Linux runner, so this checks the
       # one thing that can silently break it: the marker drifting apart across
@@ -203,10 +199,7 @@ jobs:
       # "Create this folder for me".
       - name: Check the docs name buttons as the app labels them
         run: node .github/scripts/check-button-labels.mjs
-      # scripts/ci-local.sh is the copy of these gates that actually runs today
-      # (no run of this workflow has ever been assigned a runner —
-      # docs/KNOWN_ISSUES.md item 11). Two definitions of "the gates" with only
-      # one of them ever executed is how a repo ends up green locally and red
-      # the day CI is switched on.
+      # Keep the contributor-facing local mirror aligned with the hosted
+      # workflow's load-bearing commands.
       - name: Check ci.yml and ci-local.sh agree
         run: node .github/scripts/check-ci-parity.mjs

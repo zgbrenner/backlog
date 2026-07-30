@@ -1,13 +1,10 @@
 #!/usr/bin/env node
 // Fail if .github/workflows/ci.yml and scripts/ci-local.sh have drifted apart.
 //
-// GitHub Actions does not run for this repository (every run fails in seconds
-// with no runner assigned — docs/KNOWN_ISSUES.md item 11), so ci-local.sh is
-// the copy that actually executes and ci.yml is the copy that will execute the
-// day that changes. Two
-// definitions of "the gates", only one of them ever run, is precisely how a
-// repo ends up with CI that passes locally and fails the moment it is switched
-// on. This makes the divergence a build failure instead of a surprise.
+// Hosted CI is authoritative for pull requests, while ci-local.sh lets
+// contributors run the same core gates before they push. Two definitions of
+// the gates can drift, so this makes divergence a build failure instead of a
+// surprise.
 //
 // It deliberately compares the two things that drift in practice — the set of
 // jobs, and the set of gate scripts each one invokes — rather than trying to
@@ -90,6 +87,7 @@ const ANCHORS = [
   ["cargo clippy", "-D warnings"],
   ["cargo fmt", "--check"],
   ["workspace tests", "--workspace"],
+  ["workspace resource staging", "bash scripts/dev-stubs.sh"],
   ["npm typecheck+build", "npm run check"],
   ["UI harness", "harness:shots"],
   ["python tests", "pytest"],
@@ -116,8 +114,7 @@ if (problems.length > 0) {
   console.error(`${WORKFLOW} and ${LOCAL} have drifted:\n`);
   for (const problem of problems) console.error(`  - ${problem}`);
   console.error(
-    "\nBoth must describe the same gates. Only the local one is ever run today, " +
-      "so a rule that exists in only one of them is a rule that does not exist.",
+    "\nBoth must describe the same gates so local checks predict hosted CI.",
   );
   process.exit(1);
 }

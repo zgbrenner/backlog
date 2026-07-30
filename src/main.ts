@@ -115,8 +115,19 @@ type ModelDownloadProgress = {
   overall_percent: number;
 };
 
-// Mirrors src-tauri/src/model_download.rs::DownloadDone.
-type ModelDownloadDone = { ok: boolean; error?: string | null };
+// Mirrors src-tauri/src/model_download.rs::DownloadDone. The frontend derives
+// its small display union instead of asking the backend to duplicate it.
+type ModelDownloadDone = {
+  ok: boolean;
+  cancelled: boolean;
+  error?: string | null;
+  finished_at: string;
+};
+type ModelDownloadTerminal = {
+  status: "completed" | "failed" | "cancelled";
+  ok: boolean;
+  error?: string | null;
+};
 
 // Mirrors src-tauri/src/lib.rs::Diagnostics (only the fields the UI shows).
 type Diagnostics = {
@@ -301,11 +312,11 @@ const SOFT_FLAG_COPY: Record<string, string> = {
 };
 
 /** The tuning defaults from src-tauri/src/config.rs::Config::default(), for
- *  "Reset to recommended". `convert_workers` is machine-dependent there
- *  (cores - 2, clamped 1..6); 4 is what a typical office laptop resolves to. */
+ *  "Reset to recommended". The 8 GB office-laptop preset leaves enough memory
+ *  for Windows, OneDrive and the document reader while a model is running. */
 const RECOMMENDED_TUNING: Record<string, number> = {
-  convert_workers: 4,
-  slm_parallel: 4,
+  convert_workers: 2,
+  slm_parallel: 1,
   evidence_token_budget: 1500,
   manifest_emit_per_min: 0,
   max_stage_attempts: 3,
@@ -321,6 +332,7 @@ const ESCALATION_GGUF_NAME = "Qwen3-1.7B-Q8_0.gguf";
 
 const QUEUE_PAGE = 200;
 const REVIEW_PAGE = 25;
+const REVIEW_FETCH_PAGE = 250;
 /** How long Approve waits before it writes the manifest Power Automate eats.
  *  Nothing downstream can un-file a document, so the only truthful undo is one
  *  that happens before the write. */
@@ -639,7 +651,9 @@ let queueState: string | null = null;
 let queuePage = 0;
 
 let modelsDownloading = false;
+let modelDownloadCancelling = false;
 let modelDownloadProgress: ModelDownloadProgress | null = null;
+let modelDownloadTerminal: ModelDownloadTerminal | null = null;
 let diagnostics: Diagnostics | null = null;
 let diagnosticsRequested = false;
 let diagnosticsError = false;
@@ -662,6 +676,14 @@ let updateError: string | null = null;
 let updateDownloadedBytes = 0;
 let updateTotalBytes = 0;
 
+function terminalDownloadStatus(done: ModelDownloadDone): ModelDownloadTerminal {
+  return {
+    status: done.ok ? "completed" : done.cancelled ? "cancelled" : "failed",
+    ok: done.ok,
+    error: done.error,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Backend wrappers
 // ---------------------------------------------------------------------------
@@ -677,11 +699,13 @@ let updateTotalBytes = 0;
  *
  *  `quiet` is for the polling caller: a status read that fails every five
  *  seconds must not turn into a toast every five seconds. */
-async function refreshRuntime(live: boolean, quiet = false): Promise<void> {
+async function refreshRuntime(live: boolean, quiet = false): Promise<boolean> {
   try {
     runtime = await invoke<RuntimeStatus>(live ? "run_preflight" : "get_runtime_status");
+    return true;
   } catch (e) {
     if (!quiet) showError(e);
+    return false;
   }
 }
 
@@ -742,6 +766,7 @@ function ensureShell(): void {
       </header>
       <div id="update-slot"></div>
       <div id="activity" class="activity-bar" role="status" aria-live="polite" hidden></div>
+      <div id="pending-approval-slot"></div>
       <main id="content" role="tabpanel" tabindex="-1"></main>
     </div>`));
 
@@ -766,21 +791,19 @@ function ensureShell(): void {
   // The "why is Start greyed out?" hint lives in the activity bar, which is
   // repainted wholesale, so its click is delegated from the bar itself.
   document.getElementById("activity")!.addEventListener("click", (ev) => {
-    if ((ev.target as HTMLElement).id === "start-hint") void goToPreflight();
+    if ((ev.target as HTMLElement).id === "start-hint") void goToStartFix();
   });
   applyTheme(theme);
 }
 
 function navigate(next: ViewName): Promise<void> {
   if (next === view) return Promise.resolve();
-  // Anything parked on an undo timer commits now rather than being abandoned
-  // on a screen the user has left.
-  flushPendingApprovals();
   view = next;
   pendingChanges = 0;
   // The convertd probe behind get_diagnostics is only worth paying for once
   // the user is on the screen that shows what it returns.
   if (next === "settings") void loadDiagnostics();
+  if (next === "settings") void restoreModelDownloadStatus();
   return render();
 }
 
@@ -795,6 +818,21 @@ async function goToPreflight(): Promise<void> {
   if (!button) return;
   button.scrollIntoView({ block: "center" });
   button.focus();
+}
+
+/** On first run, the useful recovery is the first missing folder rather than
+ * a readiness check. Once folders are configured, use the live check control. */
+async function goToStartFix(): Promise<void> {
+  await navigate("settings");
+  const needsFolders = !cfg || !cfg.processing_dir || !cfg.outbox_dir || !cfg.quarantine_dir;
+  if (!needsFolders) {
+    await goToPreflight();
+    return;
+  }
+  const firstFolder = document.querySelector<HTMLInputElement>('[name="processing_dir"]');
+  if (!firstFolder) return;
+  firstFolder.scrollIntoView({ block: "center" });
+  firstFolder.focus();
 }
 
 function paintHeader(): void {
@@ -852,9 +890,12 @@ function paintActivity(): void {
     // "…in Settings" is wrong when the user is already looking at Settings,
     // which on an unconfigured install is where the app boots.
     const here = view === "settings";
-    const label = runtime.checked
-      ? (here ? "fix what's listed below" : "fix what Settings lists")
-      : (here ? "check this computer" : "check this computer in Settings");
+    const needsFolders = !cfg || !cfg.processing_dir || !cfg.outbox_dir || !cfg.quarantine_dir;
+    const label = needsFolders
+      ? (here ? "finish setup below" : "finish setup in Settings")
+      : runtime.checked
+        ? (here ? "fix what's listed below" : "fix what Settings lists")
+        : (here ? "check this computer" : "check this computer in Settings");
     parts.push(`<span class="blocked-note">BackLog can't start yet — `
       + `<button type="button" id="start-hint" class="start-hint">${label}</button>.</span>`);
   }
@@ -1042,13 +1083,15 @@ async function loadViewData(wanted: ViewName): Promise<ViewData> {
     }
   }
   try {
-    const [jobs, total] = await Promise.all([
-      // Always the head of the queue: see buildReviewFoot for why this must
-      // not be an offset that walks forward over a set the reviewer is
-      // emptying as they go.
-      invoke<Job[]>("list_flagged", { limit: REVIEW_PAGE, offset: 0 }),
-      invoke<number>("count_jobs", { query: null, jobState: "flagged", job_state: "flagged" }),
-    ]);
+    const total = await invoke<number>("count_jobs", { query: null, jobState: "flagged", job_state: "flagged" });
+    const jobs: Job[] = [];
+    // Reason filtering and oldest-first ordering must consider the whole
+    // flagged set, not merely the first screenful returned by the backend.
+    for (let offset = 0; offset < total; offset += REVIEW_FETCH_PAGE) {
+      const batch = await invoke<Job[]>("list_flagged", { limit: REVIEW_FETCH_PAGE, offset });
+      jobs.push(...batch);
+      if (batch.length < REVIEW_FETCH_PAGE) break;
+    }
     return { kind: "flagged", jobs, total };
   } catch (e) {
     return { kind: "flagged", jobs: [], total: 0, error: String(e) };
@@ -1225,9 +1268,6 @@ async function onRunButton(): Promise<void> {
         // nothing at all. goToPreflight scrolls to and focuses the check button
         // wherever the user already is; the label is the button's own words.
         showError(e, { label: "Check this computer", run: () => void goToPreflight() });
-        // Same reason navigate() does it: nothing parked on an undo timer may
-        // be abandoned on a screen the user is being moved away from.
-        flushPendingApprovals();
         view = "settings";
       }
     } else {
@@ -1318,14 +1358,27 @@ function buildQueue(data: { jobs: Job[]; total: number; error?: string }): Node[
     nodes.push(buildErrorState("BackLog couldn't read the queue", data.error));
     return nodes;
   }
+  const filtered = queueQuery !== "" || queueState !== null;
+  const active = ["ingested", "converted", "filtered", "named", "validated"]
+    .reduce((sum, state) => sum + (stats[state] ?? 0), 0);
+  if (!filtered && active === 0 && data.total > 0) {
+    const reviewCount = stats["flagged"] ?? 0;
+    nodes.push(el(`<div class="caught-up" role="status"><strong>Processing is caught up</strong>
+      ${reviewCount > 0
+        ? `${formatCount(reviewCount)} files need review. `
+        : "There is nothing waiting to be processed. "}
+      <b>Done</b> means BackLog has handed a document to Power Automate.</div>`));
+  }
   if (!data.jobs.length) {
-    const filtered = queueQuery !== "" || queueState !== null;
     nodes.push(el(filtered
       ? `<div class="empty"><strong>Nothing matches</strong>No file matches that search or filter.
          Clear them to see everything BackLog has processed.</div>`
-      : `<div class="empty"><strong>No files yet</strong>Set your folders in Settings and check this
-         computer, then drop files into the Processing folder — or let your SharePoint intake put
-         them there.</div>`));
+      : active === 0
+          ? `<div class="empty"><strong>All caught up</strong>There is nothing processing or waiting for
+             review. <b>Done</b> means BackLog has handed a document to Power Automate.</div>`
+          : `<div class="empty"><strong>No files yet</strong>Set your folders in Settings and check this
+             computer, then drop files into the Processing folder — or let your SharePoint intake put
+             them there.</div>`));
     return nodes;
   }
   const table = el(`
@@ -1460,6 +1513,11 @@ type ReviewCard = {
 };
 
 const reviewCards = new Map<string, ReviewCard>();
+let reviewReason = "";
+let reviewOrder: "newest" | "oldest" = "newest";
+let reviewShown = REVIEW_PAGE;
+let reviewMatchingTotal = 0;
+let reviewVisibleCount = 0;
 
 /** Corrections typed but not yet filed, keyed by sha256 and held OUTSIDE the
  *  DOM. Carrying the card *node* across a rebuild is enough only while the
@@ -1480,12 +1538,34 @@ function buildFlagged(
   data: { jobs: Job[]; total: number; error?: string },
   held: Map<string, ReviewCard>
 ): Node[] {
+  const reasonKeys = [...new Set(data.jobs.map((job) => (job.flag_reason ?? "").split(":")[0].trim()).filter(Boolean))]
+    .sort();
   const bar = el(`
     <div class="toolbar">
+      <label class="sr-only" for="review-reason-filter">Filter review reason</label>
+      <select id="review-reason-filter" aria-label="Filter review reason">
+        <option value="">All reasons</option>
+        ${reasonKeys.map((key) => `<option value="${esc(key)}" ${reviewReason === key ? "selected" : ""}>${esc(reasonCopy(key).title)}</option>`).join("")}
+      </select>
+      <label class="sr-only" for="review-order">Review order</label>
+      <select id="review-order" aria-label="Review order">
+        <option value="newest" ${reviewOrder === "newest" ? "selected" : ""}>Newest first</option>
+        <option value="oldest" ${reviewOrder === "oldest" ? "selected" : ""}>Oldest first</option>
+      </select>
       <span class="grow"></span>
       <button type="button" id="refresh-chip" class="refresh-chip" hidden></button>
     </div>`);
   wireRefreshChip(q<HTMLElement>(bar, "#refresh-chip"));
+  q<HTMLSelectElement>(bar, "#review-reason-filter").addEventListener("change", (ev) => {
+    reviewReason = (ev.currentTarget as HTMLSelectElement).value;
+    reviewShown = REVIEW_PAGE;
+    requestRender();
+  });
+  q<HTMLSelectElement>(bar, "#review-order").addEventListener("change", (ev) => {
+    reviewOrder = (ev.currentTarget as HTMLSelectElement).value as "newest" | "oldest";
+    reviewShown = REVIEW_PAGE;
+    requestRender();
+  });
   const nodes: Node[] = [bar];
 
   const cards: Node[] = [];
@@ -1498,7 +1578,15 @@ function buildFlagged(
     cards.push(card.root);
     seen.add(sha256);
   };
-  for (const job of data.jobs) {
+  const matchingJobs = data.jobs
+    .filter((job) => !reviewReason || job.flag_reason?.split(":")[0].trim() === reviewReason)
+    .sort((a, b) => reviewOrder === "oldest"
+      ? Date.parse(a.updated_at) - Date.parse(b.updated_at)
+      : Date.parse(b.updated_at) - Date.parse(a.updated_at));
+  const visibleJobs = matchingJobs.slice(0, reviewShown);
+  reviewMatchingTotal = matchingJobs.length;
+  reviewVisibleCount = visibleJobs.length;
+  for (const job of visibleJobs) {
     const existing = held.get(job.sha256);
     if (existing) keep(job.sha256, existing);
     else {
@@ -1524,7 +1612,7 @@ function buildFlagged(
     return nodes;
   }
   nodes.push(...cards);
-  nodes.push(buildReviewFoot(cards.length, data.total));
+  nodes.push(buildReviewFoot(visibleJobs.length, matchingJobs.length));
   return nodes;
 }
 
@@ -1541,10 +1629,11 @@ function buildReviewFoot(shown: number, total: number): HTMLElement {
   const foot = el(`
     <div class="list-foot" id="review-foot">
       <span class="count"></span>
-      <button type="button" class="ghost" id="review-more">Bring in more</button>
+      <button type="button" class="ghost" id="review-more" ${shown >= total ? "disabled" : ""}>Bring in more</button>
     </div>`);
   q<HTMLElement>(foot, "#review-more").addEventListener("click", () => {
     pendingChanges = 0;
+    reviewShown += REVIEW_PAGE;
     requestRender();
   });
   paintReviewFootInto(foot, shown, total);
@@ -1552,22 +1641,22 @@ function buildReviewFoot(shown: number, total: number): HTMLElement {
 }
 
 function paintReviewFootInto(foot: HTMLElement, shown: number, total: number): void {
-  // Says what the list actually is. `list_flagged` is ORDER BY updated_at DESC
-  // (ledger.rs::search_jobs), so this is the newest end of the backlog, not the
-  // oldest — and the refill in dropCard is what makes "more are brought in"
-  // true rather than aspirational.
+  const scope = reviewReason
+    ? `file${total === 1 ? "" : "s"} matching ${reasonCopy(reviewReason).title}`
+    : `file${total === 1 ? "" : "s"} that need review`;
+  const order = reviewOrder === "oldest" ? "oldest first" : "most recently flagged first";
   q<HTMLElement>(foot, ".count").textContent = total > shown
-    ? `Showing ${formatCount(shown)} of ${formatCount(total)} files that need review, most `
-      + `recently flagged first. More are brought in as you work through these.`
-    : `Showing all ${formatCount(total)} file${total === 1 ? "" : "s"} that need review.`;
+    ? `Showing ${formatCount(shown)} of ${formatCount(total)} ${scope}, ${order}. `
+      + "Bring in more when you are ready."
+    : `Showing all ${formatCount(total)} ${scope}, ${order}.`;
 }
 
 /** Keep the footer honest as cards leave the screen one at a time. */
 function paintReviewFoot(): void {
   const foot = document.getElementById("review-foot");
   if (!foot) return;
-  const shown = reviewCards.size;
-  paintReviewFootInto(foot, shown, Math.max(shown, stats["flagged"] ?? shown));
+  const shown = Math.min(reviewCards.size, reviewVisibleCount);
+  paintReviewFootInto(foot, shown, reviewMatchingTotal);
 }
 
 function buildReviewCard(job: Job): ReviewCard {
@@ -1884,6 +1973,12 @@ function dropCard(card: ReviewCard): void {
   // a second manifest for a document Power Automate has already processed.
   const live = reviewCards.get(sha256);
   const target = card.root.isConnected || !live?.root.isConnected ? card : live;
+  const matchesReview = !reviewReason
+    || card.job.flag_reason?.split(":")[0].trim() === reviewReason;
+  if (matchesReview) {
+    reviewMatchingTotal = Math.max(0, reviewMatchingTotal - 1);
+    reviewVisibleCount = Math.max(0, reviewVisibleCount - 1);
+  }
   reviewCards.delete(sha256);
   // Whatever was typed into this card has been filed, set aside or sent back
   // round; resurrecting it onto a later card for the same file would be worse
@@ -2029,6 +2124,27 @@ type PendingApproval = {
 
 const pendingApprovals = new Map<string, PendingApproval>();
 
+/** Pending approvals belong to the app, not to the review tab. A reviewer can
+ * check Settings without turning a ten-second safety window into an immediate
+ * Power Automate handoff. */
+function paintPendingApprovalTray(): void {
+  const slot = document.getElementById("pending-approval-slot");
+  if (!slot) return;
+  const pending = [...pendingApprovals.values()][0];
+  if (!pending) {
+    slot.replaceChildren();
+    return;
+  }
+  const extra = pendingApprovals.size > 1 ? ` and ${pendingApprovals.size - 1} more` : "";
+  const tray = el(`
+    <aside class="pending-approval-tray" id="pending-approval-tray" role="status">
+      <span><b>Ready to file</b> ${esc(pending.fields.subject)}${extra} — ${pending.remaining}s left to undo.</span>
+      <button type="button" class="ghost" data-act="undo">Undo</button>
+    </aside>`);
+  q<HTMLButtonElement>(tray, '[data-act="undo"]').addEventListener("click", () => cancelApproval(pending.card));
+  slot.replaceChildren(tray);
+}
+
 function beginApproval(card: ReviewCard, fields: PendingApproval["fields"]): void {
   if (pendingApprovals.has(card.job.sha256)) return;
   card.busy = true;
@@ -2041,6 +2157,7 @@ function beginApproval(card: ReviewCard, fields: PendingApproval["fields"]): voi
     q<HTMLElement>(strip, ".filing").innerHTML =
       `Filing <b>${esc(fields.date)} ${esc(fields.subject)}</b> — <span class="count">`
       + `${pending.remaining}s</span> to change your mind.`;
+    paintPendingApprovalTray();
   };
   paint();
   pending.timer = window.setInterval(() => {
@@ -2052,6 +2169,7 @@ function beginApproval(card: ReviewCard, fields: PendingApproval["fields"]): voi
     void commitApproval(pending);
   }, 1000);
   pendingApprovals.set(card.job.sha256, pending);
+  paintPendingApprovalTray();
   // Move on: the next card's date field is where the reviewer is going. Hiding
   // the form has just blurred the submit button they pressed, so this is also
   // the only thing standing between them and a focusless <body>.
@@ -2063,6 +2181,7 @@ function cancelApproval(card: ReviewCard): void {
   if (!pending) return;
   window.clearInterval(pending.timer);
   pendingApprovals.delete(card.job.sha256);
+  paintPendingApprovalTray();
   card.busy = false;
   // The dirtyEdits entry deliberately stays: Undo puts the reviewer back in
   // front of their own typing, which is still unfiled, and dropping the entry
@@ -2076,6 +2195,7 @@ async function commitApproval(pending: PendingApproval): Promise<void> {
   window.clearInterval(pending.timer);
   const { card, fields } = pending;
   pendingApprovals.delete(card.job.sha256);
+  paintPendingApprovalTray();
   const strip = q<HTMLElement>(card.root, ".undo-strip");
   q<HTMLElement>(strip, ".filing").innerHTML =
     `<span class="spinner-dot"></span>Filing <b>${esc(fields.subject)}</b>…`;
@@ -2126,7 +2246,19 @@ function normalizePath(value: string): string {
 function buildSettings(): Node[] {
   if (!cfg) return [el(`<div class="empty">Loading settings…</div>`)];
   const c = cfg;
-  const nodes: Node[] = [renderReadinessPanel()];
+  // Models can still be missing after folders are saved, which deliberately
+  // leaves runtime.configured false. First-run is about choosing these three
+  // folders, not about every readiness check already passing.
+  const firstRun = !c.processing_dir || !c.outbox_dir || !c.quarantine_dir;
+  const nodes: Node[] = [];
+  if (firstRun) {
+    nodes.push(el(`
+      <section class="setup-intro" aria-label="First-time setup">
+        <h2>Set up this computer</h2>
+        <p>BackLog needs three local folders before it can safely handle documents.</p>
+        <ol class="setup-steps"><li>1. Choose folders</li><li>2. Save and check this computer</li><li>3. Download an optional backup model if needed</li></ol>
+      </section>`));
+  }
 
   const folder = (label: string, key: keyof Config, note?: string) => `
     <label class="wide">${label}
@@ -2179,7 +2311,7 @@ function buildSettings(): Node[] {
       </details>
 
       <div class="card-actions">
-        <button type="submit" class="primary">Save settings</button>
+        <button type="submit" class="primary">${firstRun ? "Save and check this computer" : "Save settings"}</button>
         <span class="err" role="alert"></span>
         <span class="ok-msg" role="status"></span>
       </div>
@@ -2218,10 +2350,14 @@ function buildSettings(): Node[] {
 
   form.addEventListener("submit", (ev) => {
     ev.preventDefault();
-    void saveSettings(form);
+    settingsForm = form;
+    if (firstRun) void saveAndCheckComputer().catch(() => {
+      // saveConfigFromForm already places the recoverable error beside the form.
+    });
+    else void saveSettings();
   });
 
-  nodes.push(form);
+  nodes.push(form, renderReadinessPanel());
   return nodes;
 }
 
@@ -2233,8 +2369,12 @@ function clampNumber(input: HTMLInputElement): number {
   return Math.min(max, Math.max(min, x));
 }
 
-async function saveSettings(form: HTMLElement): Promise<void> {
+let settingsForm: HTMLElement | null = null;
+
+async function saveConfigFromForm(): Promise<void> {
+  const form = settingsForm;
   if (!cfg) return;
+  if (!form) return;
   const text = (n: string) => {
     const input = form.querySelector<HTMLInputElement>(`[name="${n}"]`);
     return input ? normalizePath(input.value) : null;
@@ -2279,6 +2419,38 @@ async function saveSettings(form: HTMLElement): Promise<void> {
     setTimeout(() => (ok.textContent = ""), 6000);
   } catch (e) {
     err.textContent = friendlyError(String(e)).message;
+    throw e;
+  }
+}
+
+async function runReadinessCheck(): Promise<boolean> {
+  const checked = await refreshRuntime(true);
+  if (!checked) return false;
+  replaceReadinessPanel();
+  paintHeader();
+  void loadDiagnostics(true);
+  return true;
+}
+
+async function saveAndCheckComputer(): Promise<void> {
+  await saveConfigFromForm();
+  const checked = await runReadinessCheck();
+  const form = settingsForm;
+  if (!form) return;
+  const ok = q<HTMLElement>(form, ".ok-msg");
+  if (!checked) {
+    ok.textContent = "";
+    return;
+  }
+  ok.textContent = "Saved and checked. Follow any actions listed above before starting.";
+  setTimeout(() => (ok.textContent = ""), 6000);
+}
+
+async function saveSettings(): Promise<void> {
+  try {
+    await saveConfigFromForm();
+  } catch {
+    // saveConfigFromForm already puts the plain-language error beside the form.
   }
 }
 
@@ -2347,6 +2519,7 @@ function renderReadinessPanel(): HTMLElement {
     button.disabled = false;
   });
   panel.querySelector("#download-models-button")?.addEventListener("click", onDownloadModelsClick);
+  panel.querySelector("#cancel-model-download")?.addEventListener("click", onCancelModelDownloadClick);
   return panel;
 }
 
@@ -2374,8 +2547,8 @@ function renderProblems(): Node[] {
     if (runtime.checked) {
       return [el(`<div class="ready-box">All checks passed. BackLog is ready to start.</div>`)];
     }
-    return [el(`<div class="next-box"><strong>Start here.</strong> Fill in your three folders
-      below, then press <b>Check this computer</b>. BackLog will tell you what, if anything, is
+    return [el(`<div class="next-box"><strong>Start here.</strong> Fill in your three folders,
+      then use <b>Save and check this computer</b>. BackLog will tell you what, if anything, is
       still missing.</div>`)];
   }
   const box = el(`<div class="problem-box"><strong>Action needed</strong><ul></ul></div>`);
@@ -2404,7 +2577,7 @@ function renderProblems(): Node[] {
       });
       item.appendChild(button);
     } else if (problem.action === "download_models") {
-      const button = el(`<button type="button">Download the model files</button>`);
+      const button = el(`<button type="button">${esc(modelDownloadActionLabel())}</button>`);
       button.addEventListener("click", onDownloadModelsClick);
       item.appendChild(button);
     }
@@ -2461,23 +2634,69 @@ async function loadDiagnostics(force = false): Promise<void> {
 // Model download
 // ---------------------------------------------------------------------------
 
-/** One-time setup egress: fetches the two Qwen GGUF model files so a
- *  non-technical user never runs models/download_models.py in a terminal. */
+/** One-time setup egress fetches only the model files this computer is missing,
+ * so a non-technical user never runs models/download_models.py in a terminal. */
 async function onDownloadModelsClick(): Promise<void> {
   if (modelsDownloading) return;
   modelsDownloading = true;
+  modelDownloadCancelling = false;
   modelDownloadProgress = null;
+  modelDownloadTerminal = null;
   replaceReadinessPanel();
   try {
     await invoke("download_models");
   } catch (e) {
     // The model-download-done listener normally already surfaced this; this
     // only fires for an IPC-level failure the event itself missed.
-    if (modelsDownloading) {
+    if (modelDownloadCancelling) {
+      modelsDownloading = false;
+      modelDownloadTerminal = { status: "cancelled", ok: false, error: null };
+      replaceReadinessPanel();
+    } else if (modelsDownloading) {
       modelsDownloading = false;
       showError(e);
       replaceReadinessPanel();
     }
+  }
+}
+
+async function onCancelModelDownloadClick(): Promise<void> {
+  const button = document.getElementById("cancel-model-download") as HTMLButtonElement | null;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Cancelling…";
+  }
+  modelDownloadCancelling = true;
+  try {
+    await invoke("cancel_model_download");
+  } catch (e) {
+    modelDownloadCancelling = false;
+    showError(e);
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Cancel download";
+    }
+  }
+}
+
+/** The backend retains its last terminal result. Re-read it whenever Settings
+ * is shown so a completed or interrupted transfer is never silent after a
+ * navigation away from the progress view. */
+async function restoreModelDownloadStatus(): Promise<void> {
+  try {
+    const done = await invoke<ModelDownloadDone | null>("model_download_status");
+    modelDownloadTerminal = done ? terminalDownloadStatus(done) : null;
+    if (modelDownloadTerminal?.status === "completed") {
+      cfg = await invoke<Config>("get_config");
+      await refreshRuntime(true);
+    }
+    if (view === "settings") {
+      replaceReadinessPanel();
+      paintHeader();
+    }
+  } catch {
+    // A status read is supplemental: never turn opening Settings into an
+    // error just because an older backend has no retained terminal state.
   }
 }
 
@@ -2490,9 +2709,25 @@ function downloadCaption(p: ModelDownloadProgress | null): string {
   return `File ${p.files_done + 1} of ${p.files_total}: ${p.current_file} (${pct}%)${bytes}`;
 }
 
+function modelDownloadActionLabel(): string {
+  if (!runtime.primary_model_found && !runtime.escalation_model_found) return "Download model files (~2.4 GB)";
+  if (!runtime.primary_model_found) return "Download everyday model (~0.6 GB)";
+  return "Download optional backup model (~1.8 GB)";
+}
+
+function modelDownloadExplanation(): string {
+  if (!runtime.primary_model_found && !runtime.escalation_model_found) {
+    return "Downloads the everyday and optional backup model files from Hugging Face once (~2.4 GB, public repos, no account needed).";
+  }
+  if (!runtime.primary_model_found) {
+    return "Downloads the everyday model from Hugging Face once (~0.6 GB, public repo, no account needed).";
+  }
+  return "Your everyday model is already installed. This adds the optional backup model from Hugging Face once (~1.8 GB, public repo, no account needed).";
+}
+
 function renderModelDownloadSection(): string {
   const needsDownload = !runtime.primary_model_found || !runtime.escalation_model_found;
-  if (!needsDownload && !modelsDownloading) return "";
+  if (!needsDownload && !modelsDownloading && !modelDownloadTerminal) return "";
   const pct = modelDownloadProgress ? Math.round(modelDownloadProgress.overall_percent) : 0;
   const progress = modelsDownloading
     ? `<div class="progress-track" id="dl-track" role="progressbar" aria-valuemin="0"
@@ -2500,15 +2735,31 @@ function renderModelDownloadSection(): string {
          <div class="progress-fill" id="dl-fill" style="width:${pct}%"></div>
        </div>
        <p class="dim-note" id="dl-caption" aria-live="polite">${esc(downloadCaption(modelDownloadProgress))}</p>`
-    : `<p class="dim-note">Fetches the two Qwen model files from Hugging Face once
-        (public repos, no account needed). BackLog stays fully offline for document
+    : `<p class="dim-note">${esc(modelDownloadExplanation())} BackLog stays fully offline for document
         processing afterwards. You can carry on filling in your folders while it runs.</p>`;
+  const terminal = modelDownloadTerminal
+    ? `<p class="model-download-terminal ${modelDownloadTerminal.status}">${esc(
+      modelDownloadTerminal.status === "completed"
+        ? "Model download complete. BackLog can now use the model files."
+        : modelDownloadTerminal.status === "cancelled"
+          ? "Download cancelled. Your partial files are kept so it can safely resume."
+          : `Download failed. ${modelDownloadTerminal.error ?? "You can safely resume it."}`
+    )}</p>`
+    : "";
+  const action = modelsDownloading
+    ? `<div class="model-download-actions"><button type="button" id="download-models-button" disabled>Downloading models…</button>
+         <button type="button" id="cancel-model-download" class="cancel-download">Cancel download</button></div>`
+    : needsDownload
+      ? `<button type="button" id="download-models-button">${modelDownloadTerminal
+        && (modelDownloadTerminal.status === "cancelled" || modelDownloadTerminal.status === "failed")
+          ? `Resume download — ${esc(modelDownloadActionLabel())}`
+          : esc(modelDownloadActionLabel())}</button>`
+      : "";
   return `
     <div class="model-download">
-      <button type="button" id="download-models-button" ${modelsDownloading ? "disabled" : ""}>
-        ${modelsDownloading ? "Downloading models…" : "Download models (~2.4 GB)"}
-      </button>
+      ${action}
       ${progress}
+      ${terminal}
     </div>`;
 }
 
@@ -2597,11 +2848,14 @@ listen<ModelDownloadProgress>("model-download-progress", (event) => {
 
 listen<ModelDownloadDone>("model-download-done", async (event) => {
   modelsDownloading = false;
+  modelDownloadCancelling = false;
   modelDownloadProgress = null;
-  if (!event.payload.ok) showError(event.payload.error ?? "Model download failed.");
-  else showSuccess("The model files are downloaded. BackLog can name documents now.");
+  modelDownloadTerminal = terminalDownloadStatus(event.payload);
+  if (modelDownloadTerminal.status === "failed") showError(event.payload.error ?? "Model download failed.");
+  else if (modelDownloadTerminal.status === "completed") showSuccess("The model files are downloaded. BackLog can name documents now.");
   // Flip Readiness back to green (or show what's still missing) now that the
   // model files may have just landed on disk.
+  if (modelDownloadTerminal.status === "completed") cfg = await invoke<Config>("get_config");
   await refreshRuntime(true);
   replaceReadinessPanel();
   paintHeader();
@@ -2638,5 +2892,8 @@ window.addEventListener("beforeunload", flushPendingApprovals);
   // Both non-blocking and after the first paint, so neither a slow update
   // endpoint nor a convertd probe can delay startup.
   void checkForUpdates();
-  if (view === "settings") void loadDiagnostics();
+  if (view === "settings") {
+    void loadDiagnostics();
+    void restoreModelDownloadStatus();
+  }
 })();

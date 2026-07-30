@@ -1,16 +1,11 @@
 #!/usr/bin/env bash
 # Run every gate .github/workflows/ci.yml runs, on this machine.
 #
-# This exists because GitHub Actions does not run for this repository: every
-# run in ci.yml's history failed within seconds, none ever assigned a runner
-# (runner_id 0, empty runner_name, log download 404) — a private repo whose
-# account has no Actions allowance left. See docs/KNOWN_ISSUES.md item 11.
-# A CI file nobody can run is theatre, so the gates have to be executable
-# locally or they are not gates at all.
+# Hosted GitHub Actions is authoritative for pull requests. This local mirror
+# lets contributors run the same core gates before they push.
 #
 # Keep this in lockstep with ci.yml. The version-agreement job below checks
-# the two files still list the same jobs, so drift fails loudly here rather
-# than being discovered the day someone turns Actions on.
+# the two files still list the same jobs, so drift fails loudly.
 #
 #   ./scripts/ci-local.sh            # everything
 #   ./scripts/ci-local.sh trust-core # one job (trust-core|workspace|frontend|python|version-drift)
@@ -58,9 +53,10 @@ step trust-core "cargo clippy -p backlog-core" \
   cargo clippy --manifest-path src-tauri/Cargo.toml -p backlog-core --all-targets --locked -- -D warnings
 
 # --- workspace --------------------------------------------------------------
-# tauri-build validates externalBin and the resources DLL glob at compile time,
-# so without the stubs the app crate does not reach a single test.
-step workspace "stage dev stub sidecars" bash scripts/dev-stubs.sh
+# tauri-build validates externalBin and every resources glob at compile time,
+# so without the deterministic binary/model fixtures the app crate does not
+# reach a single test.
+step workspace "stage dev resource stubs" bash scripts/dev-stubs.sh
 step workspace "dev-stub marker contract" node .github/scripts/check-stub-marker.mjs
 step workspace "cargo test --workspace" \
   cargo test --manifest-path src-tauri/Cargo.toml --workspace --all-targets --locked
@@ -79,8 +75,8 @@ step frontend "UI harness" npm run harness:shots
 # Run by stdlib `unittest`, not pytest. Every test under those two directories
 # imports nothing outside the standard library, so requiring a third-party test
 # runner bought nothing and cost the gate its ability to run: `python3 -m pytest`
-# died with "No module named pytest" on the release machine — the only machine
-# that ever runs this script — so a 99-test suite was silently not a gate.
+# died with "No module named pytest" on a machine without pytest, so a 99-test
+# suite was silently not a gate.
 #
 # `-t` points at the start directory itself because neither directory has an
 # __init__.py, and plain `discover -s dir` then fails with "Start directory is

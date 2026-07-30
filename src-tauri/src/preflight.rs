@@ -275,13 +275,10 @@ pub async fn run_with(
 
     let primary_model_found = cfg.slm_primary_gguf.is_file();
     let escalation_model_found = cfg.slm_escalation_gguf.is_file();
-    if !primary_model_found || !escalation_model_found {
-        // These two gate `configured` but used to emit no problem at all, so
-        // a fresh install — app installed, models not downloaded — showed a
-        // green "All checks passed" box above a disabled Start button, and
-        // clicking Start returned the literal string "runtime preflight did
-        // not pass". This is the single most common state the product is
-        // ever in; it gets a named problem and a button.
+    if !primary_model_found {
+        // The primary model gates `configured`. A fresh install with no model
+        // used to show a green "All checks passed" box above a disabled Start
+        // button, so the blocking state gets a named problem and a button.
         problems.push(RuntimeProblem {
             field: "models".into(),
             code: "models_missing".into(),
@@ -295,6 +292,22 @@ pub async fn run_with(
                 cfg.slm_escalation_gguf.display()
             )),
             severity: ProblemSeverity::Error,
+            action: Some(ProblemAction::DownloadModels),
+        });
+    } else if cfg.using_primary_for_escalation() {
+        problems.push(RuntimeProblem {
+            field: "slm_escalation_gguf".into(),
+            code: "escalation_model_missing_using_primary".into(),
+            message: "The optional backup model is not installed. BackLog is ready to work \
+                      using the everyday model for backup naming attempts."
+                .into(),
+            detail: Some(format!(
+                "primary model will safely handle escalation attempts until {} is installed; \
+                 using {}.",
+                cfg.slm_escalation_gguf.display(),
+                cfg.effective_escalation_gguf().display()
+            )),
+            severity: ProblemSeverity::Warning,
             action: Some(ProblemAction::DownloadModels),
         });
     }
@@ -468,8 +481,7 @@ pub async fn run_with(
         && llama_server_found
         && llama_server_ok
         && grammar_found
-        && primary_model_found
-        && escalation_model_found;
+        && primary_model_found;
 
     RuntimeStatus {
         configured,
@@ -867,6 +879,56 @@ mod tests {
         // Both expected locations are in the detail so support can act on it.
         let detail = problem.detail.as_deref().unwrap_or_default();
         assert!(detail.contains("primary.gguf") && detail.contains("escalation.gguf"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_optional_model_is_usable_without_claiming_it_is_installed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = workable_cfg(root.path());
+        cfg.slm_primary_gguf = root.path().join("primary.gguf");
+        cfg.slm_escalation_gguf = root.path().join("missing-escalation.gguf");
+        std::fs::write(&cfg.slm_primary_gguf, b"model").unwrap();
+
+        let paths = RuntimePaths {
+            sidecar: root.path().join("convertd"),
+            llama_server: root.path().join("llama-server"),
+            grammar: root.path().join("name.gbnf"),
+            models_dir: root.path().join("models"),
+            install_dir_error: None,
+        };
+        std::fs::write(
+            &paths.sidecar,
+            b"#!/bin/sh\nwhile IFS= read -r line; do\n  echo '{\"id\":1,\"ok\":true}'\ndone\n",
+        )
+        .unwrap();
+        std::fs::write(&paths.llama_server, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&paths.grammar, b"grammar").unwrap();
+        std::fs::set_permissions(&paths.sidecar, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&paths.llama_server, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let status = run_with(&paths, &cfg, false, false).await;
+
+        assert!(status.configured, "primary fallback must remain usable");
+        assert!(status.primary_model_found);
+        assert!(
+            !status.escalation_model_found,
+            "the optional 1.7B row must remain honest"
+        );
+        let fallback = status
+            .problems
+            .iter()
+            .find(|problem| problem.code == "escalation_model_missing_using_primary")
+            .expect("degraded readiness must explain the safe primary fallback");
+        assert_eq!(fallback.severity, ProblemSeverity::Warning);
+        assert!(fallback
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("primary model will safely handle escalation attempts"));
     }
 
     #[test]

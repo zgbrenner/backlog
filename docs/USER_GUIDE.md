@@ -1,200 +1,153 @@
 # BackLog: a guide for the person who runs it
 
-BackLog watches a folder, works out what each document is, gives it a name like
-`2024-05-31 Acme Services Agreement.pdf`, and hands it to your SharePoint.
+BackLog watches a folder, works out what each document is, gives it a useful
+name, and hands it to the Power Automate flow that files it in SharePoint.
 
-You will not need a terminal, a command, or a developer, at any point.
+You do not need a terminal, Python, a separate model download, or a developer
+to install it.
 
-If something goes wrong, `TROUBLESHOOTING.md` lists every message BackLog can
-show you and what to do about each one. `PRIVACY.md` explains exactly what
-happens to your documents.
+## 1. Install one file
 
----
+Download **`BackLog_0.5.0_x64-setup.exe`** from the BackLog v0.5.0 release page
+and double-click it. This is the only required download.
 
-## 1. Install it
+The installer includes:
 
-1. Double-click `BackLog_<version>_x64-setup.exe`.
-2. **Windows will probably warn you.** BackLog is not yet code-signed, so
-   SmartScreen shows a blue box saying *"Windows protected your PC"*. Click
-   **More info**, then **Run anyway**. Windows Defender may also ask; choose
-   **Allow**.
-3. It installs for **your user account only** and does not ask for an
-   administrator password. If it does ask for one, stop — that is not the right
-   installer.
-4. BackLog opens. There is nothing to configure during install.
+- the BackLog app;
+- the document-conversion runtime;
+- the llama naming server and its Windows runtime libraries;
+- the verified Qwen3 0.6B everyday model; and
+- the offline WebView2 runtime.
 
-If your IT department manages this computer, give them `docs/SECURITY.md` and
-`NOTICE.md` before you run the installer.
+It installs for your Windows user account and does not need the internet during
+installation. It must not ask for an administrator password.
 
-## 2. Set it up (once)
+Windows will probably show **Windows protected your PC** because the installer
+does not yet have a trusted Authenticode certificate. Click **More info**, then
+**Run anyway** only if you obtained the file from the BackLog release page. If
+your organization blocks unsigned applications, ask IT to review
+`docs/SECURITY.md` and `NOTICE.md`.
 
-Open the **Settings** tab. There are three folders to choose and one download
-to start.
+## 2. Set it up once
 
-### The three folders
+Open **Settings**. BackLog leads you through three steps:
 
-| Folder | What to pick |
+1. Choose the **Processing**, **Outbox**, and **Quarantine** folders.
+2. Press **Save and check this computer**.
+3. Read any Blocked message and use the action beside it.
+
+The Processing folder is the watched intake folder. New documents arrive
+there, either because you put them there or because the intake flow did.
+
+Outbox is where BackLog writes manifests for Power Automate. Quarantine is the
+local folder where files needing a person wait. Keep all three folders
+separate; do not put one inside another.
+
+The check confirms that the folders are usable and that the bundled document
+reader, naming server, rules, and everyday model can start. **Start** becomes
+available when every required check passes.
+
+### Optional model
+
+The larger Qwen3 1.7B model is optional. It can help with difficult documents,
+but it uses about 1.8 GB more disk space and more memory while running. BackLog
+works without it by safely reusing the everyday 0.6B model for backup naming
+attempts.
+
+To add it, use **Download models** in Settings. BackLog verifies the bundled
+everyday model and downloads only anything missing. You can choose **Cancel
+download** and later **Resume download**; partial data is retained safely. The
+download result remains visible if you leave Settings and come back.
+
+Document processing itself remains local and works offline. The only routine
+network operations are this optional model download and the startup update
+check.
+
+## 3. Daily use
+
+Press **Start**. BackLog first sweeps files already in Processing, then watches
+for new arrivals. Closing the window hides it to the system tray; use the tray
+menu to quit it.
+
+The main states mean:
+
+| State | Meaning |
 |---|---|
-| **Processing folder** | The OneDrive-synced folder your documents arrive in. This is the folder BackLog watches. |
-| **Outbox folder** | Also OneDrive-synced. BackLog writes small instruction files here for Power Automate to collect. |
-| **Quarantine folder** | A **local** folder, not synced. Anything BackLog cannot confidently name is moved here so you can look at it. |
+| **Processing** | BackLog is watching or working through the intake folder. |
+| **Needs Review** | BackLog needs a person to decide or correct something. |
+| **Done** | BackLog handed a manifest to Power Automate. |
 
-Use **Browse** next to each. Three rules, which BackLog enforces:
+**Done does not mean SharePoint has finished.** The downstream Power Automate
+flow owns the later rename, archive, SharePoint copy, and list update. Its
+status and retry policy are separate from BackLog.
 
-- All three must be different folders.
-- None may be inside another.
-- BackLog must be able to write to the Outbox and Quarantine folders.
+When no file is processing:
 
-Once you set the Processing folder, BackLog tells you how many files it can see
-in it. That number is the quickest way to confirm you picked the folder you
-meant.
+- **All caught up** means no processing or review work remains.
+- **Processing is caught up** means the intake work is clear but one or more
+  documents still need a person in Needs Review.
 
-### The models
-
-Under **Readiness** you will see a button: **Download models (~2.4 GB)**.
-
-Press it. It fetches the two files BackLog uses to read and name documents,
-once, from a public source. No account and no login. It shows a progress bar
-and you can carry on filling in your folders while it runs. If it is
-interrupted, press it again — it picks up where it stopped.
-
-After this, BackLog never needs the internet to process a document.
-
-### Check
-
-Press **Check this computer**. BackLog tests everything and shows a list:
-
-```
-Processing folder is readable              Ready
-Outbox folder is writable                  Ready
-Quarantine folder is writable              Ready
-Working folder is writable                 Ready
-Document reader (convertd) is installed    Ready
-Document reader answers                    Ready
-Naming engine (llama-server) is installed  Ready
-Naming engine starts                       Ready
-Naming rules file is installed             Ready
-Everyday model file is present             Ready
-Backup model file is present               Ready
-```
-
-Before you press it they all say **Not checked**, which is honest — nothing has
-been examined yet. Afterwards each is **Ready** or **Blocked**. Anything
-Blocked comes with a sentence saying what it means and, where BackLog can fix
-it itself, a button that does. Section 4 of `TROUBLESHOOTING.md` covers every
-one of them.
-
-**Start stays greyed out until all eleven are Ready.** That is on purpose: a
-half-configured machine would fail on the first document and you would find out
-an hour later.
-
-## 3. Run it
-
-Press **Start**.
-
-BackLog first sweeps everything already in the Processing folder, then keeps
-watching for new arrivals. Files appear in the **Queue** tab as it works
-through them.
-
-The state on each row, in the order they happen:
-
-| It says | It means |
-|---|---|
-| **Queued** | Seen, not started. |
-| **Reading** | Getting the text out (this is the slow step for scans). |
-| **Understanding** | Picking out the dates and the subject. |
-| **Naming** | The model is proposing a name. |
-| **Checking** | Verifying the proposal against the document — no date ships unless it is actually in there. |
-| **Done** | Named and handed over to Power Automate. |
-| **Needs review** | BackLog would not name it and wants you. |
-| **Dismissed** | You decided this one does not need filing. |
-
-**Closing the window does not stop BackLog.** It hides to the system tray
-(bottom-right, by the clock) and keeps working. To actually stop it, right-click
-the tray icon and choose **Quit**. That is deliberate: an accidental click on
-the X in the middle of a two-thousand-file batch used to kill the batch.
-
-**Pause** stops new work without losing anything. Files that arrive while
-paused are still picked up when you resume.
+**Pause** stops new work without losing files. Anything arriving while paused
+is picked up after Resume.
 
 ## 4. Needs Review
 
-This is the part of BackLog that is a job rather than a machine. Everything
-BackLog would not name confidently lands here, and it is expected to happen —
-scans that came out badly, documents with no date on them, packets of several
-documents in one PDF.
+Needs Review is expected, especially for poor scans, packets containing several
+documents, and documents without a trustworthy date.
 
-Each card shows:
+BackLog never invents a date just to clear the queue. If it cannot verify a
+date against the page or the file's embedded properties, a person must review
+the document. If the document genuinely has no date, keep the file-modified
+date that BackLog prefilled. If the date field is unexpectedly blank, find the
+original file in File Explorer, open **Properties**, and enter its **Modified**
+date before filing. BackLog records that human correction rather than
+pretending the date appeared on the page.
 
-- **The original filename** and a plain sentence saying why it stopped.
-- **Date, Subject, Description** — pre-filled with whatever BackLog got as far
-  as, ready for you to correct.
-- **Document text** — what BackLog actually read. Open this first; it is usually
-  obvious immediately whether the scan came out or not.
-- **What happened** — the step-by-step trail for this file.
-- **Show me the file** — opens the original in Explorer.
+Each card shows the original filename, the reason it stopped, the proposed
+date/subject/description, the extracted text, and the event trail. You can
+filter by reason and sort oldest or newest first.
 
-Then one of three buttons:
+- **Approve and file** uses your corrections and records that a person chose
+  them. A short Undo window follows you if you navigate to another tab.
+- **Try again** sends the document through the bounded retry path.
+- **Can't fix this** sets it aside after confirmation. The document stays in
+  Quarantine, but the dismissal cannot currently be reversed inside BackLog.
 
-- **Approve and file** — your corrections go through the same safety checks the
-  model's proposals do, then the file is named and handed on. The index records
-  that a person chose this name (`date_source: human`, and a `HUMAN_CORRECTED`
-  note).
-- **Try again** — put it back through the pipeline. Worth one try for a timeout
-  or a temporary failure; pointless for a bad scan.
-- **Can't fix this** — set it aside. Use this for junk, sync artefacts and
-  duplicates you do not want indexed. It is recorded as a decision you made,
-  not as work completed, so it never inflates the "done" count. BackLog asks
-  **Set aside for good?** first, and it means it: **there is no undo.** The
-  card disappears and nothing in the app brings it back. The document itself is
-  left untouched in your Quarantine folder, so nothing is lost — but from there
-  it is yours to file by hand. If you are unsure, leave the card alone; it will
-  still be waiting tomorrow.
+A good subject is two to ten words and says what the document is. A good
+description is one sentence. If a correction breaks a rule, BackLog explains
+which rule.
 
-### Writing a good name
+## 5. Large backfills
 
-BackLog will reject your correction too, if it breaks a rule. The rules:
+For several thousand files:
 
-- **The date must be one that is actually on the document**, or in the file's
-  properties. If there genuinely is no date, leave it blank — BackLog will use
-  the file's own date and label it honestly rather than pretending.
-- **The subject is two to ten words**, describing what the document *is*.
-  "Acme Services Agreement", not "Scanned Document" and not "Document1".
-- **The description is one sentence.** What it is and who it is from.
+1. Add a few hundred at a time so Needs Review stays manageable.
+2. Ask the flow owner to set `manifest_emit_per_min` to 10.
+3. Leave BackLog running overnight; hiding the window is safe.
+4. Work through Needs Review in sittings. Nothing expires.
 
-If something is rejected, the message says which rule and why. Section 2 of
-`TROUBLESHOOTING.md` lists them all.
+## 6. Updates and trust
 
-## 5. The big backfill
+BackLog checks for an update at startup. Stable updates are signed with the
+Tauri updater key and are rejected if the signature does not match the public
+key already inside the app.
 
-For an initial run of several thousand files:
+That updater signature is different from Windows Authenticode signing. The
+first protects the in-app update channel; the second establishes publisher
+identity and SmartScreen reputation for the installer. BackLog v0.5.0 can have
+a valid updater signature while still showing a SmartScreen warning because a
+trusted Authenticode certificate has not yet been configured.
 
-1. Copy files into the Processing folder **in batches**, not all at once. A few
-   hundred at a time keeps the review queue a size a person can actually work
-   through.
-2. Ask whoever set up your flows to set `manifest_emit_per_min` to **10**.
-   Without it BackLog hands SharePoint work as fast as it can produce it, and
-   SharePoint starts refusing (`429`), which is slower than pacing would have
-   been. `docs/PILOT_RUNBOOK.md` covers the staged approach.
-3. Leave it running overnight. Closing the window is fine; it keeps going.
-4. Do the review queue in sittings. Nothing expires.
+An unsigned v0.5.0 build may appear as a prerelease for manual testing. It is
+not offered through the stable updater; v0.4.4 remains the stable updater until
+a correctly signed v0.5.0 release exists.
 
-## 6. When BackLog updates itself
+## Help
 
-BackLog checks for a new version when it starts. If there is one, a bar appears
-at the top offering it. Updates are cryptographically signed and BackLog will
-refuse one that is not — so if the bar appears, the update is genuine.
-
-Choosing it downloads and installs the new version and restarts BackLog. You
-can dismiss the bar and carry on; it will offer again next time.
-
-## Where things are
-
-| | |
+| Need | Read |
 |---|---|
-| Every message BackLog can show you | `TROUBLESHOOTING.md` |
-| What happens to your documents | `PRIVACY.md` |
-| For your IT department | `SECURITY.md` |
-| Setting up the two Power Automate flows | `../power-automate/FLOW1-intake.md`, `FLOW2-commit.md` |
-| Rolling this out carefully | `PILOT_RUNBOOK.md` |
-| What is not finished yet | `KNOWN_ISSUES.md` |
+| A message or blocked check | `docs/TROUBLESHOOTING.md` |
+| What happens to documents | `docs/PRIVACY.md` |
+| IT/security review | `docs/SECURITY.md` |
+| Pilot rollout | `docs/PILOT_RUNBOOK.md` |
+| Known limitations | `docs/KNOWN_ISSUES.md` |

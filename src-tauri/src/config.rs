@@ -257,7 +257,7 @@ impl Config {
             Err(_) => Self::default(),
         };
         cfg.normalize();
-        cfg.clamp_slm_parallel_to_ram();
+        cfg.clamp_resources_to_machine();
         cfg
     }
 
@@ -283,20 +283,43 @@ impl Config {
         }
     }
 
-    fn clamp_slm_parallel_to_ram(&mut self) {
-        let ceiling = default_slm_parallel();
-        if self.slm_parallel > ceiling {
+    #[cfg(test)]
+    fn clamp_resources_for_test(&mut self, gib: Option<u64>) {
+        self.slm_parallel = self.slm_parallel.min(slm_parallel_for_ram(gib));
+        self.convert_workers = self
+            .convert_workers
+            .min(convert_workers_ram_ceiling(gib))
+            .max(1);
+    }
+
+    /// Apply the machine's memory ceilings to loaded and newly submitted
+    /// settings. This is intentionally one-directional: conservative custom
+    /// values survive, while an old or imported high-memory preset is made
+    /// safe before it can start worker processes.
+    pub fn clamp_resources_to_machine(&mut self) {
+        let gib = total_ram_gib();
+        let slm_ceiling = slm_parallel_for_ram(gib);
+        if self.slm_parallel > slm_ceiling {
             log::warn!(
                 "slm_parallel {} exceeds what {} GiB of RAM supports; using {} for this run \
                  (set it explicitly lower to silence this, or see docs/SIZING.md)",
                 self.slm_parallel,
-                total_ram_gib()
-                    .map(|g| g.to_string())
+                gib.map(|g| g.to_string())
                     .unwrap_or_else(|| "an unknown amount of".into()),
-                ceiling
+                slm_ceiling
             );
-            self.slm_parallel = ceiling;
+            self.slm_parallel = slm_ceiling;
         }
+        let convert_ceiling = convert_workers_ram_ceiling(gib);
+        if self.convert_workers > convert_ceiling {
+            log::warn!(
+                "convert_workers {} exceeds this machine's safe memory budget; using {}",
+                self.convert_workers,
+                convert_ceiling
+            );
+            self.convert_workers = convert_ceiling;
+        }
+        self.convert_workers = self.convert_workers.max(1);
     }
 
     /// Clean every operator-supplied value in place. Called on load and again
@@ -315,32 +338,23 @@ impl Config {
             *dir = normalize_path(dir);
         }
         self.ettin_model_dir = normalize_path_text(&self.ettin_model_dir);
-        self.collapse_missing_escalation_model();
     }
 
-    /// Fall back to the primary weights when the escalation GGUF is not there.
+    /// Model path used for escalation attempts in this runtime.
     ///
-    /// The installer carries one model. Both GGUFs together are 2.4 GB, which
-    /// is over GitHub's per-asset ceiling and more than an 8 GB machine wants
-    /// resident anyway, so the 1.7B is an optional extra rather than a
-    /// prerequisite. Without this, its absence is not a degraded mode but a
-    /// cliff: `spawn_server` refuses a GGUF that is not a file, so the third
-    /// naming attempt fails outright and the document ends in
-    /// `SLM_FAIL:no valid output after escalation` — blaming the model for a
-    /// file that was never installed. Pointing both tiers at the same weights
-    /// keeps the escalation rung meaningful (it retries against a wider
-    /// evidence bundle, per `pipeline.rs`'s `rung`), keeps preflight's "Backup
-    /// model file is present" row honest, and lets `SlmLane::ensure_up` reuse
-    /// the running server instead of starting a second one.
-    ///
-    /// Drop the 1.7B beside the 0.6B and this stops firing on the next launch;
-    /// an explicit path that exists is always honored.
-    fn collapse_missing_escalation_model(&mut self) {
-        let escalation_missing =
-            self.slm_escalation_gguf.as_os_str().is_empty() || !self.slm_escalation_gguf.is_file();
-        if escalation_missing && self.slm_primary_gguf.is_file() {
-            self.slm_escalation_gguf = self.slm_primary_gguf.clone();
+    /// Keep the configured 1.7B path intact so Settings and the downloader
+    /// retain the operator's intent. Only the runtime model selection falls
+    /// back to the primary weights while the optional file is absent.
+    pub fn effective_escalation_gguf(&self) -> &Path {
+        if self.slm_escalation_gguf.is_file() {
+            &self.slm_escalation_gguf
+        } else {
+            &self.slm_primary_gguf
         }
+    }
+
+    pub fn using_primary_for_escalation(&self) -> bool {
+        !self.slm_escalation_gguf.is_file() && self.slm_primary_gguf.is_file()
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -576,36 +590,31 @@ mod tests {
         assert_eq!(cfg.slm_parallel, 1, "a deliberate 1 must survive on 64 GB");
     }
 
-    /// The installer ships one model; both GGUFs are 2.4 GB against GitHub's
-    /// 2 GiB asset ceiling. A missing escalation model must be a degraded mode,
-    /// not a cliff — `spawn_server` refuses a GGUF that is not a file, so
-    /// without this every third naming attempt fails outright.
     #[test]
-    fn a_missing_escalation_model_falls_back_to_the_primary() {
-        let dir = tempfile::tempdir().unwrap();
-        let primary = dir.path().join("Qwen3-0.6B-Q8_0.gguf");
-        std::fs::write(&primary, b"not really a gguf").unwrap();
+    fn an_eight_gib_machine_clamps_every_process_pool() {
+        let mut cfg = Config {
+            slm_parallel: 4,
+            convert_workers: 6,
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_test(Some(8));
+        assert_eq!(cfg.slm_parallel, 1);
+        assert_eq!(cfg.convert_workers, 2);
+    }
 
+    #[test]
+    fn normalize_preserves_missing_escalation_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary.gguf");
+        std::fs::write(&primary, b"model").unwrap();
         let mut cfg = Config {
             slm_primary_gguf: primary.clone(),
-            slm_escalation_gguf: dir.path().join("Qwen3-1.7B-Q8_0.gguf"),
+            slm_escalation_gguf: dir.path().join("missing.gguf"),
             ..Default::default()
         };
         cfg.normalize();
-        assert_eq!(
-            cfg.slm_escalation_gguf, primary,
-            "an absent escalation model must point at the primary"
-        );
-
-        // An escalation model that exists is left exactly alone.
-        let escalation = dir.path().join("Qwen3-1.7B-Q8_0.gguf");
-        std::fs::write(&escalation, b"also not really a gguf").unwrap();
-        let mut cfg = Config {
-            slm_primary_gguf: primary,
-            slm_escalation_gguf: escalation.clone(),
-            ..Default::default()
-        };
-        cfg.normalize();
-        assert_eq!(cfg.slm_escalation_gguf, escalation);
+        assert_eq!(cfg.slm_escalation_gguf, dir.path().join("missing.gguf"));
+        assert_eq!(cfg.effective_escalation_gguf(), primary.as_path());
+        assert!(cfg.using_primary_for_escalation());
     }
 }

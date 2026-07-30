@@ -58,9 +58,9 @@ try {
     if ($pyver -ne "3.11") { throw "Build venv is Python $pyver; the pinned deps require 3.11." }
     if ($bits -ne "64") { throw "Build venv is $bits-bit; a 64-bit interpreter is required." }
 
-    # 2. Install deps. Prefer uv (fast) if present, else pip. Hash-checking mode
-    #    (a lock with --hash) rejects unhashed args, so PyInstaller installs
-    #    separately.
+    # 2. Install runtime and build dependencies from separate exact locks.
+    #    Keeping PyInstaller and its helpers out of the shipped runtime lock
+    #    avoids bundling build tools while still making the freezer repeatable.
     $useUv = [bool](Get-Command uv -ErrorAction SilentlyContinue)
     $lock = Join-Path $SidecarDir "requirements.lock"
     Write-Host "Installing sidecar dependencies..." -ForegroundColor Cyan
@@ -85,9 +85,15 @@ try {
         & $VenvPy -m pip freeze | Out-File -Encoding utf8 $lock
         Write-Host "Wrote reproducible lock: $lock" -ForegroundColor Green
     }
-    if ($useUv) { uv pip install --python $VenvPy "pyinstaller>=6.11,<7" }
-    else { & $VenvPy -m pip install "pyinstaller>=6.11,<7" }
-    if ($LASTEXITCODE -ne 0) { throw "PyInstaller install failed." }
+    $buildLock = Join-Path $SidecarDir "build-requirements.lock"
+    if (-not (Test-Path $buildLock)) {
+        throw "Build dependency lock is missing: $buildLock"
+    }
+    if ($useUv) { uv pip install --python $VenvPy -r $buildLock }
+    else { & $VenvPy -m pip install -r $buildLock }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Build dependency install from $buildLock failed."
+    }
 
     # 3. Freeze convertd.py. --collect-all pulls the data files PyInstaller
     #    otherwise misses (model loaders, native libs, version metadata).

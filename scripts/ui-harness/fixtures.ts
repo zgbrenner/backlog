@@ -74,6 +74,23 @@ const READY_RUNTIME = {
   problems: [] as unknown[],
 };
 
+/** Normal installed state: the bundled primary works, while the optional
+ * backup model has not been fetched yet. */
+const OPTIONAL_MODEL_RUNTIME = {
+  ...READY_RUNTIME,
+  escalation_model_found: false,
+  problems: [
+    {
+      field: "slm_escalation_gguf",
+      code: "escalation_model_missing_using_primary",
+      message: "The optional backup model is not installed. BackLog is ready to work using the everyday model for backup naming attempts.",
+      detail: null,
+      severity: "warning",
+      action: "download_models",
+    },
+  ],
+};
+
 // Codes and the `detail` / `action` fields are exactly what preflight.rs emits.
 const BLOCKED_RUNTIME = {
   ...READY_RUNTIME,
@@ -438,7 +455,7 @@ const EVENTS_BY_SHA: Record<string, Event[]> = {
 };
 
 const DIAGNOSTICS = {
-  app_version: "0.2.0",
+  app_version: "0.5.0",
   platform: "windows x86_64",
   sidecar_versions: {
     convertd: "0.4.1",
@@ -453,7 +470,7 @@ const DIAGNOSTICS = {
  *  `sidecar_versions.error`. get_diagnostics has no failure path that rejects,
  *  so a fixture that threw was evidence of an unreachable state. */
 const DIAGNOSTICS_NO_SIDECAR = {
-  app_version: "0.2.0",
+  app_version: "0.5.0",
   platform: "windows x86_64",
   sidecar_versions: { error: "convertd is not installed" },
 };
@@ -522,6 +539,9 @@ function base(runtime: unknown, stats: unknown, jobs: Job[], flagged: Job[]): Co
     create_missing_dir: null,
     open_logs_folder: null,
     download_models: null,
+    // The backend keeps the latest terminal result so Settings can recover a
+    // completion, failure, or cancellation after navigation.
+    model_download_status: null,
     get_diagnostics: DIAGNOSTICS,
     get_events: eventsFor,
     get_evidence: evidenceFor,
@@ -631,6 +651,58 @@ function reviewScale(count: number): Scenario {
   };
 }
 
+/** A reason beyond the old first 25 rows catches client-only review filtering. */
+function reviewReasons(): Scenario {
+  const rows: Job[] = Array.from({ length: 30 }, (_, i) =>
+    job({
+      sha256: ("e" + i.toString(16)).padStart(64, "0"),
+      original_name: `reason-${String(i).padStart(2, "0")}.pdf`,
+      state: "flagged",
+      flag_reason: i === 29 ? "ENCRYPTED:password protected" : "BAD_SUBJECT:generic subject",
+      quarantine_path: `C:\\ProgramData\\BackLog\\Quarantine\\reason-${String(i).padStart(2, "0")}.pdf`,
+      proposed_subject: "Document",
+      final_filename: null,
+    })
+  );
+  return scenario("Review reason beyond initial page", READY_RUNTIME, { emitted: 12, flagged: 30 }, [], rows, {
+    view: "flagged",
+  });
+}
+
+/** A true caught-up queue has only completed history, and its history matches
+ * the counters shown in the header rather than pretending the ledger is empty. */
+function caughtUpHistory(): Job[] {
+  return Array.from({ length: 22 }, (_, i) => {
+    const flagged = i >= 18;
+    const suffix = i.toString(16).padStart(2, "0");
+    return job({
+      sha256: (flagged ? "8" : "7").repeat(62) + suffix,
+      original_name: flagged ? `needs-a-person-${i - 17}.pdf` : `filed-invoice-${i + 1}.pdf`,
+      state: flagged ? "flagged" : "emitted",
+      flag_reason: flagged ? "BAD_SUBJECT:generic subject" : null,
+      quarantine_path: flagged ? `C:\\ProgramData\\BackLog\\Quarantine\\needs-a-person-${i - 17}.pdf` : null,
+    });
+  });
+}
+
+/** Cancellation rejects the active command before the terminal event reaches
+ * the page, the ordering that used to turn a normal cancellation into a toast. */
+function cancellingDownloadScenario(): Scenario {
+  let rejectDownload: ((reason?: unknown) => void) | null = null;
+  const s = scenario("Cancelling model download", BLOCKED_RUNTIME, STATS_EMPTY, [], []);
+  return {
+    ...s,
+    commands: {
+      ...s.commands,
+      download_models: () => new Promise<void>((_resolve, reject) => { rejectDownload = reject; }),
+      cancel_model_download: () => {
+        rejectDownload?.(new Error("Download cancelled."));
+        return null;
+      },
+    },
+  };
+}
+
 export const SCENARIOS: Record<string, Scenario> = {
   /** Steady state: configured, preflight green, a real queue behind it. */
   ready: scenario("Ready, queue populated", READY_RUNTIME, STATS_BUSY, QUEUE, FLAGGED),
@@ -645,6 +717,29 @@ export const SCENARIOS: Record<string, Scenario> = {
       // behind the version line fails — but the command itself still succeeds
       // and reports the app version, which is the line the pilot runbook asks
       // the operator to read off this very screen.
+      get_diagnostics: DIAGNOSTICS_NO_SIDECAR,
+    },
+  },
+
+  /** First-run save action: folders are chosen but have not reached disk. */
+  "first-run-save": {
+    ...scenario("First run, save folders then check", UNCHECKED_RUNTIME, STATS_EMPTY, [], []),
+    commands: {
+      ...withFlaggedCount(base(UNCHECKED_RUNTIME, STATS_EMPTY, [], []), [], []),
+      get_config: EMPTY_CONFIG,
+      set_config: null,
+      run_preflight: BLOCKED_RUNTIME,
+      get_diagnostics: DIAGNOSTICS_NO_SIDECAR,
+    },
+  },
+
+  "first-run-preflight-error": {
+    ...scenario("First run, live check unavailable", UNCHECKED_RUNTIME, STATS_EMPTY, [], []),
+    commands: {
+      ...withFlaggedCount(base(UNCHECKED_RUNTIME, STATS_EMPTY, [], []), [], []),
+      get_config: EMPTY_CONFIG,
+      set_config: null,
+      run_preflight: () => new Error("the readiness check could not reach BackLog"),
       get_diagnostics: DIAGNOSTICS_NO_SIDECAR,
     },
   },
@@ -699,6 +794,63 @@ export const SCENARIOS: Record<string, Scenario> = {
       download_models: () => new Promise(() => {}),
     },
   },
+
+  "download-cancelling": cancellingDownloadScenario(),
+
+  /** A cancelled transfer must be safe to pick up from its retained .part files. */
+  "download-cancelled": {
+    ...scenario("Model download cancelled", BLOCKED_RUNTIME, STATS_EMPTY, [], []),
+    commands: {
+      ...withFlaggedCount(base(BLOCKED_RUNTIME, STATS_EMPTY, [], []), [], []),
+      model_download_status: {
+        ok: false, cancelled: true, error: null, finished_at: "2026-07-30T18:00:00Z",
+      },
+    },
+  },
+
+  /** A transient transfer failure must expose the same resumable path. */
+  "download-failed": {
+    ...scenario("Model download failed", BLOCKED_RUNTIME, STATS_EMPTY, [], []),
+    commands: {
+      ...withFlaggedCount(base(BLOCKED_RUNTIME, STATS_EMPTY, [], []), [], []),
+      model_download_status: {
+        ok: false, cancelled: false, error: "The network connection stopped.", finished_at: "2026-07-30T18:00:00Z",
+      },
+    },
+  },
+
+  /** A terminal success remains visible after leaving and returning to Settings. */
+  "download-completed": {
+    ...scenario("Model download completed", OPTIONAL_MODEL_RUNTIME, STATS_EMPTY, [], []),
+    commands: {
+      ...withFlaggedCount(base(OPTIONAL_MODEL_RUNTIME, STATS_EMPTY, [], []), [], []),
+      // Opening Settings restores the retained completion and must run a live
+      // check that discovers the newly installed backup model.
+      run_preflight: READY_RUNTIME,
+      model_download_status: {
+        ok: true, cancelled: false, error: null, finished_at: "2026-07-30T18:00:00Z",
+      },
+    },
+  },
+
+  "optional-backup-model": scenario(
+    "Bundled primary with optional backup missing",
+    OPTIONAL_MODEL_RUNTIME,
+    STATS_EMPTY,
+    [],
+    []
+  ),
+
+  /** Processing has no work, but a reviewer still has documents to resolve. */
+  "caught-up-reviews": scenario(
+    "Processing caught up with reviews remaining",
+    READY_RUNTIME,
+    { emitted: 18, flagged: 4, per_hour: 0 },
+    caughtUpHistory(),
+    FLAGGED
+  ),
+
+  "review-reasons": reviewReasons(),
 
   /** The evidence pane and the per-attempt diagnosis, both expanded. */
   "review-detail": reviewScenario("Review card, everything expanded", { ...STATS_BUSY, flagged: 4 }),
