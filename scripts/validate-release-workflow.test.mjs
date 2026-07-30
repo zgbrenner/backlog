@@ -55,6 +55,11 @@ jobs:
           Invoke-WebRequest -Uri "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm.zip"
           Get-FileHash nasm.zip
           Expand-Archive nasm.zip
+          $actualPerl = perl --version
+          $perlExit = $LASTEXITCODE
+          $perlText = $actualPerl -join "\`n"
+          if ($perlExit -ne 0 -or $perlText -notmatch "built for MSWin32-x64") { throw "native Perl is unavailable" }
+          $actualPerl | Select-Object -First 2
       - name: Install locked dependencies
         run: npm ci
       - name: Validate frontend
@@ -308,6 +313,20 @@ test("a changed NASM hash is rejected", () => {
   assert.match(
     validateReleaseWorkflow(changed, validStageScript).join("\n"),
     /exact NASM archive/,
+  );
+});
+
+test("Perl version output must be captured before it is shortened for display", () => {
+  const brokenPipe = validWorkflow
+    .replace("          $actualPerl = perl --version\n", "")
+    .replace("          $perlExit = $LASTEXITCODE\n", "")
+    .replace(
+      "          $actualPerl | Select-Object -First 2\n",
+      "          perl --version | Select-Object -First 2\n",
+    );
+  assert.match(
+    validateReleaseWorkflow(brokenPipe, validStageScript).join("\n"),
+    /without truncating the live process output/,
   );
 });
 
