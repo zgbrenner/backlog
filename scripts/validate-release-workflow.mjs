@@ -302,6 +302,10 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     const tagChecks = [...run.matchAll(/assert-release-tag\.ps1/g)].map(
       (match) => match.index,
     );
+    const prePublicationCheck = tagChecks.some(
+      (index) => index > finalAssetCheck && index < edit,
+    );
+    const postPublicationCheck = tagChecks.some((index) => index > edit);
     if (
       !run.includes("--json isDraft,name") ||
       modeCheck < 0 ||
@@ -313,13 +317,13 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
       );
     }
     if (
-      tagChecks.length < 2 ||
+      tagChecks.length < 3 ||
       tagChecks[0] > upload ||
-      tagChecks.at(-1) < finalAssetCheck ||
-      tagChecks.at(-1) > edit
+      !prePublicationCheck ||
+      !postPublicationCheck
     ) {
       problems.push(
-        `${expectedName} retries must recheck the release tag target before mutation and publication`,
+        `${expectedName} retries must recheck the release target before mutation, before publication, and after publication`,
       );
     }
   };
@@ -396,10 +400,36 @@ export function validateRustToolchain(toolchainSource) {
   return [];
 }
 
+export function validateReleaseTargetGuard(guardSource) {
+  const problems = [];
+  for (const required of [
+    "$tagExit = $LASTEXITCODE",
+    "$tagExit -eq 0",
+    "$tagExit -ne 2",
+    "--json isDraft,tagName,targetCommitish",
+    "$draft.isDraft",
+    "$draft.tagName -ne $Tag",
+    "$draft.targetCommitish.ToLowerInvariant()",
+    "$ExpectedSha.ToLowerInvariant()",
+  ]) {
+    if (!guardSource.includes(required)) {
+      problems.push(
+        "release target guard must verify either the real tag or an exact-SHA GitHub draft",
+      );
+      break;
+    }
+  }
+  return problems;
+}
+
 function runCli() {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const workflow = readFileSync(path.join(root, ".github/workflows/release.yml"), "utf8");
   const stage = readFileSync(path.join(root, "scripts/stage-release-inputs.ps1"), "utf8");
+  const targetGuard = readFileSync(
+    path.join(root, "scripts/assert-release-tag.ps1"),
+    "utf8",
+  );
   const buildScript = readFileSync(path.join(root, "scripts/build-sidecar.ps1"), "utf8");
   const buildLock = readFileSync(
     path.join(root, "sidecar/build-requirements.lock"),
@@ -410,6 +440,7 @@ function runCli() {
     ...validateReleaseWorkflow(workflow, stage),
     ...validateBuildDependencyLock(buildScript, buildLock),
     ...validateRustToolchain(toolchain),
+    ...validateReleaseTargetGuard(targetGuard),
   ];
   if (problems.length) {
     console.error("Release workflow contract is broken:");

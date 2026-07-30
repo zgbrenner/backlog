@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   validateBuildDependencyLock,
   validateReleaseWorkflow,
+  validateReleaseTargetGuard,
   validateRustToolchain,
 } from "./validate-release-workflow.mjs";
 
@@ -108,6 +109,7 @@ jobs:
           Compare-Object $expected $actual
           ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
           gh release edit "$tag" --draft=false --latest
+          ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
       - name: Publish unsigned prerelease
         if: steps.release-mode.outputs.signed == 'false'
         run: |
@@ -120,6 +122,7 @@ jobs:
           Compare-Object $expected $actual
           ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
           gh release edit "$tag" --draft=false --prerelease
+          ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
 `;
 
 const validStageScript = `
@@ -244,7 +247,7 @@ test("the tag target must be rechecked before retry mutation and publication", (
   );
   assert.match(
     validateReleaseWorkflow(unchecked, validStageScript).join("\n"),
-    /recheck the release tag target/,
+    /recheck the release target/,
   );
 });
 
@@ -256,7 +259,23 @@ test("branch-local tag checks cannot replace the final pre-publication check", (
   );
   assert.match(
     validateReleaseWorkflow(noFinalCheck, validStageScript).join("\n"),
-    /recheck the release tag target/,
+    /recheck the release target/,
+  );
+});
+
+test("the published tag must be checked after the draft becomes visible", () => {
+  const noPublishedTagCheck = validWorkflow.replaceAll(
+    "          gh release edit \"$tag\" --draft=false --latest\n" +
+      '          ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"\n',
+    "          gh release edit \"$tag\" --draft=false --latest\n",
+  ).replaceAll(
+    "          gh release edit \"$tag\" --draft=false --prerelease\n" +
+      '          ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"\n',
+    "          gh release edit \"$tag\" --draft=false --prerelease\n",
+  );
+  assert.match(
+    validateReleaseWorkflow(noPublishedTagCheck, validStageScript).join("\n"),
+    /after publication/,
   );
 });
 
@@ -374,5 +393,35 @@ test("the Rust compiler is pinned through the patch version", () => {
   assert.match(
     validateRustToolchain('channel = "1.94"').join("\n"),
     /major\.minor\.patch/,
+  );
+});
+
+const validReleaseTargetGuard = `
+$rows = @(& git ls-remote --exit-code --tags origin $baseRef $peeledRef)
+$tagExit = $LASTEXITCODE
+if ($tagExit -eq 0) {
+  if ($resolved.Sha.ToLowerInvariant() -ne $ExpectedSha.ToLowerInvariant()) { throw "wrong tag" }
+  return
+}
+if ($tagExit -ne 2) { throw "tag lookup failed" }
+$draftJson = & gh release view $Tag --json isDraft,tagName,targetCommitish
+$draft = $draftJson | ConvertFrom-Json
+if (-not $draft.isDraft) { throw "not a draft" }
+if ($draft.tagName -ne $Tag) { throw "wrong tag name" }
+if ($draft.targetCommitish.ToLowerInvariant() -ne $ExpectedSha.ToLowerInvariant()) { throw "wrong target" }
+`;
+
+test("the release target guard accepts the real tag or an exact-SHA draft", () => {
+  assert.deepEqual(validateReleaseTargetGuard(validReleaseTargetGuard), []);
+});
+
+test("a draft target that is not compared with the tested SHA is rejected", () => {
+  const driftingDraft = validReleaseTargetGuard.replace(
+    "$draft.targetCommitish.ToLowerInvariant()",
+    "$draft.name",
+  );
+  assert.match(
+    validateReleaseTargetGuard(driftingDraft).join("\n"),
+    /real tag or an exact-SHA GitHub draft/,
   );
 });
