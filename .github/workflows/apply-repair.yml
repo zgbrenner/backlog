@@ -1,4 +1,4 @@
-name: Apply semantic trace lifecycle contract
+name: Apply reversible evidence trace lifecycle
 
 on:
   pull_request:
@@ -19,21 +19,26 @@ jobs:
         with:
           ref: feature/semantic-evidence-v0.6.0
           fetch-depth: 0
-      - name: Apply tested repair and trace contract once
+      - name: Apply tested trace lifecycle once
         shell: bash
         run: |
           set -euo pipefail
-          if grep -q 'evidence_trace_round_trips_and_metric_event_contains_no_source_text' src-tauri/src/pipeline.rs && \
-             grep -q 'CARGO_MANIFEST_DIR' .github/scripts/check-troubleshooting-coverage.mjs; then
-            echo 'Repair and trace contract are already present.'
+          if grep -q 'fn write_evidence_trace' src-tauri/src/pipeline.rs && \
+             grep -q 'TRACE_WRITE_FAILED' docs/TROUBLESHOOTING.md; then
+            echo 'Reversible evidence trace lifecycle is already present.'
             exit 0
           fi
-          encoded="$RUNNER_TEMP/repair.patch.xz.b64"
-          patch="$RUNNER_TEMP/repair.patch"
+          encoded="$RUNNER_TEMP/trace.patch.xz.b64"
+          patch="$RUNNER_TEMP/trace.patch"
           cat .github/.repair-payload/part-* | tr -d '\r\n' > "$encoded"
           base64 --decode "$encoded" | xz --decompress > "$patch"
-          echo "373f2b39c38090c257908e546c5d2135ffc9f293687f52dc8c7bfd14c44c6f68  $patch" | sha256sum --check --strict
+          echo "9fadc819d1e382424dbfe7bbd449ce03ce1bca660a0ce19b31ac99b7c3a3abfd  $patch" | sha256sum --check --strict
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git am "$patch"
+          cargo fmt --all --manifest-path src-tauri/Cargo.toml
+          if ! git diff --quiet; then
+            git add src-tauri/src/pipeline.rs
+            git commit --amend --no-edit
+          fi
           git push origin HEAD:feature/semantic-evidence-v0.6.0
