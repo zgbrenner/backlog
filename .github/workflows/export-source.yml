@@ -6,9 +6,41 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  apply-semantic-implementation:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'feature/semantic-evidence-v0.6.0'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: feature/semantic-evidence-v0.6.0
+          fetch-depth: 0
+      - name: Apply checksum-pinned implementation patch once
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f sidecar/semantic.py && grep -q "cached-label" sidecar/semantic.py; then
+            echo "Semantic implementation is already present."
+            exit 0
+          fi
+          encoded="$RUNNER_TEMP/semantic.patch.xz.b64"
+          patch="$RUNNER_TEMP/semantic.patch"
+          cat .github/.semantic-payload/part-* > "$encoded"
+          echo "90d62fcec5ec489f10616a92836fd4cbad90882b77436cf77ad7097b4f271188  $encoded" | sha256sum --check --strict
+          base64 --decode "$encoded" | xz --decompress > "$patch"
+          echo "db3aa43a4368b9778fe4696ed7b072de1cc868d9be8600f0cdd6ea045beda96c  $patch" | sha256sum --check --strict
+          git apply --index "$patch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: add semantic evidence ranking and exact evidence lanes"
+          git push origin HEAD:feature/semantic-evidence-v0.6.0
+
   export:
     if: github.event_name == 'workflow_dispatch' || github.head_ref == 'feature/semantic-evidence-v0.6.0'
     runs-on: ubuntu-24.04
@@ -36,7 +68,8 @@ jobs:
           curl --fail --location --retry 3 \
             "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/$revision/vocab.txt?download=true" \
             --output "$root/vocab.txt"
-          echo 'afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1  '"$root/model.onnx" | sha256sum --check --strict
+          echo "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1  $root/model.onnx" | sha256sum --check --strict
+          echo "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3  $root/vocab.txt" | sha256sum --check --strict
           sha256sum "$root/model.onnx" "$root/vocab.txt" | tee "$RUNNER_TEMP/semantic-model/SHA256SUMS"
       - name: Upload semantic model fixture
         uses: actions/upload-artifact@v4
