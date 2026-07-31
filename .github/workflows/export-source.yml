@@ -23,3 +23,25 @@ jobs:
           path: ${{ runner.temp }}/backlog-source.tar.gz
           if-no-files-found: error
           retention-days: 1
+      - name: Fetch pinned semantic model fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision=751bff37182d3f1213fa05d7196b954e230abad9
+          root="$RUNNER_TEMP/semantic-model/all-MiniLM-L6-v2"
+          mkdir -p "$root"
+          curl --fail --location --retry 3 \
+            "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/$revision/onnx/model_quantized.onnx?download=true" \
+            --output "$root/model.onnx"
+          curl --fail --location --retry 3 \
+            "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/$revision/vocab.txt?download=true" \
+            --output "$root/vocab.txt"
+          echo 'afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1  '"$root/model.onnx" | sha256sum --check --strict
+          sha256sum "$root/model.onnx" "$root/vocab.txt" | tee "$RUNNER_TEMP/semantic-model/SHA256SUMS"
+      - name: Upload semantic model fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-model-fixture
+          path: ${{ runner.temp }}/semantic-model
+          if-no-files-found: error
+          retention-days: 1
