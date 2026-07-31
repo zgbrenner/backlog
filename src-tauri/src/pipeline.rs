@@ -12,6 +12,7 @@ use crate::sidecar::{ConvertResult, Sidecar};
 use crate::slm::{SlmLane, Tier};
 use serde_json::json;
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -606,6 +607,32 @@ impl Pipeline {
             }
         };
         let ev = filtered.evidence;
+
+        // The transformed SLM input is only trustworthy when the exact
+        // selection trace is durable beside the cached source Markdown. The
+        // ledger deliberately receives metrics only, because its audit trail
+        // is long-lived and must not become a second store of document text.
+        if let Err(error) = write_evidence_trace(&self.cfg.cache_dir, &sha, &ev.trace) {
+            log::error!("could not persist evidence trace for {sha}: {error:#}");
+            self.flag(
+                &sha,
+                &path,
+                "TRACE_WRITE_FAILED:evidence trace could not be saved".into(),
+                &clock,
+            )
+            .await;
+            return;
+        }
+        if let Err(error) =
+            self.ledger
+                .log_event(&sha, "evidence", &evidence_metric_detail(&ev.trace))
+        {
+            // The source-bearing trace is already durable, so a transient
+            // ledger event failure must not discard an otherwise reviewable
+            // document. The full failure remains in the application log.
+            log::warn!("could not record evidence metrics for {sha}: {error}");
+        }
+
         // doc_type stays NULL when no classifier ran: the torch-free profile's
         // fallback label is a constant, and writing it would put a fabricated
         // classification into every row of the SharePoint DocumentIndex.
@@ -1499,9 +1526,125 @@ impl Pipeline {
         if self.cfg.retain_cache {
             return;
         }
-        let cache = self.cfg.cache_dir.join(format!("{sha}.md"));
-        let _ = std::fs::remove_file(cache);
+        purge_cache_artifacts(&self.cfg.cache_dir, sha);
     }
+}
+
+fn evidence_trace_path(cache_dir: &Path, sha: &str) -> PathBuf {
+    cache_dir.join(format!("{sha}.evidence.json"))
+}
+
+/// Persist the reversible evidence-selection trace without ever exposing it to
+/// a partially written final path. The trace contains exact source text, so it
+/// follows the same retention lifecycle as the cached Markdown.
+fn write_evidence_trace(
+    cache_dir: &Path,
+    sha: &str,
+    trace: &filter::EvidenceTrace,
+) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(cache_dir)?;
+
+    let final_path = evidence_trace_path(cache_dir, sha);
+    let backup_path = cache_dir.join(format!("{sha}.evidence.json.bak"));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path = cache_dir.join(format!(
+        ".{sha}.evidence.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ));
+
+    let mut encoded = serde_json::to_vec_pretty(trace)?;
+    encoded.push(b'\n');
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(&encoded)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    // Windows rename does not replace an existing file. Move the previous
+    // complete trace aside first, then restore it if the final rename fails.
+    let had_previous = final_path.exists();
+    if had_previous {
+        let _ = std::fs::remove_file(&backup_path);
+        if let Err(error) = std::fs::rename(&final_path, &backup_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error.into());
+        }
+    }
+
+    if let Err(error) = std::fs::rename(&temp_path, &final_path) {
+        if had_previous {
+            let _ = std::fs::rename(&backup_path, &final_path);
+        }
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    if had_previous {
+        let _ = std::fs::remove_file(&backup_path);
+    }
+    Ok(final_path)
+}
+
+/// Source-free summary suitable for the encrypted ledger. Exact paragraphs,
+/// entities, names, and document identifiers remain only in the cache trace.
+fn evidence_metric_detail(trace: &filter::EvidenceTrace) -> String {
+    let compression = &trace.compression;
+    let savings_permille = if compression.source_chars == 0 {
+        0
+    } else {
+        compression
+            .saved_chars
+            .saturating_mul(1_000)
+            .saturating_div(compression.source_chars)
+    };
+    format!(
+        "routing={};source_chars={};bundle_chars={};saved_chars={};\
+         savings_permille={};paragraphs={}/{};semantic={};entities={}",
+        trace.routing,
+        compression.source_chars,
+        compression.bundle_chars,
+        compression.saved_chars,
+        savings_permille,
+        trace.selected_paragraphs,
+        trace.source_paragraphs,
+        trace.semantic_available,
+        trace.entity_available,
+    )
+}
+
+fn purge_cache_artifacts(cache_dir: &Path, sha: &str) {
+    for path in [
+        cache_dir.join(format!("{sha}.md")),
+        evidence_trace_path(cache_dir, sha),
+        cache_dir.join(format!("{sha}.evidence.json.bak")),
+    ] {
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "could not remove cache artifact {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+fn cache_artifact_sha(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_suffix(".evidence.json")
+        .or_else(|| name.strip_suffix(".md"))
 }
 
 pub fn hash_file(path: &Path) -> anyhow::Result<String> {
@@ -1535,7 +1678,7 @@ pub fn reconcile_terminal_manifests(cfg: &Config, ledger: &Ledger) -> anyhow::Re
             reconcile_terminal_manifest(&manifests_dir, ledger, &job, &original_relpath)?
         {
             if target == JobState::Emitted && !cfg.retain_cache {
-                let _ = std::fs::remove_file(cfg.cache_dir.join(format!("{}.md", job.sha256)));
+                purge_cache_artifacts(&cfg.cache_dir, &job.sha256);
             }
             recovered += 1;
         }
@@ -1631,29 +1774,36 @@ pub fn sweep_cache_with_ledger(cache_dir: &Path, ttl_days: u64, ledger: &Ledger)
     )) else {
         return;
     };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) != Some("md") {
-            continue;
-        }
-        let Some(sha) = p.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
+    let artifact_shas: HashSet<String> = entries
+        .flatten()
+        .filter_map(|entry| cache_artifact_sha(&entry.path()).map(str::to_owned))
+        .collect();
+
+    for sha in artifact_shas {
         // Anything the ledger still has an unresolved row for is evidence a
         // human is (or will be) looking at. An error reading the ledger fails
         // closed the same way.
-        match ledger.job_state(sha) {
+        match ledger.job_state(&sha) {
             Ok(Some(state)) if !state.is_resolved() => continue,
-            Err(e) => {
-                log::warn!("cache sweep skipping {sha}: ledger read failed: {e}");
+            Err(error) => {
+                log::warn!("cache sweep skipping {sha}: ledger read failed: {error}");
                 continue;
             }
             _ => {}
         }
-        if let Ok(modified) = e.metadata().and_then(|m| m.modified()) {
-            if modified < cutoff {
-                let _ = std::fs::remove_file(&p);
-            }
+
+        let artifacts = [
+            cache_dir.join(format!("{sha}.md")),
+            evidence_trace_path(cache_dir, &sha),
+        ];
+        let any_fresh = artifacts.iter().any(|path| {
+            path.metadata()
+                .and_then(|metadata| metadata.modified())
+                .map(|modified| modified >= cutoff)
+                .unwrap_or(false)
+        });
+        if !any_fresh {
+            purge_cache_artifacts(cache_dir, &sha);
         }
     }
 }
@@ -3011,15 +3161,17 @@ server.serve_forever()
             saved_chars: 600,
             savings_ratio: 0.6,
         };
-        trace.ranked_paragraphs.push(crate::sidecar::RankedParagraph {
-            index: 7,
-            text: "Alice Example signed the confidential agreement".into(),
-            start_char: 80,
-            end_char: 127,
-            score: 0.91,
-            probe: "parties to this document".into(),
-            rank: 0,
-        });
+        trace
+            .ranked_paragraphs
+            .push(crate::sidecar::RankedParagraph {
+                index: 7,
+                text: "Alice Example signed the confidential agreement".into(),
+                start_char: 80,
+                end_char: 127,
+                score: 0.91,
+                probe: "parties to this document".into(),
+                rank: 0,
+            });
         trace.entities.push(crate::sidecar::EntitySpan {
             label: "PERSON".into(),
             text: "Alice Example".into(),
@@ -3042,6 +3194,19 @@ server.serve_forever()
         assert_eq!(stored["ranked_paragraphs"][0]["index"], 7);
         assert_eq!(stored["entities"][0]["text"], "Alice Example");
 
+        trace.routing = "bypass_source_fits".into();
+        write_evidence_trace(dir.path(), "abc123", &trace).unwrap();
+        let replaced: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("abc123.evidence.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replaced["routing"], "bypass_source_fits");
+        assert!(
+            !dir.path().join("abc123.evidence.json.bak").exists(),
+            "a successful replacement must not retain a second source-text copy"
+        );
+
+        trace.routing = "semantic".into();
         let metric = evidence_metric_detail(&trace);
         assert!(metric.contains("routing=semantic"));
         assert!(metric.contains("source_chars=1000"));
@@ -3064,6 +3229,19 @@ server.serve_forever()
 
         assert!(!dir.path().join("abc.md").exists());
         assert!(!dir.path().join("abc.evidence.json").exists());
+    }
+
+    #[test]
+    fn cache_retention_preserves_markdown_and_trace_together() {
+        let h = Harness::with(|cfg| cfg.retain_cache = true);
+        let cache = &h.pipeline.cfg.cache_dir;
+        std::fs::write(cache.join("abc.md"), "raw document text").unwrap();
+        std::fs::write(cache.join("abc.evidence.json"), "{}").unwrap();
+
+        h.pipeline.purge_cache("abc");
+
+        assert!(cache.join("abc.md").exists());
+        assert!(cache.join("abc.evidence.json").exists());
     }
 
     /// P7: the sweep used to delete every cache entry past its TTL on mtime
