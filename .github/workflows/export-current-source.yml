@@ -1,4 +1,4 @@
-name: Export current source snapshot
+name: Export current repository snapshot
 
 on:
   pull_request:
@@ -14,11 +14,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Archive exact source
-        run: tar --exclude=.git -czf "$RUNNER_TEMP/backlog-current-source.tar.gz" .
+        with:
+          ref: feature/semantic-evidence-v0.6.0
+          fetch-depth: 0
+      - name: Bundle exact Git history
+        shell: bash
+        run: git bundle create "$RUNNER_TEMP/backlog-current.bundle" HEAD
       - uses: actions/upload-artifact@v4
         with:
-          name: backlog-current-source
-          path: ${{ runner.temp }}/backlog-current-source.tar.gz
+          name: backlog-current-repository
+          path: ${{ runner.temp }}/backlog-current.bundle
           if-no-files-found: error
           retention-days: 1
