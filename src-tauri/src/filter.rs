@@ -1187,19 +1187,6 @@ fn truncate_to_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// The largest UTF-8 byte boundary at or below `i`. Retained for callers that
-/// must cut a byte buffer; evidence assembly itself now budgets Unicode
-/// characters directly.
-pub(crate) fn floor_char_boundary(s: &str, mut i: usize) -> usize {
-    if i >= s.len() {
-        return s.len();
-    }
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

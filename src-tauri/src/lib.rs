@@ -2477,21 +2477,30 @@ mod tests {
         );
     }
 
-    /// A hung or quarantined convertd must cost an approval seconds, not the
-    /// 45-second per-request timeout the running pipeline uses.
+    /// Review-time provenance probes use the same bounded cold-start allowance
+    /// as Settings preflight: configured timeout, clamped to 1..=60 seconds.
     #[test]
-    fn the_review_path_probes_convertd_on_the_short_preflight_bound() {
-        let cfg = Config {
-            sidecar_timeout_secs: 45,
-            ..Default::default()
-        };
-        assert_eq!(review_probe_timeout(&cfg), Duration::from_secs(5));
+    fn the_review_path_tracks_the_bounded_preflight_timeout() {
+        assert_eq!(
+            review_probe_timeout(&Config {
+                sidecar_timeout_secs: 45,
+                ..Default::default()
+            }),
+            Duration::from_secs(45)
+        );
         assert_eq!(
             review_probe_timeout(&Config {
                 sidecar_timeout_secs: 0,
                 ..Default::default()
             }),
             Duration::from_secs(1)
+        );
+        assert_eq!(
+            review_probe_timeout(&Config {
+                sidecar_timeout_secs: 300,
+                ..Default::default()
+            }),
+            Duration::from_secs(60)
         );
     }
 }

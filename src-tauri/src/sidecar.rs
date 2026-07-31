@@ -769,26 +769,6 @@ impl Sidecar {
         ))
     }
 
-    pub fn salience(
-        &self,
-        sentences: &[String],
-        probes: &[String],
-        top_k: usize,
-    ) -> anyhow::Result<Vec<usize>> {
-        let v = self.call(
-            "salience",
-            serde_json::json!({ "sentences": sentences, "probes": probes, "top_k": top_k }),
-        )?;
-        Ok(v["indices"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_u64().map(|u| u as usize))
-                    .collect()
-            })
-            .unwrap_or_default())
-    }
-
     pub fn rank_paragraphs(
         &self,
         paragraphs: &[SourceParagraph],

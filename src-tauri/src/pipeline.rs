@@ -2994,6 +2994,78 @@ server.serve_forever()
         assert!(!path.exists(), "the document must stay in quarantine");
     }
 
+    #[test]
+    fn evidence_trace_round_trips_and_metric_event_contains_no_source_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trace = filter::EvidenceTrace::default();
+        trace.routing = "semantic".into();
+        trace.semantic_available = true;
+        trace.entity_available = true;
+        trace.source_paragraphs = 10;
+        trace.selected_paragraphs = 3;
+        trace.compression = filter::CompressionMetrics {
+            source_chars: 1_000,
+            source_tokens_approx: 250,
+            bundle_chars: 400,
+            bundle_tokens_approx: 100,
+            saved_chars: 600,
+            savings_ratio: 0.6,
+        };
+        trace.ranked_paragraphs.push(crate::sidecar::RankedParagraph {
+            index: 7,
+            text: "Alice Example signed the confidential agreement".into(),
+            start_char: 80,
+            end_char: 127,
+            score: 0.91,
+            probe: "parties to this document".into(),
+            rank: 0,
+        });
+        trace.entities.push(crate::sidecar::EntitySpan {
+            label: "PERSON".into(),
+            text: "Alice Example".into(),
+            score: 0.95,
+            paragraph_index: 7,
+            start_char: 80,
+            end_char: 93,
+            iso: None,
+        });
+
+        let path = write_evidence_trace(dir.path(), "abc123", &trace).unwrap();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("abc123.evidence.json")
+        );
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored["routing"], "semantic");
+        assert_eq!(stored["compression"]["saved_chars"], 600);
+        assert_eq!(stored["ranked_paragraphs"][0]["index"], 7);
+        assert_eq!(stored["entities"][0]["text"], "Alice Example");
+
+        let metric = evidence_metric_detail(&trace);
+        assert!(metric.contains("routing=semantic"));
+        assert!(metric.contains("source_chars=1000"));
+        assert!(metric.contains("bundle_chars=400"));
+        assert!(metric.contains("savings_permille=600"));
+        assert!(metric.contains("paragraphs=3/10"));
+        assert!(
+            !metric.contains("Alice") && !metric.contains("confidential agreement"),
+            "the encrypted ledger event must contain metrics, never source text"
+        );
+    }
+
+    #[test]
+    fn cache_purge_removes_markdown_and_trace_together() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("abc.md"), "raw document text").unwrap();
+        std::fs::write(dir.path().join("abc.evidence.json"), "{}").unwrap();
+
+        purge_cache_artifacts(dir.path(), "abc");
+
+        assert!(!dir.path().join("abc.md").exists());
+        assert!(!dir.path().join("abc.evidence.json").exists());
+    }
+
     /// P7: the sweep used to delete every cache entry past its TTL on mtime
     /// alone, so a document that sat in NeedsReview over a holiday lost its
     /// evidence pane exactly when the human finally opened it.
@@ -3010,6 +3082,7 @@ server.serve_forever()
             ("4444", None), // orphan: no ledger row at all
         ] {
             std::fs::write(cache.join(format!("{sha}.md")), "# cached document text").unwrap();
+            std::fs::write(cache.join(format!("{sha}.evidence.json")), "{}").unwrap();
             if let Some(state) = state {
                 ledger
                     .ingest(sha, "C:/P/x.pdf", "x.pdf", "x.pdf", "pdf")
@@ -3023,18 +3096,21 @@ server.serve_forever()
         sweep_cache_with_ledger(cache, 0, ledger);
 
         assert!(
-            cache.join("1111.md").exists(),
-            "flagged evidence must survive its TTL"
+            cache.join("1111.md").exists() && cache.join("1111.evidence.json").exists(),
+            "flagged evidence and its trace must survive their TTL"
         );
         assert!(
-            cache.join("2222.md").exists(),
-            "an in-flight job's text must survive"
+            cache.join("2222.md").exists() && cache.join("2222.evidence.json").exists(),
+            "an in-flight job's text and trace must survive"
         );
         assert!(
-            !cache.join("3333.md").exists(),
-            "a delivered job's text must go"
+            !cache.join("3333.md").exists() && !cache.join("3333.evidence.json").exists(),
+            "a delivered job's text and trace must go"
         );
-        assert!(!cache.join("4444.md").exists(), "a genuine orphan must go");
+        assert!(
+            !cache.join("4444.md").exists() && !cache.join("4444.evidence.json").exists(),
+            "a genuine orphan's text and trace must go"
+        );
     }
 
     /// The same function used to delete the events table on age alone, which

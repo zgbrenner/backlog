@@ -62,6 +62,7 @@ const NOT_CODES = new Set([
   "slm_primary_gguf",
   "slm_escalation_gguf",
   "CARGO_PKG_VERSION", // env!() lookup in get_diagnostics, not a code
+  "CARGO_MANIFEST_DIR", // env!() compile-time source path lookup, not a code
 ]);
 
 // SHOUTY_CASE flag reasons, checker codes and soft flags; the trailing `:...`
