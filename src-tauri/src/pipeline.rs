@@ -3147,19 +3147,21 @@ server.serve_forever()
     #[test]
     fn evidence_trace_round_trips_and_metric_event_contains_no_source_text() {
         let dir = tempfile::tempdir().unwrap();
-        let mut trace = filter::EvidenceTrace::default();
-        trace.routing = "semantic".into();
-        trace.semantic_available = true;
-        trace.entity_available = true;
-        trace.source_paragraphs = 10;
-        trace.selected_paragraphs = 3;
-        trace.compression = filter::CompressionMetrics {
-            source_chars: 1_000,
-            source_tokens_approx: 250,
-            bundle_chars: 400,
-            bundle_tokens_approx: 100,
-            saved_chars: 600,
-            savings_ratio: 0.6,
+        let mut trace = filter::EvidenceTrace {
+            routing: "semantic".into(),
+            semantic_available: true,
+            entity_available: true,
+            source_paragraphs: 10,
+            selected_paragraphs: 3,
+            compression: filter::CompressionMetrics {
+                source_chars: 1_000,
+                source_tokens_approx: 250,
+                bundle_chars: 400,
+                bundle_tokens_approx: 100,
+                saved_chars: 600,
+                savings_ratio: 0.6,
+            },
+            ..Default::default()
         };
         trace
             .ranked_paragraphs
