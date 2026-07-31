@@ -1,16 +1,17 @@
 name: Apply semantic trace lifecycle contract
 
 on:
-  push:
-    branches: [feature/semantic-evidence-v0.6.0]
-    paths:
-      - .github/workflows/apply-repair.yml
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   apply:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'feature/semantic-evidence-v0.6.0'
     runs-on: ubuntu-24.04
     steps:
       - name: Check out feature branch
