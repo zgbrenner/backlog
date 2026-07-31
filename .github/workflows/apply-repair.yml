@@ -1,4 +1,4 @@
-name: Apply reversible evidence trace lifecycle
+name: Apply semantic evidence lint repair
 
 on:
   pull_request:
@@ -19,26 +19,59 @@ jobs:
         with:
           ref: feature/semantic-evidence-v0.6.0
           fetch-depth: 0
-      - name: Apply tested trace lifecycle once
+      - name: Repair the clippy-only test fixture once
         shell: bash
         run: |
           set -euo pipefail
-          if grep -q 'fn write_evidence_trace' src-tauri/src/pipeline.rs && \
-             grep -q 'TRACE_WRITE_FAILED' docs/TROUBLESHOOTING.md; then
-            echo 'Reversible evidence trace lifecycle is already present.'
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src-tauri/src/pipeline.rs")
+          text = path.read_text(encoding="utf-8")
+          old = '''        let mut trace = filter::EvidenceTrace::default();
+                  trace.routing = "semantic".into();
+                  trace.semantic_available = true;
+                  trace.entity_available = true;
+                  trace.source_paragraphs = 10;
+                  trace.selected_paragraphs = 3;
+                  trace.compression = filter::CompressionMetrics {
+                      source_chars: 1_000,
+                      source_tokens_approx: 250,
+                      bundle_chars: 400,
+                      bundle_tokens_approx: 100,
+                      saved_chars: 600,
+                      savings_ratio: 0.6,
+                  };
+          '''
+          new = '''        let mut trace = filter::EvidenceTrace {
+                      routing: "semantic".into(),
+                      semantic_available: true,
+                      entity_available: true,
+                      source_paragraphs: 10,
+                      selected_paragraphs: 3,
+                      compression: filter::CompressionMetrics {
+                          source_chars: 1_000,
+                          source_tokens_approx: 250,
+                          bundle_chars: 400,
+                          bundle_tokens_approx: 100,
+                          saved_chars: 600,
+                          savings_ratio: 0.6,
+                      },
+                      ..Default::default()
+                  };
+          '''
+          if old not in text:
+              if new in text:
+                  raise SystemExit(0)
+              raise SystemExit("expected clippy fixture was not found")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+          if git diff --quiet; then
+            echo 'Lint repair is already present.'
             exit 0
           fi
-          encoded="$RUNNER_TEMP/trace.patch.xz.b64"
-          patch="$RUNNER_TEMP/trace.patch"
-          cat .github/.repair-payload/part-* | tr -d '\r\n' > "$encoded"
-          base64 --decode "$encoded" | xz --decompress > "$patch"
-          echo "9fadc819d1e382424dbfe7bbd449ce03ce1bca660a0ce19b31ac99b7c3a3abfd  $patch" | sha256sum --check --strict
+          cargo fmt --all --manifest-path src-tauri/Cargo.toml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git am "$patch"
-          cargo fmt --all --manifest-path src-tauri/Cargo.toml
-          if ! git diff --quiet; then
-            git add src-tauri/src/pipeline.rs
-            git commit --amend --no-edit
-          fi
+          git add src-tauri/src/pipeline.rs
+          git commit -m "test: satisfy semantic trace clippy contract"
           git push origin HEAD:feature/semantic-evidence-v0.6.0
