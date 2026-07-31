@@ -1,17 +1,17 @@
 name: Finalize BackLog v0.6.0 branch
 
 on:
-  push:
-    branches: [feature/semantic-evidence-v0.6.0]
-    paths:
-      - .github/workflows/apply-repair.yml
-      - .github/.release-payload/**
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   apply:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'feature/semantic-evidence-v0.6.0'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
