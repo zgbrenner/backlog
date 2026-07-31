@@ -268,6 +268,64 @@ class SalienceGracefulDegradationTests(unittest.TestCase):
         self.assertFalse(result["available"])
 
 
+class SemanticEvidenceGracefulDegradationTests(unittest.TestCase):
+    def setUp(self):
+        self.paragraphs = [
+            {
+                "index": 0,
+                "text": "Jane Doe's employment terminates effective July 31, 2026.",
+                "start_char": 0,
+                "end_char": 60,
+            }
+        ]
+
+    def test_ranker_returns_structured_unavailable_result_when_model_is_missing(self):
+        with mock.patch.object(CONVERTD, "_semantic_embedder", return_value=None):
+            result = CONVERTD.op_rank_paragraphs(
+                {"paragraphs": self.paragraphs, "probes": ["termination date"]}
+            )
+        self.assertFalse(result["available"])
+        self.assertEqual(result["reason"], "model_unavailable")
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["source_chars"], len(self.paragraphs[0]["text"]))
+
+    def test_entity_extractor_returns_structured_unavailable_result_when_model_is_missing(self):
+        with mock.patch.object(CONVERTD, "_semantic_embedder", return_value=None):
+            result = CONVERTD.op_extract_entities({"paragraphs": self.paragraphs})
+        self.assertFalse(result["available"])
+        self.assertEqual(result["reason"], "model_unavailable")
+        self.assertEqual(result["spans"], [])
+
+    def test_ranker_uses_the_shared_embedder_when_available(self):
+        fake = mock.Mock(model_id="test/embedder")
+        expected = {
+            "available": True,
+            "model": "test/embedder",
+            "results": [{"index": 0}],
+            "source_chars": 60,
+            "selected_chars": 60,
+        }
+        with mock.patch.object(CONVERTD, "_semantic_embedder", return_value=fake), mock.patch.object(
+            CONVERTD.semantic_evidence, "rank_paragraphs", return_value=expected
+        ) as rank:
+            result = CONVERTD.op_rank_paragraphs(
+                {"paragraphs": self.paragraphs, "probes": ["termination date"], "top_k": 4}
+            )
+        self.assertEqual(result, expected)
+        rank.assert_called_once()
+        self.assertIs(rank.call_args.args[0], fake)
+
+    def test_live_semantic_error_degrades_instead_of_failing_the_request(self):
+        fake = mock.Mock(model_id="test/embedder")
+        with mock.patch.object(CONVERTD, "_semantic_embedder", return_value=fake), mock.patch.object(
+            CONVERTD.semantic_evidence, "extract_entities", side_effect=RuntimeError("bad graph")
+        ):
+            result = CONVERTD.op_extract_entities({"paragraphs": self.paragraphs})
+        self.assertFalse(result["available"])
+        self.assertEqual(result["reason"], "inference_failed")
+        self.assertEqual(result["spans"], [])
+
+
 class EttinGracefulDegradationTests(unittest.TestCase):
     """Already-blank BACKLOG_ETTIN_DIR degrades to no spans; a configured
     but broken extractor must degrade the same way rather than raise."""
@@ -364,6 +422,41 @@ class ProtocolTests(unittest.TestCase):
         response = json.loads(completed.stdout.strip())
         self.assertTrue(response["ok"])
         self.assertEqual(response["spans"], [])
+
+    def test_semantic_ops_are_ok_true_end_to_end_without_local_assets(self):
+        paragraphs = [
+            {
+                "index": 0,
+                "text": "Jane Doe's employment terminates effective July 31, 2026.",
+                "start_char": 0,
+                "end_char": 60,
+            }
+        ]
+        requests = "".join(
+            json.dumps(request)
+            + "\n"
+            for request in (
+                {
+                    "id": 5,
+                    "op": "rank_paragraphs",
+                    "paragraphs": paragraphs,
+                    "probes": ["termination date"],
+                },
+                {"id": 6, "op": "extract_entities", "paragraphs": paragraphs},
+            )
+        )
+        completed = subprocess.run(
+            [sys.executable, str(MODULE_PATH)],
+            input=requests,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+        self.assertEqual([response["id"] for response in responses], [5, 6])
+        self.assertTrue(all(response["ok"] for response in responses))
+        self.assertTrue(all(not response["available"] for response in responses))
 
 
 class SalienceNeedsNoArrayLibraryTests(unittest.TestCase):

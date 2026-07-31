@@ -1,6 +1,7 @@
 //! Client for the `convertd` Python sidecar: a pool of warm processes, newline-
 //! delimited JSON over stdin/stdout, no terminal window. Ops:
-//!   pdf_probe | convert | ocr | langid | classify | salience | ettin_spans | ping
+//!   pdf_probe | convert | ocr | langid | classify | salience |
+//!   rank_paragraphs | extract_entities | ettin_spans | ping
 //! Respawn-on-death is handled here; the pipeline replays the job from the
 //! ledger on RUNTIME_FAIL.
 //!
@@ -788,6 +789,50 @@ impl Sidecar {
             .unwrap_or_default())
     }
 
+    pub fn rank_paragraphs(
+        &self,
+        paragraphs: &[SourceParagraph],
+        probes: &[String],
+        top_k: usize,
+        min_score: f64,
+        diversity: f64,
+    ) -> anyhow::Result<SemanticRankResult> {
+        let value = self.call(
+            "rank_paragraphs",
+            serde_json::json!({
+                "paragraphs": paragraphs,
+                "probes": probes,
+                "top_k": top_k,
+                "min_score": min_score,
+                "diversity": diversity,
+            }),
+        )?;
+        let result: SemanticRankResult = serde_json::from_value(value)?;
+        validate_rank_result(&result, paragraphs)?;
+        Ok(result)
+    }
+
+    pub fn extract_entities(
+        &self,
+        paragraphs: &[SourceParagraph],
+        labels: &[EntityLabel],
+        threshold: f64,
+        max_per_label: usize,
+    ) -> anyhow::Result<EntityExtractionResult> {
+        let value = self.call(
+            "extract_entities",
+            serde_json::json!({
+                "paragraphs": paragraphs,
+                "labels": labels,
+                "threshold": threshold,
+                "max_per_label": max_per_label,
+            }),
+        )?;
+        let result: EntityExtractionResult = serde_json::from_value(value)?;
+        validate_entity_result(&result, paragraphs)?;
+        Ok(result)
+    }
+
     pub fn ettin_spans(&self, text: &str) -> anyhow::Result<Vec<EttinSpan>> {
         let v = self.call("ettin_spans", serde_json::json!({ "text": text }))?;
         Ok(serde_json::from_value(v["spans"].clone()).unwrap_or_default())
@@ -833,6 +878,222 @@ pub struct EttinSpan {
     pub score: f64,
     #[serde(default)]
     pub iso: Option<String>, // normalized, DATE spans only
+}
+
+/// One unchanged source paragraph. All offsets in this semantic protocol are
+/// Unicode scalar-value indices, matching Python's `str` indexing, rather
+/// than UTF-8 byte offsets.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SourceParagraph {
+    pub index: usize,
+    pub text: String,
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RankedParagraph {
+    pub index: usize,
+    pub text: String,
+    pub start_char: usize,
+    pub end_char: usize,
+    pub score: f64,
+    pub probe: String,
+    pub rank: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct SemanticRankResult {
+    pub available: bool,
+    pub model: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub results: Vec<RankedParagraph>,
+    #[serde(default)]
+    pub source_chars: usize,
+    #[serde(default)]
+    pub selected_chars: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EntityLabel {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct EntitySpan {
+    pub label: String,
+    pub text: String,
+    pub score: f64,
+    pub paragraph_index: usize,
+    pub start_char: usize,
+    pub end_char: usize,
+    #[serde(default)]
+    pub iso: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct EntityExtractionResult {
+    pub available: bool,
+    pub model: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub spans: Vec<EntitySpan>,
+    #[serde(default)]
+    pub label_cache_key: String,
+    #[serde(default)]
+    pub label_embeddings_reused: bool,
+    #[serde(default)]
+    pub candidates_considered: usize,
+}
+
+fn char_slice(text: &str, start: usize, end: usize) -> Option<String> {
+    if end < start {
+        return None;
+    }
+    let total = text.chars().count();
+    if end > total {
+        return None;
+    }
+    Some(text.chars().skip(start).take(end - start).collect())
+}
+
+fn validate_rank_result(
+    result: &SemanticRankResult,
+    paragraphs: &[SourceParagraph],
+) -> anyhow::Result<()> {
+    let mut seen = HashSet::new();
+    for ranked in &result.results {
+        anyhow::ensure!(ranked.score.is_finite() && (0.0..=1.0).contains(&ranked.score),
+            "semantic rank score is outside [0, 1]");
+        anyhow::ensure!(ranked.rank > 0, "semantic rank must be one-based");
+        anyhow::ensure!(seen.insert(ranked.index), "semantic rank payload repeats paragraph {}", ranked.index);
+        let source = paragraphs
+            .iter()
+            .find(|paragraph| paragraph.index == ranked.index)
+            .ok_or_else(|| anyhow::anyhow!("semantic rank references unknown paragraph {}", ranked.index))?;
+        anyhow::ensure!(
+            source.text == ranked.text
+                && source.start_char == ranked.start_char
+                && source.end_char == ranked.end_char,
+            "semantic rank changed paragraph {} or its provenance",
+            ranked.index
+        );
+    }
+    let measured_selected: usize = result.results.iter().map(|item| item.text.chars().count()).sum();
+    anyhow::ensure!(
+        result.selected_chars == measured_selected,
+        "semantic rank selected_chars does not match the returned text"
+    );
+    Ok(())
+}
+
+fn validate_entity_result(
+    result: &EntityExtractionResult,
+    paragraphs: &[SourceParagraph],
+) -> anyhow::Result<()> {
+    for span in &result.spans {
+        anyhow::ensure!(!span.label.trim().is_empty(), "semantic entity label is empty");
+        anyhow::ensure!(span.score.is_finite() && (0.0..=1.0).contains(&span.score),
+            "semantic entity score is outside [0, 1]");
+        let source = paragraphs
+            .iter()
+            .find(|paragraph| paragraph.index == span.paragraph_index)
+            .ok_or_else(|| anyhow::anyhow!("semantic entity references unknown paragraph {}", span.paragraph_index))?;
+        let exact = char_slice(&source.text, span.start_char, span.end_char)
+            .ok_or_else(|| anyhow::anyhow!("semantic entity offsets are outside paragraph {}", span.paragraph_index))?;
+        anyhow::ensure!(exact == span.text, "semantic entity changed source text in paragraph {}", span.paragraph_index);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod semantic_payload_tests {
+    use super::*;
+
+    fn paragraphs() -> Vec<SourceParagraph> {
+        vec![SourceParagraph {
+            index: 7,
+            text: "Acme LLC hired José Doe.".to_string(),
+            start_char: 10,
+            end_char: 35,
+        }]
+    }
+
+    #[test]
+    fn valid_rank_payload_preserves_exact_source() {
+        let source = paragraphs();
+        let result = SemanticRankResult {
+            available: true,
+            model: "fixture".into(),
+            reason: None,
+            results: vec![RankedParagraph {
+                index: 7,
+                text: source[0].text.clone(),
+                start_char: 10,
+                end_char: 35,
+                score: 0.75,
+                probe: "parties".into(),
+                rank: 1,
+            }],
+            source_chars: source[0].text.chars().count(),
+            selected_chars: source[0].text.chars().count(),
+        };
+        validate_rank_result(&result, &source).expect("valid payload");
+    }
+
+    #[test]
+    fn rank_payload_rejects_unknown_or_non_finite_results() {
+        let source = paragraphs();
+        let mut result = SemanticRankResult {
+            available: true,
+            model: "fixture".into(),
+            reason: None,
+            results: vec![RankedParagraph {
+                index: 99,
+                text: "invented".into(),
+                start_char: 0,
+                end_char: 8,
+                score: f64::NAN,
+                probe: "date".into(),
+                rank: 1,
+            }],
+            source_chars: 8,
+            selected_chars: 8,
+        };
+        assert!(validate_rank_result(&result, &source).is_err());
+        result.results[0].score = 0.5;
+        assert!(validate_rank_result(&result, &source).is_err());
+    }
+
+    #[test]
+    fn entity_offsets_are_unicode_character_offsets_and_must_slice_exactly() {
+        let source = paragraphs();
+        let good = EntityExtractionResult {
+            available: true,
+            model: "fixture".into(),
+            reason: None,
+            spans: vec![EntitySpan {
+                label: "PERSON".into(),
+                text: "José Doe".into(),
+                score: 0.8,
+                paragraph_index: 7,
+                start_char: 15,
+                end_char: 23,
+                iso: None,
+            }],
+            label_cache_key: "abc".into(),
+            label_embeddings_reused: false,
+            candidates_considered: 1,
+        };
+        validate_entity_result(&good, &source).expect("unicode character offsets remain exact");
+        let mut bad = good.clone();
+        bad.spans[0].end_char = 200;
+        assert!(validate_entity_result(&bad, &source).is_err());
+    }
 }
 
 #[cfg(test)]

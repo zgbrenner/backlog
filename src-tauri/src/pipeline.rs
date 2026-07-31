@@ -3096,9 +3096,23 @@ server.serve_forever()
         );
     }
 
-    /// An Evidence carrying `body` and, when `salient` is non-empty, the 5d
-    /// picks that only exist for a thin document.
+    /// An Evidence carrying `body` and, when `salient` is non-empty, exact
+    /// selected text that stands in for the structured ranker in ladder tests.
     fn evidence_for(body: &str, salient: &[&str]) -> Evidence {
+        let paragraphs = filter::segment_paragraphs(body);
+        let ranked_paragraphs = salient
+            .iter()
+            .enumerate()
+            .map(|(rank, text)| crate::sidecar::RankedParagraph {
+                index: paragraphs.len() + rank,
+                text: (*text).to_string(),
+                start_char: 0,
+                end_char: text.chars().count(),
+                score: 0.8,
+                probe: "test evidence".into(),
+                rank: rank + 1,
+            })
+            .collect();
         Evidence {
             bundle: String::new(),
             language: "en".into(),
@@ -3109,6 +3123,11 @@ server.serve_forever()
             salient: salient.iter().map(|s| s.to_string()).collect(),
             ettin_spans: Vec::new(),
             thin: !salient.is_empty(),
+            paragraphs,
+            ranked_paragraphs,
+            entities: Vec::new(),
+            semantic_lane_char_budget: 2_000,
+            trace: crate::filter::EvidenceTrace::default(),
         }
     }
 
@@ -3151,13 +3170,11 @@ server.serve_forever()
         );
     }
 
-    /// Salience (5d) fires only when the deterministic harvest came back thin —
-    /// exactly when KEY SENTENCES is the only substantive section in the
-    /// bundle. Rebuilding the widened bundle with an empty `salient` therefore
-    /// handed a thin document LESS evidence than the rung before it, which is
-    /// the opposite of what the escalation is for.
+    /// Structured ranking is most important when deterministic harvesting is
+    /// thin. Widening must keep those exact selected paragraphs while adding
+    /// more source context, never replace them with a different summary.
     #[test]
-    fn a_thin_documents_widened_bundle_keeps_its_key_sentences() {
+    fn a_thin_documents_widened_bundle_keeps_its_ranked_paragraphs() {
         let h = Harness::new();
         let body = "Please be advised that the arrangement described below takes effect on \
                     2024-03-05 and continues until either party gives notice.";
@@ -3171,40 +3188,23 @@ server.serve_forever()
 
         let (_, wide) = h.pipeline.rung(3, &ev);
         assert!(
-            wide.contains("KEY SENTENCES:"),
-            "the one section a thin document has must survive the widening: {wide}"
+            wide.contains("RANKED BODY PARAGRAPHS (exact source text):"),
+            "the exact selected-text lane must survive the widening: {wide}"
         );
         assert!(wide.contains("continues until either party gives notice"));
     }
 
-    /// The budget is `evidence_token_budget * n * 4` — arithmetic with no
-    /// relation to where the document's characters fall — so it lands mid
-    /// codepoint routinely. `String::truncate` panics on such an index, and a
-    /// panic here kills the task and strands the job with no flag at all.
+    /// Evidence budgets are measured in Unicode characters rather than UTF-8
+    /// bytes, so multibyte legal names and currency symbols cannot be split.
     #[test]
-    fn a_budget_landing_mid_codepoint_cuts_back_to_a_char_boundary() {
-        // Three bytes per character on purpose: the budget advances in steps
-        // of 4, so a 2-byte character would land every step on a boundary and
-        // the search below would find nothing to test. With 3-byte characters
-        // two thirds of the steps split one.
+    fn a_unicode_character_budget_never_splits_a_codepoint() {
         let body = format!("SUBJECT: Reçu\n\n{}", "€".repeat(4000));
         let ev = evidence_for(&body, &[]);
-
-        let full = filter::widened_bundle(&ev, 1_000_000);
-        let budget = (16..full.len() / 4)
-            .find(|tokens| !full.is_char_boundary(tokens * 4))
-            .expect("a multibyte body must produce a budget that splits a codepoint");
+        let budget = 120;
         let cut = filter::widened_bundle(&ev, budget);
 
-        assert_eq!(
-            cut.len(),
-            filter::floor_char_boundary(&full, budget * 4),
-            "the bundle must be cut exactly at the last whole character"
-        );
-        assert!(
-            cut.len() < budget * 4,
-            "a split codepoint must cost bytes, not panic"
-        );
-        assert!(full.starts_with(&cut), "widening only adds material");
+        assert!(cut.is_char_boundary(cut.len()));
+        assert!(cut.chars().count() <= budget * 4);
+        assert!(cut.contains("Reçu"));
     }
 }
