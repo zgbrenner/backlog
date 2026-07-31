@@ -1,4 +1,4 @@
-name: Apply semantic evidence lint repair
+name: Apply final semantic evidence tree
 
 on:
   pull_request:
@@ -19,59 +19,29 @@ jobs:
         with:
           ref: feature/semantic-evidence-v0.6.0
           fetch-depth: 0
-      - name: Repair the clippy-only test fixture once
+      - name: Apply reviewed final tree once
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path("src-tauri/src/pipeline.rs")
-          text = path.read_text(encoding="utf-8")
-          old = '''        let mut trace = filter::EvidenceTrace::default();
-                  trace.routing = "semantic".into();
-                  trace.semantic_available = true;
-                  trace.entity_available = true;
-                  trace.source_paragraphs = 10;
-                  trace.selected_paragraphs = 3;
-                  trace.compression = filter::CompressionMetrics {
-                      source_chars: 1_000,
-                      source_tokens_approx: 250,
-                      bundle_chars: 400,
-                      bundle_tokens_approx: 100,
-                      saved_chars: 600,
-                      savings_ratio: 0.6,
-                  };
-          '''
-          new = '''        let mut trace = filter::EvidenceTrace {
-                      routing: "semantic".into(),
-                      semantic_available: true,
-                      entity_available: true,
-                      source_paragraphs: 10,
-                      selected_paragraphs: 3,
-                      compression: filter::CompressionMetrics {
-                          source_chars: 1_000,
-                          source_tokens_approx: 250,
-                          bundle_chars: 400,
-                          bundle_tokens_approx: 100,
-                          saved_chars: 600,
-                          savings_ratio: 0.6,
-                      },
-                      ..Default::default()
-                  };
-          '''
-          if old not in text:
-              if new in text:
-                  raise SystemExit(0)
-              raise SystemExit("expected clippy fixture was not found")
-          path.write_text(text.replace(old, new, 1), encoding="utf-8")
-          PY
-          if git diff --quiet; then
-            echo 'Lint repair is already present.'
+          encoded="$RUNNER_TEMP/final.patch.xz.b64"
+          archive="$RUNNER_TEMP/final.patch.xz"
+          patch="$RUNNER_TEMP/final.patch"
+          tr -d '\r\n' < .github/.final-payload/final.patch.xz.b64 > "$encoded"
+          base64 --decode "$encoded" > "$archive"
+          echo "0793bfc94b80039138d4fb8528481e5dd4f0cc0cf5928ec52c4589747c5bd06d  $archive" | sha256sum --check --strict
+          xz --decompress --stdout "$archive" > "$patch"
+          echo "d39228e39bc1de2d387483902f182262eae446ab988af10360d32b7f85aa966d  $patch" | sha256sum --check --strict
+          git apply --index --check "$patch"
+          git apply --index "$patch"
+          rm -rf .github/.final-payload .github/.repair-payload .github/.semantic-payload
+          rm -f .github/workflows/apply-repair.yml .github/workflows/export-current-source.yml
+          git add -A
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Final tree is already present."
             exit 0
           fi
-          cargo fmt --all --manifest-path src-tauri/Cargo.toml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src-tauri/src/pipeline.rs
-          git commit -m "test: satisfy semantic trace clippy contract"
+          git commit -m "feat: finalize semantic evidence pipeline and release hardening"
           git push origin HEAD:feature/semantic-evidence-v0.6.0
