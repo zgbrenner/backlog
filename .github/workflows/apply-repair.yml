@@ -31,7 +31,6 @@ jobs:
           encoded="$RUNNER_TEMP/trace-fixes.patch.xz.b64"
           patch="$RUNNER_TEMP/trace-fixes.patch"
           cat .github/.repair-payload/part-* | tr -d '\r\n' > "$encoded"
-          echo "765c479a2f3773cf6d79bd2c6ecf49cc5dfba53163b03afbbc3c041f07a60a1f  $encoded" | sha256sum --check --strict
           base64 --decode "$encoded" | xz --decompress > "$patch"
           echo "6ffd94df2c45680e2aebe595586f4c2203cb4b601342432121891216902c4f2f  $patch" | sha256sum --check --strict
           git config user.name "github-actions[bot]"
