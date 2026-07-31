@@ -1,39 +1,14 @@
 name: Apply semantic trace lifecycle fixes
 
 on:
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.head_ref == 'feature/semantic-evidence-v0.6.0'
+    if: false
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out feature branch
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: feature/semantic-evidence-v0.6.0
-          fetch-depth: 0
-      - name: Apply trace lifecycle patch once
-        shell: bash
-        run: |
-          set -euo pipefail
-          if grep -q 'TRACE_WRITE_FAILED' docs/TROUBLESHOOTING.md && \
-             grep -q 'fn write_evidence_trace' src-tauri/src/pipeline.rs; then
-            echo 'Trace lifecycle fixes are already present.'
-            exit 0
-          fi
-          encoded="$RUNNER_TEMP/trace-fixes.patch.xz.b64"
-          patch="$RUNNER_TEMP/trace-fixes.patch"
-          cat .github/.repair-payload/part-* | tr -d '\r\n' > "$encoded"
-          base64 --decode "$encoded" | xz --decompress > "$patch"
-          echo "6ffd94df2c45680e2aebe595586f4c2203cb4b601342432121891216902c4f2f  $patch" | sha256sum --check --strict
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git am "$patch"
-          git push origin HEAD:feature/semantic-evidence-v0.6.0
+      - run: echo "repair payload is being refreshed"
