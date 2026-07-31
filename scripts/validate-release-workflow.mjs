@@ -43,7 +43,7 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     problems.push("release workflow default permissions must be read-only");
   }
   if (
-    workflow?.concurrency?.group !== "release-v0.5.0" ||
+    workflow?.concurrency?.group !== "release-${{ github.event.workflow_run.head_sha }}" ||
     workflow?.concurrency?.["cancel-in-progress"] !== true
   ) {
     problems.push("a newer tested release must cancel superseded packaging work");
@@ -70,9 +70,24 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     if (String(preflightCheckout?.with?.ref ?? "") !== "${{ env.RELEASE_SHA }}") {
       problems.push("release preflight must check out the exact CI-tested commit");
     }
+    const metadata = preflightSteps.find((step) => step?.id === "release-metadata");
+    if (!stepRun(metadata).includes("release-contract.mjs metadata")) {
+      problems.push("release preflight must derive version metadata from the checked-out commit");
+    }
+    if (
+      String(preflight?.outputs?.version ?? "") !==
+        "${{ steps.release-metadata.outputs.version }}" ||
+      String(preflight?.outputs?.tag ?? "") !==
+        "${{ steps.release-metadata.outputs.tag }}"
+    ) {
+      problems.push("release preflight must expose the validated version and tag");
+    }
     const gate = preflightSteps.find((step) => step?.id === "release-gate");
     if (!stepRun(gate).includes("release-contract.mjs gate")) {
       problems.push("absent-tag preflight must run release-contract.mjs gate");
+    }
+    if (String(gate?.env?.TAG ?? "") !== "${{ steps.release-metadata.outputs.tag }}") {
+      problems.push("release gate must use the tag derived from release metadata");
     }
     if (
       String(preflight?.outputs?.["should-release"] ?? "") !==
@@ -96,6 +111,15 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   }
   if (job?.permissions?.contents !== "write") {
     problems.push("only the Windows publication job may receive contents: write");
+  }
+  if (
+    String(job?.env?.VERSION ?? "") !== "${{ needs.release-check.outputs.version }}" ||
+    String(job?.env?.TAG ?? "") !== "${{ needs.release-check.outputs.tag }}"
+  ) {
+    problems.push("Windows release must consume the preflight's validated version and tag");
+  }
+  if (!String(job?.env?.INSTALLER ?? "").includes("BackLog_${{ needs.release-check.outputs.version }}_x64-setup.exe")) {
+    problems.push("installer path must be derived from the validated release version");
   }
   const steps = Array.isArray(job.steps) ? job.steps : [];
   const findNamed = (name) => steps.find((step) => step?.name === name);
@@ -336,8 +360,8 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
       );
     }
   };
-  assertRetryState(signedRun, "BackLog v0.5.0");
-  assertRetryState(unsignedRun, "BackLog v0.5.0 (unsigned prerelease)");
+  assertRetryState(signedRun, "BackLog v$env:VERSION");
+  assertRetryState(unsignedRun, "BackLog v$env:VERSION (unsigned prerelease)");
   const signatureIndex = steps.indexOf(signatureVerification);
   const signedPublishIndex = steps.indexOf(signedPublish);
   if (

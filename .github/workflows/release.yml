@@ -10,33 +10,35 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-v0.5.0
+  group: release-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: true
 
 env:
-  VERSION: "0.5.0"
-  TAG: "v0.5.0"
   RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
   RELEASE_BRANCH: ${{ github.event.workflow_run.head_branch }}
-  INSTALLER: "src-tauri/target/release/bundle/nsis/BackLog_0.5.0_x64-setup.exe"
-  SIGNATURE: "src-tauri/target/release/bundle/nsis/BackLog_0.5.0_x64-setup.exe.sig"
-  MANIFEST: "src-tauri/target/release/bundle/nsis/latest.json"
 
 jobs:
   release-check:
-    name: Check whether v0.5.0 still needs publication
+    name: Check whether the current release still needs publication
     if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
     outputs:
       should-release: ${{ steps.release-gate.outputs.release }}
+      version: ${{ steps.release-metadata.outputs.version }}
+      tag: ${{ steps.release-metadata.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ env.RELEASE_SHA }}
+      - name: Read and validate release metadata
+        id: release-metadata
+        run: node scripts/release-contract.mjs metadata
       - name: Skip cleanly after the release tag exists
         id: release-gate
+        env:
+          TAG: ${{ steps.release-metadata.outputs.tag }}
         run: node scripts/release-contract.mjs gate
 
   release:
@@ -47,6 +49,12 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.release-check.outputs.version }}
+      TAG: ${{ needs.release-check.outputs.tag }}
+      INSTALLER: "src-tauri/target/release/bundle/nsis/BackLog_${{ needs.release-check.outputs.version }}_x64-setup.exe"
+      SIGNATURE: "src-tauri/target/release/bundle/nsis/BackLog_${{ needs.release-check.outputs.version }}_x64-setup.exe.sig"
+      MANIFEST: "src-tauri/target/release/bundle/nsis/latest.json"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -180,7 +188,7 @@ jobs:
           if (-not (Test-Path $env:INSTALLER)) { throw "Expected installer missing: $env:INSTALLER" }
           $sha = (Get-FileHash $env:INSTALLER -Algorithm SHA256).Hash.ToLowerInvariant()
           @"
-          BackLog 0.5.0 is the one-download Windows package. It includes the
+          BackLog $env:VERSION is the one-download Windows package. It includes the
           primary model, conversion runtime, llama server, and offline WebView2.
 
           Installer SHA-256: $sha
@@ -255,13 +263,13 @@ jobs:
           $release = gh release view $env:TAG --json isDraft,name 2>$null | ConvertFrom-Json
           if ($LASTEXITCODE -eq 0) {
             if (-not $release.isDraft) { throw "$env:TAG is already published; refusing to overwrite it" }
-            if ($release.name -ne "BackLog v0.5.0") {
+            if ($release.name -ne "BackLog v$env:VERSION") {
               throw "Existing draft was created in a different release mode; refusing to modify it"
             }
             ./scripts/retarget-release-draft.ps1 `
               -Tag $env:TAG `
               -ExpectedSha $env:RELEASE_SHA `
-              -ExpectedName "BackLog v0.5.0"
+              -ExpectedName "BackLog v$env:VERSION"
             ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
             $existingAssets = @(gh release view $env:TAG --json assets --jq ".assets[].name")
             if ($LASTEXITCODE -ne 0) { throw "Could not inspect the existing signed draft" }
@@ -274,11 +282,11 @@ jobs:
             if ($LASTEXITCODE -eq 0) {
               ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
               gh release create $env:TAG @assets --verify-tag --draft `
-                --title "BackLog v0.5.0" `
+                --title "BackLog v$env:VERSION" `
                 --notes-file "$env:RUNNER_TEMP\release-notes.md"
             } elseif ($LASTEXITCODE -eq 2) {
               gh release create $env:TAG @assets --target $env:RELEASE_SHA --draft `
-                --title "BackLog v0.5.0" `
+                --title "BackLog v$env:VERSION" `
                 --notes-file "$env:RUNNER_TEMP\release-notes.md"
             } else {
               throw "Could not check the release tag"
@@ -292,7 +300,7 @@ jobs:
           }
           ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
           gh release edit $env:TAG --draft=false --latest `
-            --title "BackLog v0.5.0" `
+            --title "BackLog v$env:VERSION" `
             --notes-file "$env:RUNNER_TEMP\release-notes.md"
           if ($LASTEXITCODE -ne 0) { throw "Stable release publication failed" }
           ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
@@ -310,13 +318,13 @@ jobs:
           $release = gh release view $env:TAG --json isDraft,name 2>$null | ConvertFrom-Json
           if ($LASTEXITCODE -eq 0) {
             if (-not $release.isDraft) { throw "$env:TAG is already published; refusing to overwrite it" }
-            if ($release.name -ne "BackLog v0.5.0 (unsigned prerelease)") {
+            if ($release.name -ne "BackLog v$env:VERSION (unsigned prerelease)") {
               throw "Existing draft was created in a different release mode; refusing to modify it"
             }
             ./scripts/retarget-release-draft.ps1 `
               -Tag $env:TAG `
               -ExpectedSha $env:RELEASE_SHA `
-              -ExpectedName "BackLog v0.5.0 (unsigned prerelease)"
+              -ExpectedName "BackLog v$env:VERSION (unsigned prerelease)"
             ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
             $existingAssets = @(gh release view $env:TAG --json assets --jq ".assets[].name")
             if ($LASTEXITCODE -ne 0) { throw "Could not inspect the existing unsigned draft" }
@@ -329,11 +337,11 @@ jobs:
             if ($LASTEXITCODE -eq 0) {
               ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
               gh release create $env:TAG $env:INSTALLER --verify-tag --draft `
-                --title "BackLog v0.5.0 (unsigned prerelease)" `
+                --title "BackLog v$env:VERSION (unsigned prerelease)" `
                 --notes-file "$env:RUNNER_TEMP\release-notes.md"
             } elseif ($LASTEXITCODE -eq 2) {
               gh release create $env:TAG $env:INSTALLER --target $env:RELEASE_SHA --draft `
-                --title "BackLog v0.5.0 (unsigned prerelease)" `
+                --title "BackLog v$env:VERSION (unsigned prerelease)" `
                 --notes-file "$env:RUNNER_TEMP\release-notes.md"
             } else {
               throw "Could not check the release tag"
@@ -347,7 +355,7 @@ jobs:
           }
           ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
           gh release edit $env:TAG --draft=false --prerelease `
-            --title "BackLog v0.5.0 (unsigned prerelease)" `
+            --title "BackLog v$env:VERSION (unsigned prerelease)" `
             --notes-file "$env:RUNNER_TEMP\release-notes.md"
           if ($LASTEXITCODE -ne 0) { throw "Prerelease publication failed" }
           ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA

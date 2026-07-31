@@ -50,7 +50,8 @@
 [CmdletBinding()]
 param(
     [hashtable] $Expected = @{},
-    [string] $BinDir = ""
+    [string] $BinDir = "",
+    [string] $ModelDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,6 +64,7 @@ $ErrorActionPreference = "Stop"
 # `pwsh scripts/verify-binaries.ps1` came to be unrunnable on the shell that
 # ships with Windows.
 if (-not $BinDir) { $BinDir = Join-Path $PSScriptRoot "..\src-tauri\binaries" }
+if (-not $ModelDir) { $ModelDir = Join-Path $PSScriptRoot "..\src-tauri\resources\models" }
 
 # Kept byte-identical in scripts/dev-stubs.sh and scripts/dev-stubs.ps1.
 $StubMarker = "BACKLOG-DEV-STUB-DO-NOT-SHIP"
@@ -75,6 +77,11 @@ $StubMarker = "BACKLOG-DEV-STUB-DO-NOT-SHIP"
 $RequiredBinaries = @(
     "llama-server-x86_64-pc-windows-msvc.exe"
 )
+
+$RequiredModelAssets = @{
+    "semantic\all-MiniLM-L6-v2\model.onnx" = "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1"
+    "semantic\all-MiniLM-L6-v2\vocab.txt" = "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+}
 
 $failures = [System.Collections.Generic.List[string]]::new()
 $notes = [System.Collections.Generic.List[string]]::new()
@@ -186,6 +193,34 @@ if (-not (Test-Path $BinDir)) {
     Write-Error "binaries directory not found: $BinDir. Run RELEASING.md Build steps 1-2 first."
 }
 $BinDir = (Resolve-Path $BinDir).Path
+
+if (-not (Test-Path $ModelDir)) {
+    Write-Error "models resource directory not found: $ModelDir. Run scripts/stage-release-inputs.ps1 first."
+}
+$ModelDir = (Resolve-Path $ModelDir).Path
+
+foreach ($relative in ($RequiredModelAssets.Keys | Sort-Object)) {
+    $path = Join-Path $ModelDir $relative
+    if (-not (Test-Path $path)) {
+        $failures.Add("$relative is missing. Run scripts/stage-release-inputs.ps1 to stage the semantic model assets.")
+        continue
+    }
+    $length = (Get-Item $path).Length
+    if ($length -eq 0) {
+        $failures.Add("$relative is zero bytes.")
+        continue
+    }
+    if ($relative.EndsWith(".onnx") -and (Test-CarriesStubMarker $path)) {
+        $failures.Add("$relative is a dev stub from scripts/dev-stubs.*, not the real semantic model.")
+        continue
+    }
+    $hash = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($hash -ne $RequiredModelAssets[$relative]) {
+        $failures.Add("$relative SHA-256 $hash does not match the recorded $($RequiredModelAssets[$relative]).")
+        continue
+    }
+    Write-Host "ok    $relative  ($length bytes, SHA-256 pinned)" -ForegroundColor Green
+}
 
 foreach ($name in $RequiredBinaries) {
     $path = Join-Path $BinDir $name

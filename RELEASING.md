@@ -1,16 +1,17 @@
 # Releasing BackLog
 
-BackLog v0.5.0 is built on a clean `windows-2022` GitHub-hosted runner by
+BackLog v0.6.0 is built on a clean `windows-2022` GitHub-hosted runner by
 `.github/workflows/release.yml`. This public repository uses standard public
 Actions runners, which do not consume billable minutes.
 
 The release is one Windows x64 installer:
 
-`BackLog_0.5.0_x64-setup.exe`
+`BackLog_0.6.0_x64-setup.exe`
 
 It contains the app, `convertd` and its Python runtime, `llama-server` and its
-runtime DLLs, the verified Qwen3 0.6B primary model, and offline WebView2. The
-Qwen3 1.7B escalation model remains an optional in-app download.
+runtime DLLs, the verified Qwen3 0.6B primary model, the pinned MiniLM semantic
+model/tokenizer, and offline WebView2. The Qwen3 1.7B escalation model remains
+an optional in-app download.
 
 ## Required release state
 
@@ -18,10 +19,10 @@ Before merging or pushing the release commit to `main`:
 
 1. `package.json`, `src-tauri/Cargo.toml`,
    `src-tauri/tauri.conf.json`, `package-lock.json`, and the root `backlog`
-   package in `src-tauri/Cargo.lock` must say `0.5.0`.
+   package in `src-tauri/Cargo.lock` must say `0.6.0`.
 2. `CHANGELOG.md` must contain the matching section.
 3. CI must be green on `main`.
-4. `v0.5.0` must not already be published. The workflow preflight skips a
+4. `v0.6.0` must not already be published. The workflow preflight skips a
    completed release and can resume only an interrupted draft whose tag still
    points at the exact CI-tested commit.
 5. Complete the source and security portions of
@@ -56,17 +57,18 @@ The workflow uses:
 | Sidecar freezer | `sidecar/build-requirements.lock` |
 | Release actions | Full reviewed commit SHAs in `.github/workflows/release.yml` |
 | Primary model | Qwen3 0.6B Q8_0, SHA-256 `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031` |
+| Semantic model | Xenova all-MiniLM-L6-v2 quantized ONNX, SHA-256 `afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1`; tokenizer SHA-256 `07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3` |
 | llama.cpp | `b10091` Windows CPU x64 ZIP, SHA-256 `b2d991bdd37258bb51309f50e9fb7a52a16fe662ba71b2cbbbbb9303b47b5dee` |
 | `llama-server.exe` | SHA-256 `78af9cfb34f346b0de1e4f9c1577061cb3d55e8be55c8d540fde878e56bd0fe2` |
 
-`scripts/stage-release-inputs.ps1` downloads the exact model and llama.cpp
-archive, verifies both before staging, rejects
+`scripts/stage-release-inputs.ps1` downloads the exact primary and semantic
+models plus the llama.cpp archive, verifies each before staging, rejects
 `BACKLOG-DEV-STUB-DO-NOT-SHIP`, and copies the VC143 runtime files from the
 runner's installed MSVC toolchain. `scripts/verify-binaries.ps1` then checks PE
 structure, recorded hashes, and every imported DLL before Tauri runs.
 
 The Python sidecar is built with Python 3.11 and smoke-tested against real
-DOCX, PDF, and image fixtures by `scripts/build-sidecar.ps1`.
+  DOCX, PDF, image, and semantic evidence fixtures by `scripts/build-sidecar.ps1`.
 
 ## Signing modes
 
@@ -84,14 +86,14 @@ Configure:
 
 The workflow builds with updater artifacts enabled, requires:
 
-- `BackLog_0.5.0_x64-setup.exe`;
-- `BackLog_0.5.0_x64-setup.exe.sig`; and
+- `BackLog_0.6.0_x64-setup.exe`;
+- `BackLog_0.6.0_x64-setup.exe.sig`; and
 - `latest.json`;
 
 and verifies that `latest.json` carries the exact detached signature and points
 to the same installer. It then decodes the updater public key embedded in
 `src-tauri/tauri.conf.json` and cryptographically verifies that signature over
-the exact installer. Only then does it create `v0.5.0` as a draft, upload all
+the exact installer. Only then does it create `v0.6.0` as a draft, upload all
 three files, and publish the stable GitHub release.
 
 Never rotate this updater key casually. Existing installations verify updates
@@ -105,7 +107,7 @@ When `TAURI_SIGNING_PRIVATE_KEY` is absent or blank, the workflow overlays
 It then requires the installer to exist and requires both the signature and
 `latest.json` to be absent.
 
-The workflow still creates `v0.5.0`, but publishes an explicit prerelease with
+The workflow still creates `v0.6.0`, but publishes an explicit prerelease with
 the installer only. The release notes say that v0.4.4 remains the stable
 updater. GitHub's `releases/latest` endpoint therefore continues to resolve to
 the prior stable release.
@@ -120,8 +122,9 @@ automatically starts the release workflow for that exact commit. Failed CI
 does not allocate the Windows release build. There is intentionally no manual
 dispatch path that can bypass that exact-commit CI result.
 
-The first job checks the exact remote tag and GitHub Release state before
-allocating the Windows runner. A published `v0.5.0` exits successfully. If an
+The first job derives the release tag from validated package metadata, then
+checks the exact remote tag and GitHub Release state before
+allocating the Windows runner. A published `v0.6.0` exits successfully. If an
 asset upload was interrupted, use **Re-run all jobs** on that same failed
 release-workflow run. A matching draft resumes with `--clobber`; a tag or draft
 pointing at any other commit fails closed. Before publication, the workflow

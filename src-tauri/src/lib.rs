@@ -1408,6 +1408,45 @@ pub fn run() {
                     log::warn!("could not place the bundled {name} into the models folder");
                 }
             }
+            for (target, expected_sha256) in [
+                (
+                    model_download::SEMANTIC_MODEL_TARGET,
+                    model_download::SEMANTIC_MODEL_SHA256,
+                ),
+                (
+                    model_download::SEMANTIC_VOCAB_TARGET,
+                    model_download::SEMANTIC_VOCAB_SHA256,
+                ),
+            ] {
+                let dest = models_dir.join(target);
+                if dest.is_file()
+                    && pipeline::hash_file(&dest)
+                        .map(|actual| actual == expected_sha256)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                let bundled = resource(app.handle(), &format!("models/{target}"));
+                if !bundled.is_file() {
+                    continue;
+                }
+                match pipeline::hash_file(&bundled) {
+                    Ok(actual) if actual == expected_sha256 => {
+                        if let Some(parent) = dest.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        if std::fs::copy(&bundled, &dest).is_ok() {
+                            log::info!("copied bundled {target} into the models folder");
+                        } else {
+                            log::warn!("could not copy bundled {target} into the models folder");
+                        }
+                    }
+                    Ok(actual) => log::warn!(
+                        "bundled {target} has SHA-256 {actual}, expected {expected_sha256}; ignoring it"
+                    ),
+                    Err(error) => log::warn!("could not hash bundled {target}: {error}"),
+                }
+            }
             // After the bundled step, so a machine that received only the
             // primary still gets a usable escalation rung pointed at it.
             cfg.normalize();

@@ -7,10 +7,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "models" / "download_models.py"
+LOCK_PATH = ROOT / "models" / "models.lock.json"
 SPEC = importlib.util.spec_from_file_location("backlog_download_models", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 DOWNLOAD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DOWNLOAD)
+
+SEMANTIC_REVISION = "751bff37182d3f1213fa05d7196b954e230abad9"
+SEMANTIC_MODEL_TARGET = "semantic/all-MiniLM-L6-v2/model.onnx"
+SEMANTIC_VOCAB_TARGET = "semantic/all-MiniLM-L6-v2/vocab.txt"
+SEMANTIC_MODEL_SHA256 = "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1"
+SEMANTIC_VOCAB_SHA256 = "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
 
 
 class ModelSpecTests(unittest.TestCase):
@@ -56,7 +63,59 @@ class ModelSpecTests(unittest.TestCase):
         ).lower()
         self.assertNotIn("gliclass", serialized)
         self.assertNotIn("granite", serialized)
-        self.assertEqual(len(DOWNLOAD.MODEL_SPECS), 2)
+        self.assertEqual(len(DOWNLOAD.MODEL_SPECS), 4)
+
+    def test_semantic_model_assets_are_revision_pinned_and_staged_under_runtime_layout(self):
+        files = {
+            (spec.repo_id, spec.filename, spec.target, spec.revision)
+            for spec in DOWNLOAD.MODEL_SPECS
+        }
+        self.assertIn(
+            (
+                "Xenova/all-MiniLM-L6-v2",
+                "onnx/model_quantized.onnx",
+                SEMANTIC_MODEL_TARGET,
+                SEMANTIC_REVISION,
+            ),
+            files,
+        )
+        self.assertIn(
+            (
+                "Xenova/all-MiniLM-L6-v2",
+                "vocab.txt",
+                SEMANTIC_VOCAB_TARGET,
+                SEMANTIC_REVISION,
+            ),
+            files,
+        )
+
+    def test_committed_lock_contains_every_declared_target_and_no_extra_payloads(self):
+        lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+        declared = {spec.target for spec in DOWNLOAD.MODEL_SPECS}
+        self.assertEqual(set(lock), declared)
+        self.assertEqual(lock[SEMANTIC_MODEL_TARGET], SEMANTIC_MODEL_SHA256)
+        self.assertEqual(lock[SEMANTIC_VOCAB_TARGET], SEMANTIC_VOCAB_SHA256)
+
+    def test_tauri_resources_include_the_nested_semantic_model_directory(self):
+        config = json.loads((ROOT / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+        resources = config["bundle"]["resources"]
+        self.assertEqual(
+            resources["resources/models/semantic/all-MiniLM-L6-v2/*"],
+            "resources/models/semantic/all-MiniLM-L6-v2/",
+        )
+
+    def test_release_scripts_gate_semantic_assets_and_live_frozen_semantic_ops(self):
+        stage = (ROOT / "scripts" / "stage-release-inputs.ps1").read_text(encoding="utf-8")
+        build = (ROOT / "scripts" / "build-sidecar.ps1").read_text(encoding="utf-8")
+        verify = (ROOT / "scripts" / "verify-binaries.ps1").read_text(encoding="utf-8")
+        for text in (stage, build, verify):
+            self.assertIn(SEMANTIC_MODEL_TARGET.replace("/", "\\"), text)
+            self.assertIn(SEMANTIC_MODEL_SHA256, text)
+            self.assertIn(SEMANTIC_VOCAB_TARGET.replace("/", "\\"), text)
+            self.assertIn(SEMANTIC_VOCAB_SHA256, text)
+        self.assertIn('"op" = "rank_paragraphs"', build)
+        self.assertIn('"op" = "extract_entities"', build)
+        self.assertIn("available: true", build)
 
 
 class LockVerificationTests(unittest.TestCase):

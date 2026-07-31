@@ -8,7 +8,7 @@ to install it.
 
 ## 1. Install one file
 
-Download **`BackLog_0.5.0_x64-setup.exe`** from the BackLog v0.5.0 release page
+Download **`BackLog_0.6.0_x64-setup.exe`** from the BackLog v0.6.0 release page
 and double-click it. This is the only required download.
 
 The installer includes:
@@ -16,7 +16,8 @@ The installer includes:
 - the BackLog app;
 - the document-conversion runtime;
 - the llama naming server and its Windows runtime libraries;
-- the verified Qwen3 0.6B everyday model; and
+- the verified Qwen3 0.6B everyday model;
+- the pinned MiniLM semantic evidence model; and
 - the offline WebView2 runtime.
 
 It installs for your Windows user account and does not need the internet during
@@ -134,13 +135,13 @@ key already inside the app.
 
 That updater signature is different from Windows Authenticode signing. The
 first protects the in-app update channel; the second establishes publisher
-identity and SmartScreen reputation for the installer. BackLog v0.5.0 can have
+identity and SmartScreen reputation for the installer. BackLog v0.6.0 can have
 a valid updater signature while still showing a SmartScreen warning because a
 trusted Authenticode certificate has not yet been configured.
 
-An unsigned v0.5.0 build may appear as a prerelease for manual testing. It is
+An unsigned v0.6.0 build may appear as a prerelease for manual testing. It is
 not offered through the stable updater; v0.4.4 remains the stable updater until
-a correctly signed v0.5.0 release exists.
+a correctly signed v0.6.0 release exists.
 
 ## Help
 

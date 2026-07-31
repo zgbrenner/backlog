@@ -31,6 +31,8 @@ MODEL_ID = f"Xenova/all-MiniLM-L6-v2@{MODEL_REVISION}:q8"
 MODEL_RELATIVE_DIR = Path("semantic") / "all-MiniLM-L6-v2"
 MODEL_FILENAME = "model.onnx"
 VOCAB_FILENAME = "vocab.txt"
+MODEL_SHA256 = "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1"
+VOCAB_SHA256 = "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
 DEFAULT_MAX_LENGTH = 256
 
 DEFAULT_ENTITY_LABELS = [
@@ -345,6 +347,17 @@ def load_embedder(models_dir: Path) -> OnnxMiniLmEmbedder:
     if not model.is_file() or not vocab.is_file():
         missing = [str(path) for path in (model, vocab) if not path.is_file()]
         raise FileNotFoundError("missing local semantic model asset(s): " + ", ".join(missing))
+    mismatched = []
+    for path, expected in ((model, MODEL_SHA256), (vocab, VOCAB_SHA256)):
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
+        if actual != expected:
+            mismatched.append(f"{path} expected {expected} computed {actual}")
+    if mismatched:
+        raise ValueError("semantic model asset hash mismatch: " + "; ".join(mismatched))
     return OnnxMiniLmEmbedder(model, vocab)
 
 
@@ -519,7 +532,7 @@ _ORG_PATTERN = re.compile(
     r"\b(?:[A-Z][\w&'.-]*(?:\s+|$)){1,6}(?:LLC|L\.L\.C\.|Inc\.?|Incorporated|Corp\.?|Corporation|Company|Co\.?|LP|LLP|PLC|University|Association|Department|Agency|Court)\b"
 )
 _NAME_PATTERN = re.compile(
-    r"\b[A-Z][A-Za-z'’-]{1,30}(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z'’-]{1,30})){1,3}\b"
+    r"\b[A-Z][A-Za-z'’-]{1,30}(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z'’-]{1,30})){1,3}(?<!['\u2019]s)(?<!['\u2019])\b"
 )
 _PARTY_PATTERN = re.compile(
     r"(?i)\b(?:between|by and between|from)\s+([A-Z][^\n,;]{2,100}?)\s+(?:and|to)\s+([A-Z][^\n,;]{2,100}?)(?=[,;.\n]|$)"
@@ -799,6 +812,16 @@ def extract_entities(
             score = (_dot(vector, label_vectors[label_index[label]]) + 1.0) / 2.0
             if label == candidate.hints[0]:
                 score = max(score, candidate.floor)
+                # Candidate generation is deliberately conservative and keeps
+                # structural type hints alongside the semantic labels. A
+                # sentence embedder is not an NLI classifier: without this
+                # small prior it can call a two-token person's name an
+                # organization merely because the surrounding paragraph says
+                # "employment" or "agreement". Typed candidates (dates,
+                # amounts, identifiers) already have a high floor; the prior
+                # only strengthens ambiguous person/party/name candidates.
+                if candidate.floor < 0.8:
+                    score = min(1.0, score + 0.08)
             if score > best_score:
                 best_label = label
                 best_score = score

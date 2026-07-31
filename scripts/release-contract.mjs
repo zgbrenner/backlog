@@ -7,6 +7,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +15,42 @@ import { fileURLToPath } from "node:url";
 const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const REPOSITORY_RE = /^[0-9A-Za-z_.-]+\/[0-9A-Za-z_.-]+$/;
 const TAG_RE = /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Read and cross-check the version authorities from the exact checked-out
+ * release commit. Keeping this in the release contract means a workflow can
+ * derive every artifact name from the same metadata it validates, instead of
+ * carrying a second hand-edited version constant in YAML.
+ */
+export function releaseMetadata(root = ROOT) {
+  const packageVersion = JSON.parse(
+    readFileSync(path.join(root, "package.json"), "utf8"),
+  ).version;
+  const tauriVersion = JSON.parse(
+    readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8"),
+  ).version;
+  const cargoVersion = readFileSync(path.join(root, "src-tauri/Cargo.toml"), "utf8")
+    .match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+  const versions = [packageVersion, tauriVersion, cargoVersion];
+  if (versions.some((version) => typeof version !== "string" || !VERSION_RE.test(version))) {
+    throw new Error("package, Tauri, and Cargo versions must all be valid semver values");
+  }
+  if (new Set(versions).size !== 1) {
+    throw new Error(
+      `release version drift: package=${packageVersion}, tauri=${tauriVersion}, cargo=${cargoVersion}`,
+    );
+  }
+  const version = packageVersion;
+  const installer = `BackLog_${version}_x64-setup.exe`;
+  return {
+    version,
+    tag: `v${version}`,
+    installer,
+    signature: `${installer}.sig`,
+    manifest: "latest.json",
+  };
+}
 
 export function shouldStartRelease({
   ref,
@@ -235,13 +272,28 @@ async function runCli() {
       console.log(
         releaseState === "draft"
           ? `${tag} is an interrupted draft for this commit: publication will resume.`
-          : `${tag} is not published: the v0.5.0 release build will start.`,
+          : `${tag} is not published: the ${tag} release build will start.`,
       );
     } else if (releaseState === "published") {
       console.log(`${tag} is already published: this workflow run is complete.`);
     } else {
-      console.log(`Release skipped for ${ref}; v0.5.0 publishes only from main.`);
+      console.log(`Release skipped for ${ref}; ${tag} publishes only from main.`);
     }
+    return;
+  }
+
+  if (command === "metadata") {
+    const output = process.env.GITHUB_OUTPUT;
+    if (!output) throw new Error("GITHUB_OUTPUT is required for release metadata");
+    const metadata = releaseMetadata();
+    await appendFile(
+      output,
+      Object.entries(metadata)
+        .map(([key, value]) => `${key}=${value}`)
+        .join("\n") + "\n",
+      "utf8",
+    );
+    console.log(`Release metadata verified: ${metadata.version} (${metadata.tag}).`);
     return;
   }
 
@@ -298,7 +350,7 @@ async function runCli() {
     return;
   }
 
-  throw new Error("usage: release-contract.mjs <gate|mode|manifest|verify> [options]");
+  throw new Error("usage: release-contract.mjs <metadata|gate|mode|manifest|verify> [options]");
 }
 
 const isMain = process.argv[1] &&

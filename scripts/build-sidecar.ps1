@@ -37,6 +37,26 @@ $SidecarDir = Join-Path $RepoRoot "sidecar"
 $VenvDir = Join-Path $SidecarDir ".venv-build"
 $BinDir = Join-Path $RepoRoot "src-tauri/binaries"
 $VenvPy = Join-Path $VenvDir "Scripts/python.exe"
+$ReleaseModelDir = Join-Path $RepoRoot "src-tauri/resources/models"
+$SemanticModel = Join-Path $ReleaseModelDir "semantic\all-MiniLM-L6-v2\model.onnx"
+$SemanticVocab = Join-Path $ReleaseModelDir "semantic\all-MiniLM-L6-v2\vocab.txt"
+$SemanticModelSha256 = "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1"
+$SemanticVocabSha256 = "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+
+function Assert-Hash {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Expected,
+        [Parameter(Mandatory)][string] $Label
+    )
+    if (-not (Test-Path $Path)) {
+        throw "$Label is missing: $Path. Run scripts/stage-release-inputs.ps1 first."
+    }
+    $actual = (Get-FileHash $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $Expected) {
+        throw "$Label hash mismatch: expected $Expected, computed $actual"
+    }
+}
 
 Push-Location $SidecarDir
 try {
@@ -137,15 +157,18 @@ try {
     $builtInternal = Join-Path $builtDir "_internal"
     if (-not (Test-Path $builtInternal)) { throw "Expected build output missing: $builtInternal" }
 
-    # 4. Smoke test: drive real documents through one warm process.
+    # 4. Smoke test: drive real documents and real semantic ops through one warm process.
     #    `ping` returns {} and every heavy component sits behind a lazy
     #    factory, so a ping-only gate passes a build with a missed hidden
     #    import or an uncollected ONNX data file and fails on the customer's
     #    first document. These three fixtures cover the three lanes:
     #    markitdown/mammoth (docx), markitdown/pdfminer (pdf), and
-    #    rapidocr+onnxruntime (scanned png). All four requests go through ONE
-    #    process, which is also how the app uses it.
+    #    rapidocr+onnxruntime (scanned png), plus the ONNX MiniLM semantic
+    #    ranker and cached-label entity extractor. All six requests go
+    #    through ONE process, which is also how the app uses it.
     Write-Host "Smoke-testing the built sidecar on real fixtures..." -ForegroundColor Cyan
+    Assert-Hash $SemanticModel $SemanticModelSha256 "semantic\all-MiniLM-L6-v2\model.onnx"
+    Assert-Hash $SemanticVocab $SemanticVocabSha256 "semantic\all-MiniLM-L6-v2\vocab.txt"
 
     # The request stream has to reach convertd as BOM-less UTF-8. PowerShell
     # encodes a native command's stdin with [Console]::InputEncoding -- whatever
@@ -158,13 +181,31 @@ try {
     # it. (Restored in the outer finally.)
     $PreviousInputEncoding = [Console]::InputEncoding
     [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false
+    $PreviousModelsDir = $env:BACKLOG_MODELS_DIR
+    $env:BACKLOG_MODELS_DIR = $ReleaseModelDir
 
     $Fixtures = Join-Path $SidecarDir "fixtures"
+    $SemanticParagraphs = @(
+        @{
+            index = 0
+            text = "Jane Doe's employment terminates effective July 31, 2026 under the Acme Corporation agreement."
+            start_char = 0
+            end_char = 94
+        },
+        @{
+            index = 1
+            text = "The warehouse door was painted blue during routine maintenance."
+            start_char = 95
+            end_char = 158
+        }
+    )
     $requests = @(
         @{ id = 1; op = "versions" },
         @{ id = 2; op = "convert"; path = (Join-Path $Fixtures "sample_letter.docx"); head_pages = 10; tail_pages = 3 },
         @{ id = 3; op = "convert"; path = (Join-Path $Fixtures "sample_text.pdf"); head_pages = 10; tail_pages = 3 },
-        @{ id = 4; op = "ocr"; path = (Join-Path $Fixtures "sample_scan.png"); dpi = 300; head_pages = 10; tail_pages = 3 }
+        @{ id = 4; op = "ocr"; path = (Join-Path $Fixtures "sample_scan.png"); dpi = 300; head_pages = 10; tail_pages = 3 },
+        @{ id = 5; "op" = "rank_paragraphs"; paragraphs = $SemanticParagraphs; probes = @("employment termination date"); top_k = 1; min_score = 0.0 },
+        @{ id = 6; "op" = "extract_entities"; paragraphs = $SemanticParagraphs; labels = @(@{ label = "PERSON"; description = "a human person's full name" }, @{ label = "ORGANIZATION"; description = "a company or organization" }); threshold = 0.0 }
     ) | ForEach-Object { $_ | ConvertTo-Json -Compress }
 
     $responses = @{}
@@ -175,7 +216,7 @@ try {
         }
     }
 
-    foreach ($id in 1..4) {
+    foreach ($id in 1..6) {
         if (-not $responses.ContainsKey($id)) { throw "Smoke test failed; no response for request $id." }
         if ($responses[$id].ok -ne $true) {
             throw "Smoke test failed; request ${id}: $($responses[$id].error)"
@@ -193,7 +234,15 @@ try {
     if ($responses[4].ocr_used -ne $true -or [int]$responses[4].page_count -lt 1) {
         throw "Smoke test failed; the OCR lane did not run on sample_scan.png."
     }
-    Write-Host "Smoke test passed: versions + docx/pdf convert + png OCR." -ForegroundColor Green
+    foreach ($id in 5, 6) {
+        if ($responses[$id].available -ne $true) {
+            throw "Smoke test failed; semantic request $id did not report available: true."
+        }
+    }
+    if ($responses[5].results.Count -lt 1) {
+        throw "Smoke test failed; semantic ranker returned no ranked paragraphs."
+    }
+    Write-Host "Smoke test passed: versions + docx/pdf convert + png OCR + semantic ranking/entities." -ForegroundColor Green
 
     # 5. Place it where Tauri's bundle.resources expects it. convertd is no
     #    longer an externalBin single file, so there is no target-triple
@@ -217,6 +266,8 @@ try {
     Write-Host "  Now stage llama-server (see RELEASING.md step 2) and run 'npm run tauri build'."
 }
 finally {
+    if ($null -ne $PreviousModelsDir) { $env:BACKLOG_MODELS_DIR = $PreviousModelsDir }
+    else { Remove-Item Env:BACKLOG_MODELS_DIR -ErrorAction SilentlyContinue }
     if ($null -ne $PreviousInputEncoding) { [Console]::InputEncoding = $PreviousInputEncoding }
     Pop-Location
 }

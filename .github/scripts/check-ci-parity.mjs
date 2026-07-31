@@ -89,6 +89,7 @@ const ANCHORS = [
   ["workspace tests", "--workspace"],
   ["workspace resource staging", "bash scripts/dev-stubs.sh"],
   ["npm typecheck+build", "npm run check"],
+  ["frontend dependency audit", "npm audit --audit-level=high"],
   ["UI harness", "harness:shots"],
   ["python tests", "pytest"],
   ["Power Automate contract", "validate_examples.py"],

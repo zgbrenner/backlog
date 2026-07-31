@@ -11,6 +11,7 @@ Reproduce any of it with the load harness described at the bottom.
 |---|---|
 | Runs on 8 GB RAM, no dedicated GPU? | **Yes**, at `slm_parallel: 1`, which is now the automatic default on that machine. |
 | Runs on 8 GB with the shipped pre-0.4.0 defaults? | **No.** `slm_parallel: 4` puts the two model servers alone at 6,078 MB. |
+| How large is the semantic evidence model? | **22.1 MiB on disk**: the pinned quantized ONNX graph is 22,972,370 bytes and its tokenizer is 231,508 bytes. The model is loaded by `convertd` and is separate from the Qwen KV-cache figures below. |
 | A GPU helps? | Not used at all. `llama-server` is the CPU build; there is no CUDA/Vulkan path in this product. |
 | 1,000 tax PDFs/DOCX of 2–12 pages? | Completes, nothing is dropped. **~3.2 hours** measured on a 16-core desktop (see Throughput) — an 8 GB laptop with fewer cores will be slower. Treat it as an upper bound on speed, not a promise; an overnight run either way. |
 | Why 3.2 hours when 0.4.2 did it in 2.7? | 0.4.3 bought the party name in the filename — 38 of 40 correct against 18 — for 19% more wall clock. See Naming quality. |

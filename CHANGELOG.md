@@ -15,6 +15,27 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.6.0] — exact semantic evidence and guarded release packaging
+
+### Added
+
+- Local, torch-free ONNX paragraph ranking and cached-label entity extraction.
+  Both lanes preserve exact source text, paragraph indices, and character
+  offsets, and degrade to deterministic evidence when the optional model is
+  unavailable.
+- Hash-pinned MiniLM model assets are staged, copied into the per-user runtime
+  model directory on first launch, and exercised by the frozen-sidecar smoke
+  contract.
+
+### Fixed
+
+- The release workflow now derives the version, tag, installer name, and
+  updater paths from validated package/Tauri/Cargo metadata on the exact CI
+  commit. A stale hand-edited release version can no longer publish a mismatched
+  installer.
+- Rust formatting drift and Windows development-stub parity are covered before
+  release verification.
+
 ## [0.5.0] — reliable recovery and one-download setup
 
 ### Fixed

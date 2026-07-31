@@ -455,7 +455,10 @@ fn semantic_lane_budget(char_budget: usize) -> usize {
         .min(char_budget)
 }
 
-fn ranked_without_compression(paragraphs: &[SourceParagraph], reason: &str) -> Vec<RankedParagraph> {
+fn ranked_without_compression(
+    paragraphs: &[SourceParagraph],
+    reason: &str,
+) -> Vec<RankedParagraph> {
     paragraphs
         .iter()
         .enumerate()
@@ -513,9 +516,8 @@ fn select_paragraphs(
     // If squeezing to the normal lane would save less than 10%, an embedding
     // round-trip and a lossy selection buy almost nothing. Spend the small
     // amount of additional context and preserve the whole exact body instead.
-    let materiality_limit = ((normal_lane_budget as f64)
-        / (1.0 - MIN_COMPRESSION_SAVINGS_RATIO))
-        .ceil() as usize;
+    let materiality_limit =
+        ((normal_lane_budget as f64) / (1.0 - MIN_COMPRESSION_SAVINGS_RATIO)).ceil() as usize;
     if source_chars <= materiality_limit && full_lane_budget <= char_budget {
         return ParagraphSelection {
             ranked: ranked_without_compression(
@@ -588,10 +590,8 @@ fn deterministic_fallback_rank(
     probes: &[String],
     top_k: usize,
 ) -> Vec<RankedParagraph> {
-    let probe_terms: Vec<Vec<String>> = probes
-        .iter()
-        .map(|probe| meaningful_terms(probe))
-        .collect();
+    let probe_terms: Vec<Vec<String>> =
+        probes.iter().map(|probe| meaningful_terms(probe)).collect();
     let last_index = paragraphs.len().saturating_sub(1);
     let mut scored: Vec<(usize, f64, String)> = paragraphs
         .iter()
@@ -604,7 +604,10 @@ fn deterministic_fallback_rank(
                 if terms.is_empty() {
                     continue;
                 }
-                let hits = terms.iter().filter(|term| lower.contains(term.as_str())).count();
+                let hits = terms
+                    .iter()
+                    .filter(|term| lower.contains(term.as_str()))
+                    .count();
                 let overlap = hits as f64 / terms.len() as f64;
                 if overlap > best_overlap {
                     best_overlap = overlap;
@@ -842,9 +845,7 @@ impl BundleBuilder {
                 format!("{}\n", item.rendered)
             };
             let rendered_chars = rendered.chars().count();
-            let available = cap
-                .saturating_sub(lane_used)
-                .min(self.remaining());
+            let available = cap.saturating_sub(lane_used).min(self.remaining());
             if rendered_chars <= available {
                 self.append(&rendered);
                 lane_used += rendered_chars;
@@ -1260,18 +1261,13 @@ mod tests {
             probe: "parties".into(),
             rank: 1,
         };
-        let assembly = assemble_bundle(
-            &harvest,
-            &[],
-            &[],
-            &[entity],
-            &[ranked],
-            &[],
-            800,
-            2_000,
-        );
-        assert!(assembly.bundle.contains("EXTRACTED ENTITIES (exact source spans):"));
-        assert!(assembly.bundle.contains("RANKED BODY PARAGRAPHS (exact source text):"));
+        let assembly = assemble_bundle(&harvest, &[], &[], &[entity], &[ranked], &[], 800, 2_000);
+        assert!(assembly
+            .bundle
+            .contains("EXTRACTED ENTITIES (exact source spans):"));
+        assert!(assembly
+            .bundle
+            .contains("RANKED BODY PARAGRAPHS (exact source text):"));
         assert!(assembly.bundle.contains("José Doe"));
         assert!(assembly
             .lanes

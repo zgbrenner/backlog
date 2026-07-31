@@ -947,14 +947,25 @@ fn validate_rank_result(
 ) -> anyhow::Result<()> {
     let mut seen = HashSet::new();
     for ranked in &result.results {
-        anyhow::ensure!(ranked.score.is_finite() && (0.0..=1.0).contains(&ranked.score),
-            "semantic rank score is outside [0, 1]");
+        anyhow::ensure!(
+            ranked.score.is_finite() && (0.0..=1.0).contains(&ranked.score),
+            "semantic rank score is outside [0, 1]"
+        );
         anyhow::ensure!(ranked.rank > 0, "semantic rank must be one-based");
-        anyhow::ensure!(seen.insert(ranked.index), "semantic rank payload repeats paragraph {}", ranked.index);
+        anyhow::ensure!(
+            seen.insert(ranked.index),
+            "semantic rank payload repeats paragraph {}",
+            ranked.index
+        );
         let source = paragraphs
             .iter()
             .find(|paragraph| paragraph.index == ranked.index)
-            .ok_or_else(|| anyhow::anyhow!("semantic rank references unknown paragraph {}", ranked.index))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "semantic rank references unknown paragraph {}",
+                    ranked.index
+                )
+            })?;
         anyhow::ensure!(
             source.text == ranked.text
                 && source.start_char == ranked.start_char
@@ -963,7 +974,11 @@ fn validate_rank_result(
             ranked.index
         );
     }
-    let measured_selected: usize = result.results.iter().map(|item| item.text.chars().count()).sum();
+    let measured_selected: usize = result
+        .results
+        .iter()
+        .map(|item| item.text.chars().count())
+        .sum();
     anyhow::ensure!(
         result.selected_chars == measured_selected,
         "semantic rank selected_chars does not match the returned text"
@@ -976,16 +991,34 @@ fn validate_entity_result(
     paragraphs: &[SourceParagraph],
 ) -> anyhow::Result<()> {
     for span in &result.spans {
-        anyhow::ensure!(!span.label.trim().is_empty(), "semantic entity label is empty");
-        anyhow::ensure!(span.score.is_finite() && (0.0..=1.0).contains(&span.score),
-            "semantic entity score is outside [0, 1]");
+        anyhow::ensure!(
+            !span.label.trim().is_empty(),
+            "semantic entity label is empty"
+        );
+        anyhow::ensure!(
+            span.score.is_finite() && (0.0..=1.0).contains(&span.score),
+            "semantic entity score is outside [0, 1]"
+        );
         let source = paragraphs
             .iter()
             .find(|paragraph| paragraph.index == span.paragraph_index)
-            .ok_or_else(|| anyhow::anyhow!("semantic entity references unknown paragraph {}", span.paragraph_index))?;
-        let exact = char_slice(&source.text, span.start_char, span.end_char)
-            .ok_or_else(|| anyhow::anyhow!("semantic entity offsets are outside paragraph {}", span.paragraph_index))?;
-        anyhow::ensure!(exact == span.text, "semantic entity changed source text in paragraph {}", span.paragraph_index);
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "semantic entity references unknown paragraph {}",
+                    span.paragraph_index
+                )
+            })?;
+        let exact = char_slice(&source.text, span.start_char, span.end_char).ok_or_else(|| {
+            anyhow::anyhow!(
+                "semantic entity offsets are outside paragraph {}",
+                span.paragraph_index
+            )
+        })?;
+        anyhow::ensure!(
+            exact == span.text,
+            "semantic entity changed source text in paragraph {}",
+            span.paragraph_index
+        );
     }
     Ok(())
 }

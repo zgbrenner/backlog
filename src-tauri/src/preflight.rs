@@ -282,9 +282,8 @@ pub async fn run_with(
         problems.push(RuntimeProblem {
             field: "models".into(),
             code: "models_missing".into(),
-            message: "BackLog still needs to download the two model files it uses to name \
-                      documents. Press Download models below; it is a one-time download of \
-                      about 2.5 GB."
+            message: "BackLog still needs to download its local model bundle. Press Download \
+                      models below; it is a one-time download of about 2.5 GB."
                 .into(),
             detail: Some(format!(
                 "expected {} and {}",

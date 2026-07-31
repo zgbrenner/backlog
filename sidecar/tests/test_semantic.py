@@ -1,6 +1,7 @@
 import importlib.util
 import math
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -175,6 +176,28 @@ class CachedLabelEntityTests(unittest.TestCase):
         self.assertTrue(any(span["text"] == "Acme Holdings LLC" for span in spans))
         self.assertTrue(any(span["text"] == "Jane Doe" for span in spans))
 
+    def test_person_name_candidate_stops_before_possessive_apostrophe(self):
+        embedder = KeywordEmbedder()
+        text = "Jane Doe's employment terminates effective July 31, 2026."
+        paragraphs = [{"index": 0, "text": text, "start_char": 0, "end_char": len(text)}]
+
+        result = SEMANTIC.extract_entities(
+            embedder,
+            paragraphs,
+            SEMANTIC.DEFAULT_ENTITY_LABELS,
+            threshold=0.05,
+        )
+
+        person = next(
+            span
+            for span in result["spans"]
+            if span["label"] == "PERSON" and span["text"] == "Jane Doe"
+        )
+        self.assertEqual(person["text"], "Jane Doe")
+        self.assertEqual(person["start_char"], 0)
+        self.assertEqual(person["end_char"], 8)
+        self.assertEqual(text[person["start_char"] : person["end_char"]], "Jane Doe")
+
     def test_label_embeddings_are_cached_by_normalized_label_set(self):
         embedder = KeywordEmbedder()
         paragraphs = [
@@ -247,6 +270,18 @@ class WordPieceTokenizerTests(unittest.TestCase):
         self.assertEqual(mask[:7], [1] * 7)
         self.assertEqual(ids[7:], [0, 0, 0])
         self.assertEqual(token_types, [0] * 10)
+
+
+class SemanticAssetVerificationTests(unittest.TestCase):
+    def test_load_embedder_rejects_mismatched_local_assets_before_inference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / SEMANTIC.MODEL_RELATIVE_DIR
+            root.mkdir(parents=True)
+            (root / SEMANTIC.MODEL_FILENAME).write_bytes(b"not the pinned onnx")
+            (root / SEMANTIC.VOCAB_FILENAME).write_text("[PAD]\n[UNK]\n[CLS]\n[SEP]\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "semantic model asset hash mismatch"):
+                SEMANTIC.load_embedder(Path(tmp))
 
 
 if __name__ == "__main__":

@@ -56,6 +56,27 @@ if ((-not (Test-Path $convertdExe)) -or ((Get-Item $convertdExe).Length -eq 0)) 
     Set-Content -Path $convertdExe -Value $StubMarker -Encoding ascii -NoNewline
 }
 
+# tauri-build also validates the bundled model glob. Keep this in sync with
+# scripts/dev-stubs.sh so a fresh Windows checkout can run the same workspace
+# tests as CI without downloading model weights. The release staging script
+# replaces this marker with the hash-verified model before packaging.
+$model = Join-Path $PSScriptRoot "..\src-tauri\resources\models\Qwen3-0.6B-Q8_0.gguf"
+$modelDir = Split-Path -Parent $model
+New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
+if ((-not (Test-Path $model)) -or ((Get-Item $model).Length -eq 0)) {
+    Set-Content -Path $model -Value $StubMarker -Encoding ascii -NoNewline
+}
+
+$semanticDir = Join-Path $PSScriptRoot "..\src-tauri\resources\models\semantic\all-MiniLM-L6-v2"
+New-Item -ItemType Directory -Force -Path $semanticDir | Out-Null
+foreach ($asset in @("model.onnx", "vocab.txt")) {
+    $path = Join-Path $semanticDir $asset
+    if ((-not (Test-Path $path)) -or ((Get-Item $path).Length -eq 0)) {
+        Set-Content -Path $path -Value $StubMarker -Encoding ascii -NoNewline
+    }
+}
+
 Write-Host "Dev stub sidecar binaries created in src-tauri/binaries/." -ForegroundColor Green
 Write-Host "They carry the marker '$StubMarker' and will fail scripts/verify-binaries.ps1."
+Write-Host "The marker model was staged in src-tauri/resources/models/ and will fail release verification."
 Write-Host "Real binaries: scripts/build-sidecar.ps1 (convertd) + RELEASING.md (llama-server)."
