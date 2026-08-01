@@ -1,8 +1,12 @@
 import importlib.util
+import hashlib
 import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -163,6 +167,59 @@ class LockVerificationTests(unittest.TestCase):
             root = Path(tmp)
             errors = DOWNLOAD.verify_lock(root, {"../escape.gguf": "0" * 64})
             self.assertTrue(any("unsafe lock path" in error for error in errors))
+
+
+class ExistingLockDownloadTests(unittest.TestCase):
+    def _run_single_file_download(self, root: Path, payload: bytes, expected: bytes):
+        spec = DOWNLOAD.ModelSpec("Qwen/test", "model.gguf", "model.gguf")
+        lock_path = root / "models.lock.json"
+        lock_path.write_text(
+            json.dumps({spec.target: hashlib.sha256(expected).hexdigest()}),
+            encoding="utf-8",
+        )
+        source = root / ".cache" / "hub-download.bin"
+        source.parent.mkdir()
+
+        def fake_hf_hub_download(**_kwargs):
+            source.write_bytes(payload)
+            return str(source)
+
+        fake_hub = types.SimpleNamespace(
+            hf_hub_download=fake_hf_hub_download,
+            snapshot_download=mock.Mock(side_effect=AssertionError("unexpected snapshot")),
+        )
+        patches = (
+            mock.patch.object(DOWNLOAD, "HERE", root),
+            mock.patch.object(DOWNLOAD, "LOCK", lock_path),
+            mock.patch.object(DOWNLOAD, "MODEL_SPECS", [spec]),
+            mock.patch.dict(sys.modules, {"huggingface_hub": fake_hub}),
+        )
+        with patches[0], patches[1], patches[2], patches[3]:
+            DOWNLOAD._download_bundle()
+        return spec, lock_path
+
+    def test_mutated_download_cannot_replace_a_missing_locked_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = b"committed model bytes"
+            with self.assertRaisesRegex(RuntimeError, "does not match existing lock"):
+                self._run_single_file_download(root, b"mutable main bytes", expected)
+            self.assertFalse((root / "model.gguf").exists())
+            self.assertEqual(
+                json.loads((root / "models.lock.json").read_text(encoding="utf-8")),
+                {"model.gguf": hashlib.sha256(expected).hexdigest()},
+            )
+
+    def test_matching_download_preserves_the_committed_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = b"committed model bytes"
+            spec, lock_path = self._run_single_file_download(root, expected, expected)
+            self.assertEqual((root / spec.target).read_bytes(), expected)
+            self.assertEqual(
+                json.loads(lock_path.read_text(encoding="utf-8")),
+                {spec.target: hashlib.sha256(expected).hexdigest()},
+            )
 
 
 if __name__ == "__main__":

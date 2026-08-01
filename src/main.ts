@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, type InvokeArgs } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { check, type Update } from "@tauri-apps/plugin-updater";
@@ -332,7 +332,6 @@ const ESCALATION_GGUF_NAME = "Qwen3-1.7B-Q8_0.gguf";
 
 const QUEUE_PAGE = 200;
 const REVIEW_PAGE = 25;
-const REVIEW_FETCH_PAGE = 250;
 /** How long Approve waits before it writes the manifest Power Automate eats.
  *  Nothing downstream can un-file a document, so the only truthful undo is one
  *  that happens before the write. */
@@ -411,8 +410,10 @@ function formatDuration(hours: number): string {
  *  raw is the deterministic checker's Display form and the occasional OS
  *  error, and those are what this maps. */
 function friendlyError(raw: string): { message: string; raw: string | null } {
-  const text = raw.replace(/^Error:\s*/i, "").trim();
+  const text = raw.replace(/^(?:Error|IpcTimeoutError):\s*/i, "").trim();
   const rules: Array<[RegExp, string]> = [
+    [/^BackLog did not receive a response from .* within \d+ ms\.?$/i,
+      "BackLog is taking too long to answer. Check that it is still running, then try again."],
     [/^date '.*' is not a valid calendar date/i,
       "That is not a date on the calendar. Use the date picker, or type it as YYYY-MM-DD."],
     [/outside plausible range/i,
@@ -645,6 +646,10 @@ let cfg: Config | null = null;
 let runtime: RuntimeStatus = uncheckedRuntime();
 let view: ViewName = "queue";
 let stats: Record<string, number> = {};
+let statsError: string | null = null;
+/** Last bounded review page, used to reattach a pending correction without
+ * retaining the entire flagged ledger in the WebView. */
+let lastFlaggedJobs: Job[] = [];
 
 let queueQuery = "";
 let queueState: string | null = null;
@@ -688,6 +693,45 @@ function terminalDownloadStatus(done: ModelDownloadDone): ModelDownloadTerminal 
 // Backend wrappers
 // ---------------------------------------------------------------------------
 
+/** Reads must not be able to hold the renderer hostage forever. The sidecar
+ * commands that do real work intentionally are not routed through this helper;
+ * only cached/list/evidence reads use it, so a slow document operation is not
+ * mistaken for a dead UI. The underlying promise still gets a rejection
+ * handler after a timeout, preventing a late IPC failure from becoming an
+ * unhandled rejection. */
+const IPC_READ_TIMEOUT_MS = 1500;
+
+class IpcTimeoutError extends Error {
+  constructor(command: string) {
+    super(`BackLog did not receive a response from "${command}" within ${IPC_READ_TIMEOUT_MS} ms.`);
+    this.name = "IpcTimeoutError";
+  }
+}
+
+function invokeBounded<T>(command: string, args?: InvokeArgs): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      settled = true;
+      reject(new IpcTimeoutError(command));
+    }, IPC_READ_TIMEOUT_MS);
+    void invoke<T>(command, args).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
 /** Refreshes the in-memory runtime status. `live` runs the full machine check;
  *  otherwise this re-reads whatever the backend last cached. On failure the
  *  previous status is kept rather than reset, so a transient IPC hiccup can't
@@ -701,7 +745,9 @@ function terminalDownloadStatus(done: ModelDownloadDone): ModelDownloadTerminal 
  *  seconds must not turn into a toast every five seconds. */
 async function refreshRuntime(live: boolean, quiet = false): Promise<boolean> {
   try {
-    runtime = await invoke<RuntimeStatus>(live ? "run_preflight" : "get_runtime_status");
+    runtime = await (live
+      ? invoke<RuntimeStatus>("run_preflight")
+      : invokeBounded<RuntimeStatus>("get_runtime_status"));
     return true;
   } catch (e) {
     if (!quiet) showError(e);
@@ -709,12 +755,16 @@ async function refreshRuntime(live: boolean, quiet = false): Promise<boolean> {
   }
 }
 
-async function loadStats(): Promise<void> {
+async function loadStats(): Promise<boolean> {
   try {
-    stats = await invoke<Record<string, number>>("get_stats");
-  } catch {
+    stats = await invokeBounded<Record<string, number>>("get_stats");
+    statsError = null;
+    return true;
+  } catch (e) {
+    statsError = String(e);
     // The header degrades to the last known counts; a failed stats read is
     // never worth a toast during a backfill that emits thousands of them.
+    return false;
   }
 }
 
@@ -996,7 +1046,7 @@ async function render(): Promise<void> {
 
 type ViewData =
   | { kind: "queue"; jobs: Job[]; total: number; error?: string }
-  | { kind: "flagged"; jobs: Job[]; total: number; error?: string }
+  | { kind: "flagged"; jobs: Job[]; total: number; reasons: string[]; error?: string }
   | { kind: "settings" };
 
 async function renderOnce(): Promise<void> {
@@ -1014,8 +1064,15 @@ async function renderOnce(): Promise<void> {
   // so a nav click highlights its tab at once instead of after a round trip.
   paintHeader();
 
-  await loadStats();
-  const data = await loadViewData(wanted);
+  // Start both reads together. A hung stats read must not prevent the view
+  // read from reaching its own bounded recovery state, and Settings can be
+  // shown immediately after a failed stats read because it needs no ledger
+  // data of its own.
+  const statsTask = wanted === "settings" && statsError
+    ? Promise.resolve(false)
+    : loadStats();
+  const dataTask = loadViewData(wanted);
+  const [, data] = await Promise.all([statsTask, dataTask]);
   // Superseded (a nav click, an event, a button) — the newer render owns the
   // DOM and this one must not touch it.
   if (token !== renderSeq || wanted !== view) return;
@@ -1069,8 +1126,8 @@ async function loadViewData(wanted: ViewName): Promise<ViewData> {
   if (wanted === "queue") {
     try {
       const [jobs, total] = await Promise.all([
-        invoke<Job[]>("list_jobs", jobListArgs({ limit: QUEUE_PAGE, offset: queuePage * QUEUE_PAGE })),
-        invoke<number>("count_jobs", jobListArgs({})),
+        invokeBounded<Job[]>("list_jobs", jobListArgs({ limit: QUEUE_PAGE, offset: queuePage * QUEUE_PAGE })),
+        invokeBounded<number>("count_jobs", jobListArgs({})),
       ]);
       // Seed "Working on:" from the page we just fetched (ordered by
       // updated_at DESC), so the line is populated the moment the queue opens
@@ -1083,18 +1140,23 @@ async function loadViewData(wanted: ViewName): Promise<ViewData> {
     }
   }
   try {
-    const total = await invoke<number>("count_jobs", { query: null, jobState: "flagged", job_state: "flagged" });
-    const jobs: Job[] = [];
-    // Reason filtering and oldest-first ordering must consider the whole
-    // flagged set, not merely the first screenful returned by the backend.
-    for (let offset = 0; offset < total; offset += REVIEW_FETCH_PAGE) {
-      const batch = await invoke<Job[]>("list_flagged", { limit: REVIEW_FETCH_PAGE, offset });
-      jobs.push(...batch);
-      if (batch.length < REVIEW_FETCH_PAGE) break;
-    }
-    return { kind: "flagged", jobs, total };
+    const reason = reviewReason || null;
+    const oldestFirst = reviewOrder === "oldest";
+    const [total, jobs, reasons] = await Promise.all([
+      invokeBounded<number>("count_flagged", { reason, flag_reason: reason }),
+      invokeBounded<Job[]>("list_flagged", {
+        limit: Math.min(reviewShown, 2000),
+        offset: 0,
+        reason,
+        oldest_first: oldestFirst,
+        oldestFirst,
+      }),
+      invokeBounded<string[]>("list_flag_reasons"),
+    ]);
+    lastFlaggedJobs = jobs;
+    return { kind: "flagged", jobs, total, reasons };
   } catch (e) {
-    return { kind: "flagged", jobs: [], total: 0, error: String(e) };
+    return { kind: "flagged", jobs: [], total: 0, reasons: [], error: String(e) };
   }
 }
 
@@ -1382,14 +1444,17 @@ function buildQueue(data: { jobs: Job[]; total: number; error?: string }): Node[
     return nodes;
   }
   const table = el(`
-    <div class="table-wrap">
-      <table>
-        <thead><tr>
-          <th scope="col">Original</th><th scope="col">New name</th>
-          <th scope="col">Description</th><th scope="col">State</th><th scope="col">Updated</th>
-        </tr></thead>
-        <tbody></tbody>
-      </table>
+    <div class="queue-table">
+      <div class="table-wrap" role="region" aria-label="Document queue" tabindex="0">
+        <table>
+          <thead><tr>
+            <th scope="col">Original</th><th scope="col">New name</th>
+            <th scope="col">Description</th><th scope="col">State</th><th scope="col">Updated</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="table-scroll-note">On a narrow window, scroll horizontally to see all queue columns.</p>
     </div>`);
   const body = q<HTMLTableSectionElement>(table, "tbody");
   for (const job of data.jobs) {
@@ -1535,11 +1600,10 @@ function reasonCopy(raw: string | null): { title: string; why: string; next: str
 }
 
 function buildFlagged(
-  data: { jobs: Job[]; total: number; error?: string },
+  data: { jobs: Job[]; total: number; reasons: string[]; error?: string },
   held: Map<string, ReviewCard>
 ): Node[] {
-  const reasonKeys = [...new Set(data.jobs.map((job) => (job.flag_reason ?? "").split(":")[0].trim()).filter(Boolean))]
-    .sort();
+  const reasonKeys = data.reasons;
   const bar = el(`
     <div class="toolbar">
       <label class="sr-only" for="review-reason-filter">Filter review reason</label>
@@ -1584,10 +1648,10 @@ function buildFlagged(
       ? Date.parse(a.updated_at) - Date.parse(b.updated_at)
       : Date.parse(b.updated_at) - Date.parse(a.updated_at));
   const visibleJobs = matchingJobs.slice(0, reviewShown);
-  reviewMatchingTotal = matchingJobs.length;
+  reviewMatchingTotal = data.total;
   reviewVisibleCount = visibleJobs.length;
   for (const job of visibleJobs) {
-    const existing = held.get(job.sha256);
+    const existing = held.get(job.sha256) ?? pendingApprovals.get(job.sha256)?.card;
     if (existing) keep(job.sha256, existing);
     else {
       cards.push(buildReviewCard(job).root);
@@ -1599,6 +1663,17 @@ function buildFlagged(
   // gone and its timer still running.
   for (const [sha256, card] of held) {
     if (!seen.has(sha256)) keep(sha256, card);
+  }
+  // A pending approval can be detached while Settings is open, so it is not
+  // present in 'held' when the reviewer comes back. Reattach the original
+  // parked node whenever its flagged row is still in the current result set;
+  // rebuilding it from the ledger would restore the editable form while the
+  // countdown and the tray still describe an approval that is already queued.
+  for (const pending of pendingApprovals.values()) {
+    const sha256 = pending.card.job.sha256;
+    if (seen.has(sha256)) continue;
+    const job = matchingJobs.find((candidate) => candidate.sha256 === sha256);
+    if (job) keep(sha256, pending.card);
   }
 
   if (data.error) {
@@ -1612,7 +1687,7 @@ function buildFlagged(
     return nodes;
   }
   nodes.push(...cards);
-  nodes.push(buildReviewFoot(visibleJobs.length, matchingJobs.length));
+  nodes.push(buildReviewFoot(visibleJobs.length, data.total));
   return nodes;
 }
 
@@ -1846,8 +1921,31 @@ function buildReviewCard(job: Job): ReviewCard {
   q<HTMLButtonElement>(root, '[data-act="evidence"]').addEventListener("click", async (ev) => {
     const button = ev.currentTarget as HTMLButtonElement;
     await togglePane(button, evidencePane, async () => {
-      evidencePane.textContent = await loadEvidence(card.job.sha256)
-        ?? "There is no saved text for this file — it failed before BackLog could read it.";
+      const result = await loadEvidence(card.job.sha256);
+      if (result.kind === "available") {
+        evidencePane.textContent = result.text;
+        return;
+      }
+      if (result.kind === "missing") {
+        evidencePane.textContent =
+          "There is no saved text for this file — it failed before BackLog could read it.";
+        return;
+      }
+      const failure = el(
+        '<div class="evidence-error" role="alert">' +
+        '<p class="msg">BackLog could not read the saved text right now. Try again.</p>' +
+        '<details class="tech"><summary>Technical detail</summary><code class="reason"></code></details>' +
+        '<button type="button" class="ghost evidence-retry">Try again</button></div>'
+      );
+      q<HTMLElement>(failure, ".reason").textContent = friendlyError(result.raw).raw ?? result.raw;
+      q<HTMLButtonElement>(failure, ".evidence-retry").addEventListener("click", () => {
+        // Read failures are deliberately not cached, so this asks the backend again.
+        evidenceCache.delete(card.job.sha256);
+        evidencePane.hidden = true;
+        button.setAttribute("aria-expanded", "false");
+        button.click();
+      });
+      evidencePane.replaceChildren(failure);
     });
   });
 
@@ -2016,24 +2114,42 @@ function dropCard(card: ReviewCard): void {
 
 // --- evidence, timeline, date candidates ------------------------------------
 
-const evidenceCache = new Map<string, string | null>();
+type EvidenceResult =
+  | { kind: "available"; text: string }
+  | { kind: "missing" }
+  | { kind: "error"; raw: string };
 
-async function loadEvidence(sha256: string): Promise<string | null> {
+const evidenceCache = new Map<string, EvidenceResult>();
+
+function isMissingEvidenceError(raw: string): boolean {
+  return /no such file|not found|does not exist/i.test(raw);
+}
+
+async function loadEvidence(sha256: string): Promise<EvidenceResult> {
   if (evidenceCache.has(sha256)) return evidenceCache.get(sha256)!;
-  let text: string | null = null;
   try {
-    text = await invoke<string>("get_evidence", { sha256 });
-  } catch {
-    text = null;
+    const text = await invokeBounded<string>("get_evidence", { sha256 });
+    const result: EvidenceResult = { kind: "available", text };
+    evidenceCache.set(sha256, result);
+    return result;
+  } catch (e) {
+    const raw = String(e);
+    // A missing evidence file is a normal outcome for a conversion that
+    // failed before text was persisted. Other failures remain retryable:
+    // caching them made a transient IPC or disk error look permanently empty.
+    if (isMissingEvidenceError(raw)) {
+      const result: EvidenceResult = { kind: "missing" };
+      evidenceCache.set(sha256, result);
+      return result;
+    }
+    return { kind: "error", raw };
   }
-  evidenceCache.set(sha256, text);
-  return text;
 }
 
 async function buildTimeline(sha256: string): Promise<HTMLElement> {
   let events: LedgerEvent[] = [];
   try {
-    events = await invoke<LedgerEvent[]>("get_events", { sha256, limit: 60 });
+    events = await invokeBounded<LedgerEvent[]>("get_events", { sha256, limit: 60 });
   } catch (e) {
     const err = el(`<p class="err"></p>`);
     err.textContent = friendlyError(String(e)).message;
@@ -2086,8 +2202,9 @@ function extractDateCandidates(text: string, limit = 6): string[] {
 
 function observeForDates(card: ReviewCard, dateInput: HTMLInputElement, host: HTMLElement): void {
   const fill = async () => {
-    const text = await loadEvidence(card.job.sha256);
-    if (!text) return;
+    const result = await loadEvidence(card.job.sha256);
+    if (result.kind !== "available" || !result.text) return;
+    const text = result.text;
     const candidates = extractDateCandidates(text);
     if (!candidates.length) return;
     for (const iso of candidates) {
@@ -2127,6 +2244,120 @@ type PendingApproval = {
 };
 
 const pendingApprovals = new Map<string, PendingApproval>();
+const approvalsInFlight = new Map<string, PendingApproval>();
+const PENDING_APPROVAL_STORAGE_KEY = "backlog.pending-approvals";
+
+type StoredPendingApproval = {
+  sha256: string;
+  fields: PendingApproval["fields"];
+};
+
+function storedApprovalFields(value: unknown): value is PendingApproval["fields"] {
+  if (!value || typeof value !== "object") return false;
+  const fields = value as Record<string, unknown>;
+  return typeof fields.date === "string"
+    && typeof fields.subject === "string"
+    && typeof fields.description === "string"
+    && fields.date.length <= 32
+    && fields.subject.length <= 512
+    && fields.description.length <= 4096;
+}
+
+/** Keep only a short-lived renderer intent. Storing this in sessionStorage is
+ * deliberate: a correction can contain document metadata, so it must not
+ * become a persistent browser profile record. The native resubmit remains the
+ * only operation that can create a manifest. */
+function persistPendingApprovals(): void {
+  const records = new Map<string, StoredPendingApproval>();
+  for (const pending of [...pendingApprovals.values(), ...approvalsInFlight.values()]) {
+    records.set(pending.card.job.sha256, {
+      sha256: pending.card.job.sha256,
+      fields: pending.fields,
+    });
+  }
+  try {
+    if (!records.size) {
+      sessionStorage.removeItem(PENDING_APPROVAL_STORAGE_KEY);
+      return;
+    }
+    sessionStorage.setItem(PENDING_APPROVAL_STORAGE_KEY, JSON.stringify([...records.values()]));
+  } catch {
+    // Storage can be disabled by an embedded WebView policy. Failing closed
+    // here is preferable to attempting an unawaited IPC write on unload.
+  }
+}
+
+function takeStoredPendingApprovals(): StoredPendingApproval[] {
+  try {
+    const raw = sessionStorage.getItem(PENDING_APPROVAL_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((entry): entry is StoredPendingApproval => {
+      if (!entry || typeof entry !== "object") return false;
+      const record = entry as Record<string, unknown>;
+      return typeof record.sha256 === "string"
+        && /^[a-f0-9-]{1,90}$/i.test(record.sha256)
+        && storedApprovalFields(record.fields);
+    });
+  } catch {
+    return [];
+  }
+}
+
+function clearStoredPendingApprovals(): void {
+  try {
+    sessionStorage.removeItem(PENDING_APPROVAL_STORAGE_KEY);
+  } catch {
+    // Storage may be disabled; there is nothing else to clear.
+  }
+}
+
+/** Reattach a correction after a renderer reload without treating it as
+ * submitted. If a previous in-flight invoke already succeeded, its row is no
+ * longer in the flagged query and the stale intent is discarded. */
+async function restorePendingApprovals(): Promise<void> {
+  const saved = takeStoredPendingApprovals();
+  if (!saved.length) return;
+  if (view !== "flagged") {
+    view = "flagged";
+    await render();
+  }
+  // A failed list read must leave the intent available for the next renderer
+  // session. The error card is the stable signal because render() deliberately
+  // keeps its public return type void.
+  if (document.querySelector("#content .err-state")) return;
+  let retryNeeded = false;
+  for (const record of saved) {
+    let card = reviewCards.get(record.sha256);
+    if (!card) {
+      const listed = lastFlaggedJobs.find((job) => job.sha256 === record.sha256);
+      const job = listed ?? await invokeBounded<Job | null>("get_flagged_job", {
+        sha256: record.sha256,
+      }).catch(() => {
+        retryNeeded = true;
+        return null;
+      });
+      if (job) {
+        card = buildReviewCard(job);
+        reviewCards.set(job.sha256, card);
+        const foot = document.getElementById("review-foot");
+        document.getElementById("content")?.insertBefore(card.root, foot);
+      }
+    }
+    if (!card) continue;
+    dirtyEdits.set(record.sha256, { ...record.fields });
+    const date = q<HTMLInputElement>(card.root, '[name="date"]');
+    const subject = q<HTMLInputElement>(card.root, '[name="subject"]');
+    const description = q<HTMLInputElement>(card.root, '[name="description"]');
+    date.value = record.fields.date;
+    subject.value = record.fields.subject;
+    description.value = record.fields.description;
+    card.dirty = true;
+    beginApproval(card, record.fields);
+  }
+  if (!retryNeeded) clearStoredPendingApprovals();
+}
 
 /** Pending approvals belong to the app, not to the review tab. A reviewer can
  * check Settings without turning a ten-second safety window into an immediate
@@ -2173,6 +2404,7 @@ function beginApproval(card: ReviewCard, fields: PendingApproval["fields"]): voi
     void commitApproval(pending);
   }, 1000);
   pendingApprovals.set(card.job.sha256, pending);
+  persistPendingApprovals();
   paintPendingApprovalTray();
   // Move on: the next card's date field is where the reviewer is going. Hiding
   // the form has just blurred the submit button they pressed, so this is also
@@ -2185,6 +2417,7 @@ function cancelApproval(card: ReviewCard): void {
   if (!pending) return;
   window.clearInterval(pending.timer);
   pendingApprovals.delete(card.job.sha256);
+  persistPendingApprovals();
   paintPendingApprovalTray();
   card.busy = false;
   // The dirtyEdits entry deliberately stays: Undo puts the reviewer back in
@@ -2199,6 +2432,8 @@ async function commitApproval(pending: PendingApproval): Promise<void> {
   window.clearInterval(pending.timer);
   const { card, fields } = pending;
   pendingApprovals.delete(card.job.sha256);
+  approvalsInFlight.set(card.job.sha256, pending);
+  persistPendingApprovals();
   paintPendingApprovalTray();
   const strip = q<HTMLElement>(card.root, ".undo-strip");
   q<HTMLElement>(strip, ".filing").innerHTML =
@@ -2206,8 +2441,12 @@ async function commitApproval(pending: PendingApproval): Promise<void> {
   q<HTMLButtonElement>(strip, '[data-act="undo"]').disabled = true;
   try {
     await invoke("resubmit", { sha256: card.job.sha256, ...fields });
+    approvalsInFlight.delete(card.job.sha256);
+    persistPendingApprovals();
     dropCard(card);
   } catch (e) {
+    approvalsInFlight.delete(card.job.sha256);
+    persistPendingApprovals();
     // The card comes back exactly as the reviewer left it, with their typing
     // intact — this is the one place a lost correction would be unrecoverable.
     card.busy = false;
@@ -2224,13 +2463,6 @@ async function commitApproval(pending: PendingApproval): Promise<void> {
     q<HTMLElement>(card.root, ".err").textContent = friendlyError(String(e)).message;
     showError(e);
   }
-}
-
-/** Commit everything still on its countdown. Called when the reviewer leaves
- *  the screen and when the window goes away: a pending approval must never be
- *  silently dropped. */
-function flushPendingApprovals(): void {
-  for (const pending of [...pendingApprovals.values()]) void commitApproval(pending);
 }
 
 // ---------------------------------------------------------------------------
@@ -2267,7 +2499,8 @@ function buildSettings(): Node[] {
   const folder = (label: string, key: keyof Config, note?: string) => `
     <label class="wide">${label}
       <div class="pick"><input name="${key}" value="${esc(String(c[key] ?? ""))}" spellcheck="false">
-      <button type="button" class="ghost" data-pick="${key}">Browse</button></div>
+      <button type="button" class="ghost" data-pick="${key}"
+        aria-label="Browse for ${esc(label)}">Browse</button></div>
       ${note ? `<span class="field-note">${note}</span>` : ""}
     </label>`;
 
@@ -2865,7 +3098,10 @@ listen<ModelDownloadDone>("model-download-done", async (event) => {
   paintHeader();
 });
 
-window.addEventListener("beforeunload", flushPendingApprovals);
+// `beforeunload` cannot await a Tauri invoke. Persist the intent for the next
+// renderer session instead of pretending that an asynchronous resubmit has
+// completed before WebView2 tears down the page.
+window.addEventListener("beforeunload", persistPendingApprovals);
 
 // ---------------------------------------------------------------------------
 // Boot
@@ -2893,6 +3129,7 @@ window.addEventListener("beforeunload", flushPendingApprovals);
   await refreshRuntime(false);
   if (!cfg.processing_dir || !runtime.configured) view = "settings";
   await render();
+  await restorePendingApprovals();
   // Both non-blocking and after the first paint, so neither a slow update
   // endpoint nor a convertd probe can delay startup.
   void checkForUpdates();

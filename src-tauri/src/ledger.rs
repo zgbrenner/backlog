@@ -618,6 +618,31 @@ impl Ledger {
         Ok(changed == 1)
     }
 
+    /// Guarded compare-and-swap that additionally requires an exact current
+    /// state. This is for operator actions whose meaning depends on the card
+    /// the operator saw (for example, correcting a flagged job): the general
+    /// state transition table intentionally permits replay from any in-flight
+    /// rung, so it is not a sufficient ownership check for those commands.
+    pub fn set_state_if_current(
+        &self,
+        sha256: &str,
+        expected: JobState,
+        state: JobState,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        if !transition_allowed(expected, state) {
+            return Ok(false);
+        }
+        let now = now_iso();
+        let changed = conn.execute(
+            "UPDATE jobs SET state=?2, last_stage=?2, stage_started_at=?3,
+                 attempts=0, updated_at=?3
+             WHERE sha256=?1 AND state=?4",
+            params![sha256, state.as_str(), now, expected.as_str()],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Whole-slice write in one statement (and therefore one implicit
     /// transaction). The previous column-per-transaction form cost ~20 commits
     /// per file, each taken while holding the global connection mutex — the
@@ -787,10 +812,17 @@ impl Ledger {
                  stage_started_at=NULL, flag_reason=NULL, quarantine_path=NULL, soft_flags=NULL,
                  final_filename=NULL, proposed_date=NULL, date_source=NULL,
                  proposed_subject=NULL, description=NULL, updated_at=?2
-             WHERE sha256=?1",
+             WHERE sha256=?1 AND state='flagged'",
             params![sha256, now_iso()],
         )?;
         Ok(changed == 1)
+    }
+
+    fn escape_like(value: &str) -> String {
+        value
+            .replace('\\', r"\\")
+            .replace('%', r"\%")
+            .replace('_', r"\_")
     }
 
     /// Shared WHERE fragment + bound values for the search/count pair, so a
@@ -804,10 +836,7 @@ impl Ledger {
         let mut values = Vec::new();
         if let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) {
             // LIKE wildcards typed by a human are literals, not operators.
-            let escaped = q
-                .replace('\\', r"\\")
-                .replace('%', r"\%")
-                .replace('_', r"\_");
+            let escaped = Self::escape_like(q);
             let pattern = format!("%{escaped}%");
             sql.push_str(
                 " AND (original_name LIKE ? ESCAPE '\\' OR final_filename LIKE ? ESCAPE '\\')",
@@ -818,6 +847,17 @@ impl Ledger {
         if let Some(state) = state {
             sql.push_str(" AND state = ?");
             values.push(Value::Text(state.as_str().to_string()));
+        }
+        (sql, values)
+    }
+
+    fn flagged_reason_filter(reason: Option<&str>) -> (String, Vec<rusqlite::types::Value>) {
+        use rusqlite::types::Value;
+        let mut sql = " WHERE state = ?".to_string();
+        let mut values = vec![Value::Text(JobState::Flagged.as_str().to_string())];
+        if let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) {
+            sql.push_str(" AND flag_reason LIKE ? ESCAPE '\\'");
+            values.push(Value::Text(format!("{}:%", Self::escape_like(reason))));
         }
         (sql, values)
     }
@@ -853,16 +893,63 @@ impl Ledger {
         Ok(n)
     }
 
-    /// Paged flagged/NeedsReview listing. The unbounded form this replaces
-    /// shipped every flagged row in a whole backfill across the IPC boundary
-    /// to render one screen.
-    pub fn list_by_state_paged(
+    /// Bounded Needs Review listing with the same reason/order semantics as the
+    /// UI. Filtering in SQLite keeps a large flagged backfill out of the IPC
+    /// boundary and out of the WebView heap; the frontend only receives the
+    /// cards it can actually display.
+    pub fn list_flagged_paged(
         &self,
-        state: JobState,
+        reason: Option<&str>,
+        oldest_first: bool,
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<Vec<Job>> {
-        self.search_jobs(None, Some(state), limit, offset)
+        use rusqlite::types::Value;
+        let (filter, mut values) = Self::flagged_reason_filter(reason);
+        let direction = if oldest_first { "ASC" } else { "DESC" };
+        let sql = format!(
+            "SELECT * FROM jobs{filter} ORDER BY updated_at {direction}, sha256 {direction} LIMIT ? OFFSET ?"
+        );
+        values.push(Value::Integer(limit as i64));
+        values.push(Value::Integer(offset as i64));
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), Self::row_to_job)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn count_flagged(&self, reason: Option<&str>) -> anyhow::Result<i64> {
+        let (filter, values) = Self::flagged_reason_filter(reason);
+        let sql = format!("SELECT COUNT(*) FROM jobs{filter}");
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        Ok(stmt.query_row(params_from_iter(values), |row| row.get(0))?)
+    }
+
+    /// Return only stable machine reason codes, never the document-bearing
+    /// detail after the colon. This keeps the filter menu useful without
+    /// copying failure text or metadata into the renderer.
+    pub fn flagged_reasons(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT flag_reason FROM jobs WHERE state=?1 AND flag_reason IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![JobState::Flagged.as_str()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut reasons = std::collections::BTreeSet::new();
+        for raw in rows {
+            let raw = raw?;
+            if let Some(code) = raw
+                .split(':')
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                reasons.insert(code.to_string());
+            }
+        }
+        Ok(reasons.into_iter().collect())
     }
 
     /// Jobs that reached a terminal outcome inside the last `window_mins` —
@@ -1365,6 +1452,22 @@ mod tests {
                 .unwrap();
         }
         ledger.set_state("b", JobState::Flagged).unwrap();
+        ledger
+            .update_fields(
+                "b",
+                &[("flag_reason", Some("BAD_SUBJECT:generic subject".into()))],
+            )
+            .unwrap();
+        ledger
+            .ingest("d", "C:/P/locked.pdf", "locked.pdf", "locked.pdf", "pdf")
+            .unwrap();
+        ledger
+            .update_fields(
+                "d",
+                &[("flag_reason", Some("ENCRYPTED:password protected".into()))],
+            )
+            .unwrap();
+        ledger.set_state("d", JobState::Flagged).unwrap();
 
         assert_eq!(ledger.count_jobs(Some("acme"), None).unwrap(), 2);
         assert_eq!(
@@ -1379,20 +1482,39 @@ mod tests {
             ledger.search_jobs(Some("acme"), None, 10, 2).unwrap().len(),
             0
         );
-        assert_eq!(ledger.count_jobs(None, Some(JobState::Flagged)).unwrap(), 1);
+        assert_eq!(ledger.count_jobs(None, Some(JobState::Flagged)).unwrap(), 2);
         assert_eq!(
             ledger
-                .list_by_state_paged(JobState::Flagged, 10, 0)
+                .search_jobs(None, Some(JobState::Flagged), 10, 0)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            ledger
+                .search_jobs(None, Some(JobState::Flagged), 10, 1)
                 .unwrap()
                 .len(),
             1
         );
+        assert_eq!(ledger.count_flagged(Some("BAD_SUBJECT")).unwrap(), 1);
         assert_eq!(
             ledger
-                .list_by_state_paged(JobState::Flagged, 10, 1)
-                .unwrap()
-                .len(),
-            0
+                .list_flagged_paged(Some("BAD_SUBJECT"), false, 10, 0)
+                .unwrap()[0]
+                .sha256,
+            "b"
+        );
+        assert_eq!(
+            ledger
+                .list_flagged_paged(Some("ENCRYPTED"), false, 10, 0)
+                .unwrap()[0]
+                .sha256,
+            "d"
+        );
+        assert_eq!(
+            ledger.flagged_reasons().unwrap(),
+            vec!["BAD_SUBJECT".to_string(), "ENCRYPTED".to_string()]
         );
 
         // A wildcard typed by a human is a literal, not a match-everything.
@@ -1429,6 +1551,19 @@ mod tests {
         assert!(job.quarantine_path.is_none());
         assert!(job.claimed_at.is_none());
         assert!(!ledger.reset_for_reprocess("ghost").unwrap());
+    }
+
+    #[test]
+    fn reset_for_reprocess_refuses_terminal_jobs() {
+        let (_dir, ledger) = ledger();
+        seed(&ledger, "terminal");
+        assert!(ledger.set_state("terminal", JobState::Emitted).unwrap());
+
+        assert!(!ledger.reset_for_reprocess("terminal").unwrap());
+        assert_eq!(
+            ledger.get("terminal").unwrap().unwrap().state,
+            JobState::Emitted
+        );
     }
 
     #[test]

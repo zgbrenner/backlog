@@ -409,6 +409,14 @@ button.danger:hover { background: var(--bad-soft); }
 .evidence {
   font-family: var(--mono); font-size: 12px; white-space: pre-wrap; margin-bottom: 0;
 }
+.evidence-error {
+  font-family: inherit; white-space: normal; line-height: 1.5;
+}
+.evidence-error .msg { margin: 0 0 10px; color: var(--bad); }
+.evidence-error .tech { margin-bottom: 10px; }
+.evidence-error .reason {
+  display: block; white-space: pre-wrap; word-break: break-word; color: var(--dim);
+}
 .timeline { font-size: 12.5px; }
 .timeline ol { list-style: none; margin: 0; padding: 0; }
 .timeline li {
@@ -419,6 +427,10 @@ button.danger:hover { background: var(--bad-soft); }
 .timeline .at { color: var(--dim); font-variant-numeric: tabular-nums; }
 .timeline .stage { color: var(--accent); font-weight: 600; }
 .timeline .detail { word-break: break-word; }
+
+.table-scroll-note {
+  display: none; margin: 7px 2px 0; color: var(--dim); font-size: 11.5px;
+}
 
 /* Approve is deferred, not undoable after the fact: the manifest it writes is
  * consumed by Power Automate. So the card parks here for ten seconds first. */
@@ -696,4 +708,19 @@ details.advanced .dim-note { margin-bottom: 12px; }
   .fields { grid-template-columns: 1fr; }
   .grid3 { grid-template-columns: repeat(2, 1fr); }
   .timeline li { grid-template-columns: 1fr; gap: 2px; }
+}
+
+/* Keep the table semantics on small Windows windows, but give its columns
+ * enough room to read filenames and descriptions. The focused region exposes
+ * the overflow to keyboard and touch users instead of clipping it. */
+@media (max-width: 720px) {
+  .table-wrap {
+    overflow-x: auto; overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+  }
+  .table-wrap table { min-width: 760px; }
+  td.mono { word-break: normal; overflow-wrap: anywhere; }
+  td.desc { max-width: 320px; }
+  td.when { white-space: normal; }
+  .table-scroll-note { display: block; }
 }

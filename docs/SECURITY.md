@@ -14,11 +14,11 @@ the appliance. Where the two differ, this file is the more precise one.
   modes before importing model libraries.
 - Rust injects the app-data models directory (`app_data_dir()/models`, i.e.
   `%APPDATA%\ai.sonomos.backlog\models`) into `BACKLOG_MODELS_DIR` before
-  starting the sidecar. Models are **not** installer resources: `bundle.resources`
-  maps only `resources/*` and `binaries/*.dll`, and `lib.rs` rehomes both GGUF
-  paths to that directory at startup — which is also where the in-app downloader
+  starting the sidecar. The release bundle contains the verified primary GGUF
+  and semantic assets as installer resources; startup relocates the bundled
+  weights into that per-user directory, which is also where the in-app downloader
   writes. An absolute path a user set via Settings' Browse dialog is honored
-  untouched.
+  only after the normal path and preflight checks.
 - llama-server binds only to `127.0.0.1` and uses two dedicated local ports.
 - The deterministic Rust checker is the final authority before an `ok` manifest.
 - A source document is never silently deleted. Failure becomes terminal only
@@ -28,8 +28,9 @@ the appliance. Where the two differ, this file is the more precise one.
   an audit trail instead of treating the correction as an unrelated document.
 - Power Automate error rows contain operational details, not extracted document
   text or evidence bundles.
-- The desktop capability file grants only Tauri core, event, window, and dialog
-  permissions. The application does not initialize shell or opener plugins.
+- The desktop capability file grants Tauri core, event, window, and dialog
+  permissions plus the narrowly used updater and process-restart permissions.
+  The application does not initialize shell or opener plugins.
 - Two plugins ARE initialized and are deliberate grants, not oversights:
   - **`tauri-plugin-updater`** — the signed self-update channel. It is the one
     component permitted to download and execute code. Every update is verified
@@ -49,11 +50,12 @@ the appliance. Where the two differ, this file is the more precise one.
   prompt the appliance user cannot satisfy. `webviewInstallMode` is
   `offlineInstaller`, so no part of installation contacts Microsoft.
 - Model weights are one of exactly two deliberate exceptions to "no runtime
-  network access" (the other is the updater check above): `download_models` (`src-tauri/src/model_download.rs`), invoked
-  once from Settings when Readiness reports missing model files, streams the
-  pinned Hugging Face repos over HTTPS into `app_data/models` and SHA-256-
-  verifies every file against `models.lock.json` (trust-on-first-download,
-  then verify on every subsequent run — mirroring `models/download_models.py`).
+  network access" (the other is the updater check above): `download_models`
+  (`src-tauri/src/model_download.rs`), invoked once from Settings when
+  Readiness reports missing model files, streams the pinned Hugging Face
+  payloads over HTTPS into `app_data/models` and SHA-256-verifies every file
+  against `models.lock.json`. A missing or mismatched locked payload fails
+  closed; document processing never reaches the network.
   This uses the `reqwest` crate directly from Rust, not a webview-exposed
   plugin, so it added no capability grant. Document processing itself never
   reaches the network.
@@ -82,7 +84,7 @@ folder, which the operator chooses.
 | `ledger.db` — original names, proposed dates, subjects, descriptions, local paths, event trail | Whole-file SQLCipher encryption (`rusqlite` `bundled-sqlcipher-vendored-openssl`). |
 | `ledger.key` — the 256-bit SQLCipher key | DPAPI `CryptProtectData`, decryptable only by the same Windows user on the same machine. Never written in plaintext. |
 | `cache\*.md` — converted document text | Purged on emit (`retain_cache=false` default); flagged files keep theirs until review resolves; `cache_ttl_days` (7) sweeps orphans at startup. |
-| `<outbox>\_manifests\*.json` | **Not encrypted, by necessity** — Power Automate must read them. They carry the proposed filename, description, date and identifiers, never document text, and Flow 2 deletes each after committing. |
+| `<outbox>\_manifests\*.json` | **Not encrypted, by necessity** — Power Automate must read them. They carry the proposed filename, description, date, date source, document type, language, original name/path, content and delivery identifiers, model versions and soft flags; never document text. Flow 2 deletes each after committing. |
 | Quarantine directory | Unmodified source documents. Protect it as you protect the originals; it must be local, not synced. |
 | `logs\` | Folder paths reduced to drive + depth (`logging::redact_path`); model output replaced with `[model output withheld]`. |
 | `models\` | ~2.4 GB of Apache-2.0 weights. Not sensitive; SHA-256-verified against `models.lock.json`. |

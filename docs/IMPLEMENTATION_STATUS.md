@@ -1,6 +1,6 @@
 # BackLog implementation status
 
-**Updated:** 2026-07-28
+**Updated:** 2026-07-31
 
 This branch consolidates the original prototype, the reliability implementation,
 and the independent reproducibility contribution.
@@ -73,18 +73,21 @@ sidecar binaries and no model weights, and is the copy that actually enforces
 anything: `.github/workflows/ci.yml` lists the same five jobs on ubuntu-latest
 and does execute — the repository is public, so runs are unmetered — but its
 `Workspace (app crate)` job cannot pass without the model weights, and the
-workflows are disabled for that reason (`docs/KNOWN_ISSUES.md` item 11). Fresh
-counts from the current tree:
+workflows are disabled for that reason (`docs/KNOWN_ISSUES.md` item 11).
+Verification counts from the current tree (2026-07-31):
 
 | Check | Result |
 |---|---|
-| `cargo test -p backlog-core` | 49 passed |
-| `cargo test --workspace --all-targets` | 199 passed (150 app + 49 core) |
-| `cargo clippy --workspace --all-targets -- -D warnings` | 0 warnings |
+| `cargo test -p backlog-core --locked` | 60 passed |
+| `cargo test -p backlog --lib --locked` | 196 passed, 3 ignored |
+| `cargo test --workspace --all-targets --locked` | not completed locally: Windows drive space was exhausted while creating a static archive; the app-lib and core gates above pass |
+| `cargo clippy -p backlog --lib --locked -- -D warnings` | 0 warnings |
+| `cargo clippy -p backlog-core --all-targets --locked -- -D warnings` | 0 warnings |
 | `cargo fmt --all -- --check` | clean |
 | `npm run check` (`tsc --noEmit` + `vite build`) | passes |
 | `npm run harness:shots` | every scenario, both themes, 0 console errors |
-| `python -m pytest sidecar/tests models/tests` | 96 passed, 3 skipped |
+| `python -m unittest discover -s sidecar/tests -t sidecar/tests` | 110 passed, 3 skipped |
+| `python -m unittest discover -s models/tests -t models/tests` | 13 passed |
 | `python power-automate/validate_examples.py` | passes |
 | `node .github/scripts/check-versions.mjs` | versions agree |
 | `node .github/scripts/check-troubleshooting-coverage.mjs` | every user-visible code is documented |

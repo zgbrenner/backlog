@@ -43,9 +43,11 @@ if str(_SIDECAR_DIR) not in sys.path:
 import semantic as semantic_evidence
 
 # Missing local assets must fail rather than silently reaching a model hub.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+# Assignment is deliberate: a parent process must not be able to weaken the
+# sidecar's offline contract by exporting a false-y value.
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 _DEFAULT_MODELS_DIR = (
     Path(sys.executable).resolve().parent / "models"
@@ -375,7 +377,9 @@ def _page_indices(n_pages: int, head: int, tail: int) -> list[int]:
 
 
 def op_pdf_probe(args: dict) -> dict:
-    document = _open_pdf(args["path"])
+    path = args["path"]
+    _check_input_size(path)
+    document = _open_pdf(path)
     try:
         counts = []
         for index in _page_indices(len(document), 10, 3):
@@ -417,6 +421,8 @@ LETTERHEAD_RE = re.compile(
 # small member from reaching even that.
 MAX_ZIP_MEMBER_BYTES = 4 * 1024 * 1024
 MAX_ZIP_RATIO = 200
+MAX_ZIP_TEXT_TOTAL_BYTES = 16 * 1024 * 1024
+_ZIP_TEXT_SUFFIXES = (".xml", ".rels", ".vml", ".html", ".htm", ".txt", ".csv")
 
 
 def _read_zip_member(archive, name: str) -> bytes | None:
@@ -437,6 +443,37 @@ def _read_zip_member(archive, name: str) -> bytes | None:
     with archive.open(info) as member:
         data = member.read(MAX_ZIP_MEMBER_BYTES + 1)
     return None if len(data) > MAX_ZIP_MEMBER_BYTES else data
+
+
+def _check_ooxml_text_budget(path: str) -> None:
+    """Reject XML-heavy ZIP bombs before a document library opens the package.
+
+    ``_read_zip_member`` protects the optional metadata path, but MarkItDown
+    and its Office dependencies perform their own ZIP reads. Their parsers are
+    therefore reached only after the package's declared text members pass the
+    same per-member/ratio limits and a conservative aggregate limit. Binary
+    media is intentionally excluded from this accounting: it is not parsed as
+    XML and legitimate scanned Office packages commonly contain compressed
+    images larger than one XML part.
+    """
+    import zipfile
+
+    total = 0
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            if info.is_dir() or not info.filename.lower().endswith(_ZIP_TEXT_SUFFIXES):
+                continue
+            if info.file_size > MAX_ZIP_MEMBER_BYTES:
+                raise ValueError(
+                    f"OOXML text member exceeds the {MAX_ZIP_MEMBER_BYTES}-byte sidecar limit"
+                )
+            if info.compress_size > 0 and info.file_size / info.compress_size > MAX_ZIP_RATIO:
+                raise ValueError("OOXML text member compression ratio exceeds the sidecar limit")
+            total += info.file_size
+            if total > MAX_ZIP_TEXT_TOTAL_BYTES:
+                raise ValueError(
+                    f"OOXML text members exceed the {MAX_ZIP_TEXT_TOTAL_BYTES}-byte sidecar limit"
+                )
 
 
 class _DoctypeRefused(Exception):
@@ -564,8 +601,24 @@ def _letterhead_resets(markdown: str) -> int:
 # so an unbounded conversion (a 10 MB spreadsheet flattens to megabytes of
 # markdown) has to be bounded here, on every route -- not only on the PDF
 # branch that happened to have a page count handy.
+# The parser-side ceiling is intentionally byte-based and checked before any
+# document library opens the file; the output ceiling below remains a separate
+# character-based protocol bound.
+MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_MARKDOWN_CHARS = 200_000
 _ELISION = "\n\n[...]\n\n"
+
+
+def _check_input_size(path: str) -> None:
+    """Reject oversized or unstatable inputs before a parser sees them."""
+    try:
+        size = Path(path).stat().st_size
+    except OSError as error:
+        raise RuntimeError("cannot inspect input file size before parsing") from error
+    if size > MAX_INPUT_BYTES:
+        raise ValueError(
+            f"input file exceeds the {MAX_INPUT_BYTES}-byte sidecar limit"
+        )
 
 
 def _cap_markdown(markdown: str) -> str:
@@ -622,9 +675,12 @@ def _conversion_result(
 
 def op_convert(args: dict) -> dict:
     path = args["path"]
+    _check_input_size(path)
     container = _ole_container_kind(path)
     if container == "encrypted":
         return _conversion_result(path, "", encrypted=True)
+    if container is None and Path(path).suffix.lower() in _OOXML_SUFFIXES:
+        _check_ooxml_text_budget(path)
     try:
         markdown = _markitdown().convert(path).text_content or ""
     except Exception as error:
@@ -795,9 +851,10 @@ def _prepare_ocr_image(image, enhanced: bool):
 
 
 def op_ocr(args: dict) -> dict:
+    path = args["path"]
+    _check_input_size(path)
     import numpy as np
 
-    path = args["path"]
     requested_dpi = int(args.get("dpi", 300))
     dpi, enhanced = _ocr_profile(requested_dpi)
     head = int(args.get("head_pages", 10))
@@ -1118,6 +1175,24 @@ def _serialize(response: dict) -> str:
     return text + "\n"
 
 
+MAX_REQUEST_ID = (1 << 64) - 1
+PROTOCOL_ERROR_ID = 0
+
+
+def _validate_request_id(request: object) -> int:
+    if not isinstance(request, dict):
+        raise ValueError("request must be a JSON object")
+    value = request.get("id")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > MAX_REQUEST_ID
+    ):
+        raise ValueError("request id must be an unsigned 64-bit integer")
+    return value
+
+
 def handle_line(line: str) -> str:
     """Turn one request line into exactly one response line. Never raises.
 
@@ -1127,10 +1202,12 @@ def handle_line(line: str) -> str:
     all three retry rungs died identically and the resident RapidOCR/Lingua/
     magika state this warm process exists to amortize was lost every time.
     """
-    request_id = None
+    # Zero is reserved for errors whose malformed ID cannot safely be echoed
+    # into the Rust u64 response field. Normal app requests start at one.
+    request_id = PROTOCOL_ERROR_ID
     try:
         request = json.loads(line)
-        request_id = request.get("id")
+        request_id = _validate_request_id(request)
         operation = request.get("op", "")
         handler = OPS.get(operation)
         if handler is None:

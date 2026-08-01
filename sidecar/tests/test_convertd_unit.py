@@ -35,7 +35,13 @@ def _installed(*modules: str) -> bool:
     return True
 
 
-def _run_driver(ops_source: str, requests: list[str], *, timeout: int = 20):
+def _run_driver(
+    ops_source: str,
+    requests: list[str],
+    *,
+    timeout: int = 20,
+    env: dict[str, str] | None = None,
+):
     """Run convertd's real main() in a subprocess with extra ops registered.
 
     The point of these tests is what happens to the PROCESS, not to a
@@ -54,6 +60,7 @@ def _run_driver(ops_source: str, requests: list[str], *, timeout: int = 20):
             "mod.main()\n",
             encoding="utf-8",
         )
+        process_env = None if env is None else {**os.environ, **env}
         return subprocess.run(
             [sys.executable, str(driver)],
             input="\n".join(requests) + "\n",
@@ -61,6 +68,7 @@ def _run_driver(ops_source: str, requests: list[str], *, timeout: int = 20):
             capture_output=True,
             timeout=timeout,
             check=True,
+            env=process_env,
         )
 
 
@@ -459,6 +467,48 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(all(not response["available"] for response in responses))
 
 
+class OfflineEnvironmentTests(unittest.TestCase):
+    def test_offline_hub_flags_override_parent_environment(self):
+        completed = _run_driver(
+            "mod.OPS['env'] = lambda args: {name: mod.os.environ[name] for name in ("
+            "'HF_HUB_OFFLINE', 'TRANSFORMERS_OFFLINE', 'HF_DATASETS_OFFLINE')}",
+            [json.dumps({"id": 1, "op": "env"})],
+            env={
+                "HF_HUB_OFFLINE": "0",
+                "TRANSFORMERS_OFFLINE": "0",
+                "HF_DATASETS_OFFLINE": "0",
+            },
+        )
+        response = json.loads(completed.stdout.strip())
+        self.assertTrue(response["ok"], response)
+        self.assertEqual(
+            {name: response[name] for name in (
+                "HF_HUB_OFFLINE",
+                "TRANSFORMERS_OFFLINE",
+                "HF_DATASETS_OFFLINE",
+            )},
+            {
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "HF_DATASETS_OFFLINE": "1",
+            },
+        )
+
+
+class RequestIdValidationTests(unittest.TestCase):
+    def test_malformed_request_ids_are_rejected_before_dispatch(self):
+        for invalid in ("not-an-integer", True, -1, 1 << 64, None):
+            handler = mock.Mock()
+            with mock.patch.dict(CONVERTD.OPS, {"ping": handler}):
+                response = json.loads(
+                    CONVERTD.handle_line(json.dumps({"id": invalid, "op": "ping"}))
+                )
+            self.assertEqual(response["id"], CONVERTD.PROTOCOL_ERROR_ID)
+            self.assertFalse(response["ok"])
+            self.assertIn("unsigned 64-bit integer", response["error"])
+            handler.assert_not_called()
+
+
 class SalienceNeedsNoArrayLibraryTests(unittest.TestCase):
     """The deterministic fallback must not merely happen to work on a box
     where numpy is installed. Shadow numpy with a module that refuses to
@@ -557,6 +607,19 @@ class MarkdownCeilingTests(unittest.TestCase):
             result = CONVERTD._conversion_result("missing.pdf", "x", ocr_mean_conf=value)
             self.assertEqual(result["ocr_mean_conf"], 0.0)
             self.assertTrue(math.isfinite(result["ocr_mean_conf"]))
+
+
+class InputBudgetTests(unittest.TestCase):
+    def test_oversized_input_is_rejected_before_markitdown(self):
+        with mock.patch.object(
+            CONVERTD.Path,
+            "stat",
+            return_value=SimpleNamespace(st_size=CONVERTD.MAX_INPUT_BYTES + 1),
+        ), mock.patch.object(
+            CONVERTD, "_markitdown", side_effect=AssertionError("must not parse")
+        ):
+            with self.assertRaisesRegex(ValueError, "input file exceeds"):
+                CONVERTD.op_convert({"path": "large.docx"})
 
 
 class PdfTruncationTests(unittest.TestCase):
@@ -879,16 +942,22 @@ class EncryptedOfficeDetectionTests(unittest.TestCase):
         class EncryptedFileError(Exception):
             pass
 
-        with mock.patch.object(
-            CONVERTD, "_markitdown", side_effect=EncryptedFileError("nope")
-        ):
-            result = CONVERTD.op_convert({"path": "whatever.pdf"})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "whatever.pdf"
+            path.write_bytes(b"not a real PDF")
+            with mock.patch.object(
+                CONVERTD, "_markitdown", side_effect=EncryptedFileError("nope")
+            ):
+                result = CONVERTD.op_convert({"path": str(path)})
         self.assertTrue(result["encrypted"])
 
     def test_op_convert_still_raises_on_an_ordinary_failure(self):
-        with mock.patch.object(CONVERTD, "_markitdown", side_effect=RuntimeError("corrupt")):
-            with self.assertRaises(RuntimeError):
-                CONVERTD.op_convert({"path": "whatever.pdf"})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "whatever.pdf"
+            path.write_bytes(b"not a real PDF")
+            with mock.patch.object(CONVERTD, "_markitdown", side_effect=RuntimeError("corrupt")):
+                with self.assertRaises(RuntimeError):
+                    CONVERTD.op_convert({"path": str(path)})
 
 
 class DocumentMetadataDateTests(unittest.TestCase):
@@ -963,6 +1032,15 @@ class ZipDecompressionBudgetTests(unittest.TestCase):
                     CONVERTD._read_zip_member(archive, "docProps/core.xml")
                 )
             self.assertEqual(CONVERTD._doc_meta_date_entries(path), [])
+
+    def test_conversion_rejects_an_oversized_xml_member_before_markitdown(self):
+        payload = b"<document>" + b"x" * (CONVERTD.MAX_ZIP_MEMBER_BYTES + 1) + b"</document>"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._docx_with_core(tmp, payload)
+            with mock.patch.object(CONVERTD, "_markitdown") as markitdown:
+                with self.assertRaises(ValueError):
+                    CONVERTD.op_convert({"path": path})
+            markitdown.assert_not_called()
 
     def test_a_small_member_with_an_absurd_compression_ratio_is_refused(self):
         payload = b"\x00" * (CONVERTD.MAX_ZIP_MEMBER_BYTES // 4)

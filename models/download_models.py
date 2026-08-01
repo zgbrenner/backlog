@@ -26,8 +26,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -197,6 +199,50 @@ def _write_lock(root: Path) -> dict[str, str]:
     return lock
 
 
+def _verify_locked_entries(root: Path, lock: dict[str, str]) -> list[str]:
+    """Verify committed lock entries without treating new targets as errors."""
+    errors: list[str] = []
+    for relative_text, expected in sorted(lock.items()):
+        relative = _safe_relative_path(relative_text)
+        if relative is None:
+            errors.append(f"unsafe lock path: {relative_text!r}")
+            continue
+        path = root / relative
+        if not path.is_file():
+            errors.append(f"missing locked file: {relative.as_posix()}")
+            continue
+        actual = sha256_file(path)
+        if actual != str(expected).lower():
+            errors.append(
+                f"hash mismatch for {relative.as_posix()}: "
+                f"locked {expected}, computed {actual}"
+            )
+    return errors
+
+
+def _copy_downloaded_file(
+    downloaded: Path, destination: Path, expected: str | None
+) -> None:
+    """Install a file only after the copied bytes match a committed digest."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, staged_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".part", dir=destination.parent
+    )
+    os.close(descriptor)
+    staged = Path(staged_name)
+    try:
+        shutil.copy2(downloaded, staged)
+        actual = sha256_file(staged)
+        if expected is not None and actual != expected:
+            raise RuntimeError(
+                f"downloaded {destination.as_posix()} does not match existing lock "
+                f"(locked {expected}, computed {actual})"
+            )
+        staged.replace(destination)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
 def _load_lock() -> dict[str, str]:
     if not LOCK.exists():
         return {}
@@ -216,7 +262,8 @@ def _download_bundle() -> None:
 
     existing_lock = _load_lock()
     # A changed locked file is never overwritten. Missing files may be restored
-    # from the same declared source, then the complete bundle is re-verified.
+    # from the same declared source, but their bytes must still match the
+    # committed digest before they are installed or the lock is rewritten.
     for relative, expected in existing_lock.items():
         safe = _safe_relative_path(relative)
         if safe is None:
@@ -240,8 +287,11 @@ def _download_bundle() -> None:
                         revision=spec.revision,
                     )
                 )
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(downloaded, destination)
+                _copy_downloaded_file(
+                    downloaded,
+                    destination,
+                    existing_lock.get(spec.target),
+                )
         else:
             snapshot_download(
                 repo_id=spec.repo_id,
@@ -261,6 +311,14 @@ def _download_bundle() -> None:
             "obsolete or untracked model files remain; remove them before locking:\n  - "
             + joined
         )
+
+    if existing_lock:
+        errors = _verify_locked_entries(HERE, existing_lock)
+        if errors:
+            raise RuntimeError(
+                "downloaded model bundle does not match the existing lock:\n  - "
+                + "\n  - ".join(errors)
+            )
 
     lock = _write_lock(HERE)
     errors = verify_lock(HERE, lock)

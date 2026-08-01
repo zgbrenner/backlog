@@ -11,18 +11,23 @@ please report it.
 
 BackLog reads your documents **on this computer**. The text never leaves it.
 
-The only things that ever leave this computer are:
+The only outbound data and network activity are:
 
-1. **The finished file and its new name**, handed to your own SharePoint by
-   your own Power Automate flows — the same place the document was always
-   going.
-2. **A one-time download of two model files** from Hugging Face, when you press
-   **Download models (~2.4 GB)** in Settings. No account, no login, and nothing
-   about your documents is sent — it is a plain file download.
+1. **The finished file and a limited index record**, handed to your own
+   SharePoint by your own Power Automate flows — the same place the document
+   was always going. The record includes the new filename, description, date,
+   date source, document type, language, original name/path, content and
+   delivery identifiers, model versions and soft flags. It never includes
+   document text or evidence.
+2. **A model-bundle download** from Hugging Face only when you press
+   **Download models (~2.4 GB)** in Settings. A fresh release already includes
+   the primary model; this action fills in missing or optional model assets. No
+   account, no login, and nothing about your documents is sent — it is a plain
+   file download.
 3. **A check for a new version of BackLog** when the app starts, to a GitHub
    releases URL. It sends nothing but the request itself.
 
-That is the complete list.
+That is the complete list. The update request does not upload document data.
 
 ## Reading your documents
 
@@ -63,7 +68,7 @@ profile, which other users of the machine cannot read.
 | The record of every file processed: original name, proposed date, subject, description, state | `ledger.db` | **Encrypted.** The whole database file is encrypted with SQLCipher. |
 | The key to that database | `ledger.key` | Protected by Windows DPAPI, so it can only be decrypted by **you, on this machine**. It is never written in plain form. |
 | Converted document text | `cache\` | Deleted on filing (see above). |
-| Model files | `models\` | The two Qwen model files, about 2.4 GB. |
+| Model files | `models\` | The bundled primary Qwen model plus the optional escalation model, about 2.4 GB when both are installed. |
 | Log files | `logs\` | See below. |
 | Your settings | `backlog.config.json` | Plain text — folder paths and tuning numbers only. |
 

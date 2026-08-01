@@ -490,15 +490,46 @@ fn list_flagged(
     state: tauri::State<AppState>,
     limit: Option<usize>,
     offset: Option<usize>,
+    reason: Option<String>,
+    oldest_first: Option<bool>,
 ) -> Result<Vec<ledger::Job>, String> {
     state
         .ledger
-        .list_by_state_paged(
-            ledger::JobState::Flagged,
+        .list_flagged_paged(
+            reason.as_deref(),
+            oldest_first.unwrap_or(false),
             limit.unwrap_or(500).min(2000),
             offset.unwrap_or(0),
         )
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn count_flagged(state: tauri::State<AppState>, reason: Option<String>) -> Result<i64, String> {
+    state
+        .ledger
+        .count_flagged(reason.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_flagged_job(
+    state: tauri::State<AppState>,
+    sha256: String,
+) -> Result<Option<ledger::Job>, String> {
+    if !is_ledger_key(&sha256) {
+        return Err("invalid id".into());
+    }
+    state
+        .ledger
+        .get(&sha256)
+        .map(|job| job.filter(|job| job.state == ledger::JobState::Flagged))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_flag_reasons(state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    state.ledger.flagged_reasons().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -655,6 +686,9 @@ fn reprocess_inner(state: &AppState, sha256: &str) -> Result<(), String> {
         .get(sha256)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "BackLog has no record of that file.".to_string())?;
+    if job.state != ledger::JobState::Flagged {
+        return Err("Only files in Needs Review can be sent through another try.".into());
+    }
     let cfg = state.cfg.lock().unwrap().clone();
 
     // Restore to the *relative* location it came from, so its identity (and
@@ -688,7 +722,7 @@ fn reprocess_inner(state: &AppState, sha256: &str) -> Result<(), String> {
         .reset_for_reprocess(sha256)
         .map_err(|e| e.to_string())?
     {
-        return Err("BackLog has no record of that file.".into());
+        return Err("That review item has already changed; refresh and try again.".into());
     }
     let _ = state
         .ledger
@@ -1557,6 +1591,9 @@ pub fn run() {
             list_jobs,
             count_jobs,
             list_flagged,
+            count_flagged,
+            get_flagged_job,
+            list_flag_reasons,
             get_stats,
             get_events,
             get_evidence,
@@ -2276,6 +2313,41 @@ mod tests {
         assert_eq!(
             dismissed_manifest(&job, "  ").flag_reason.as_deref(),
             Some("DISMISSED:no reason given")
+        );
+    }
+
+    #[test]
+    fn reprocess_refuses_a_terminal_job_without_moving_or_resetting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = stopped_state(dir.path());
+        let cfg = state.cfg.lock().unwrap().clone();
+        let sha = "e".repeat(64);
+        let path = cfg.processing_dir.join("already-filed.pdf");
+        std::fs::write(&path, b"already filed bytes").unwrap();
+        state
+            .ledger
+            .ingest(
+                &sha,
+                &path.to_string_lossy(),
+                "already-filed.pdf",
+                "already-filed.pdf",
+                "pdf",
+            )
+            .unwrap();
+        assert!(state
+            .ledger
+            .set_state(&sha, ledger::JobState::Emitted)
+            .unwrap());
+
+        let error = reprocess_inner(&state, &sha).expect_err("terminal jobs are immutable");
+        assert!(
+            error.contains("Needs Review") || error.contains("Flagged"),
+            "{error}"
+        );
+        assert!(path.exists(), "the terminal source must not be moved");
+        assert_eq!(
+            state.ledger.get(&sha).unwrap().unwrap().state,
+            ledger::JobState::Emitted
         );
     }
 

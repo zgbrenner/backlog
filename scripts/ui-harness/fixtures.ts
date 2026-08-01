@@ -496,6 +496,10 @@ type ListArgs = {
   query?: string | null;
   jobState?: string | null;
   job_state?: string | null;
+  reason?: string | null;
+  flag_reason?: string | null;
+  oldestFirst?: boolean;
+  oldest_first?: boolean;
   limit?: number;
   offset?: number;
 };
@@ -520,6 +524,21 @@ function page(rows: Job[], args?: unknown): Job[] {
   return rows.slice(offset, offset + limit);
 }
 
+function flaggedFiltered(rows: Job[], args?: unknown): Job[] {
+  const a = (args ?? {}) as ListArgs;
+  const reason = (a.reason ?? a.flag_reason ?? "").toString().trim();
+  const matching = rows.filter((row) => !reason || String(row["flag_reason"] ?? "").split(":")[0] === reason);
+  const oldest = a.oldestFirst ?? a.oldest_first ?? false;
+  return [...matching].sort((left, right) => {
+    const delta = Date.parse(String(left["updated_at"] ?? "")) - Date.parse(String(right["updated_at"] ?? ""));
+    return oldest ? delta : -delta;
+  });
+}
+
+function flaggedReasons(rows: Job[]): string[] {
+  return [...new Set(rows.map((row) => String(row["flag_reason"] ?? "").split(":")[0]).filter(Boolean))].sort();
+}
+
 function base(runtime: unknown, stats: unknown, jobs: Job[], flagged: Job[]): CommandTable {
   return {
     get_config: CONFIG,
@@ -528,7 +547,13 @@ function base(runtime: unknown, stats: unknown, jobs: Job[], flagged: Job[]): Co
     get_stats: stats,
     list_jobs: (args?: unknown) => page(filtered(jobs, args), args),
     count_jobs: (args?: unknown) => filtered(jobs, args).length,
-    list_flagged: (args?: unknown) => page(flagged, args),
+    list_flagged: (args?: unknown) => page(flaggedFiltered(flagged, args), args),
+    count_flagged: (args?: unknown) => flaggedFiltered(flagged, args).length,
+    list_flag_reasons: () => flaggedReasons(flagged),
+    get_flagged_job: (args?: unknown) => {
+      const sha = ((args ?? {}) as ShaArgs).sha256 ?? "";
+      return flagged.find((row) => row["sha256"] === sha) ?? null;
+    },
     set_config: null,
     set_paused: null,
     start_pipeline: null,
@@ -637,7 +662,7 @@ function reviewScale(count: number): Scenario {
     commands: {
       ...base(READY_RUNTIME, {}, live, live),
       get_stats: () => ({ emitted: 940, flagged: live.length, per_hour: 0 }),
-      list_flagged: (args?: unknown) => page(live, args),
+      list_flagged: (args?: unknown) => page(flaggedFiltered(live, args), args),
       count_jobs: (args?: unknown) => {
         const a = (args ?? {}) as ListArgs;
         const state = a.jobState ?? a.job_state ?? null;
@@ -750,6 +775,26 @@ export const SCENARIOS: Record<string, Scenario> = {
   /** The review backlog — the screen a user actually spends time in. */
   review: reviewScenario("Needs Review backlog", { ...STATS_BUSY, flagged: 4 }),
 
+  /** The first evidence read fails transiently, then recovers on retry. */
+  "review-evidence-retry": (() => {
+    const s = reviewScenario("Evidence read recovers on retry", { ...STATS_BUSY, flagged: 4 });
+    let failed = false;
+    return {
+      ...s,
+      commands: {
+        ...s.commands,
+        get_evidence: (args?: unknown) => {
+          const sha = ((args ?? {}) as ShaArgs).sha256 ?? "";
+          if (sha === "c".repeat(64) && !failed) {
+            failed = true;
+            return new Error("temporary evidence read failure");
+          }
+          return evidenceFor(args);
+        },
+      },
+    };
+  })(),
+
   /** Backend is down: every list command rejects. */
   errors: {
     label: "Backend errors on every read",
@@ -758,6 +803,8 @@ export const SCENARIOS: Record<string, Scenario> = {
       list_jobs: () => new Error("ledger is locked by another process (code 5)"),
       list_flagged: () => new Error("ledger is locked by another process (code 5)"),
       count_jobs: () => new Error("ledger is locked by another process (code 5)"),
+      count_flagged: () => new Error("ledger is locked by another process (code 5)"),
+      list_flag_reasons: () => new Error("ledger is locked by another process (code 5)"),
     },
   },
 
@@ -769,6 +816,8 @@ export const SCENARIOS: Record<string, Scenario> = {
       get_stats: () => new Promise(() => {}),
       list_jobs: () => new Promise(() => {}),
       count_jobs: () => new Promise(() => {}),
+      count_flagged: () => new Promise(() => {}),
+      list_flag_reasons: () => new Promise(() => {}),
     },
   },
 
