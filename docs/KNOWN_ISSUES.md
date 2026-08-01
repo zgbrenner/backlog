@@ -1,6 +1,6 @@
 # Known issues and deferred work
 
-This list describes limitations that remain after BackLog v0.6.0. Resolved
+This list describes limitations that remain after BackLog v0.7.0. Resolved
 pipeline recovery, model fallback, first-run/download, CI-resource, and release
 automation issues have been removed rather than kept as misleading open work.
 
@@ -14,7 +14,7 @@ and manifest state are still coupled.
 The deferred redesign would represent physical deliveries separately from
 content, make manifest persistence transactional, and define resubmission and
 duplicate behavior as first-class ledger operations. It is intentionally
-outside v0.6.0 because it requires a data migration and coordinated Flow 2
+outside v0.7.0 because it requires a data migration and coordinated Flow 2
 compatibility work.
 
 Until then:

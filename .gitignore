@@ -11,6 +11,7 @@ src-tauri/gen/
 
 # Tauri sidecar & model binaries (built/downloaded, not committed)
 src-tauri/binaries/
+src-tauri/portable-inputs/
 
 # Python
 __pycache__/

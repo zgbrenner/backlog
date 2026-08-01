@@ -15,6 +15,21 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.7.0] — portable offline release and trust-boundary hardening
+
+### Added
+
+- Installer-free Windows x64 portable ZIP packaging with a self-contained
+  launcher and verified release manifest.
+- Clearer daily-use guidance for portable launches and low-memory machines.
+
+### Fixed
+
+- Bound oversized model fields before deterministic validation can allocate or
+  echo attacker-controlled content.
+- Preserve a later unambiguous date reading when an earlier reading is
+  ambiguous.
+
 ## [0.6.0] — exact semantic evidence and guarded release packaging
 
 ### Added

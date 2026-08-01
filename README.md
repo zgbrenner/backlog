@@ -7,7 +7,7 @@ every proposal with a deterministic checker, and hands Power Automate a JSON
 manifest to rename, archive, and index the file in SharePoint.
 
 No cloud inference. Every model runs on-device. The only outbound requests the
-app ever makes are a one-time model download and a startup update check; see
+app ever makes are an optional model download and a startup update check; see
 [`docs/PRIVACY.md`](docs/PRIVACY.md) for the exact list.
 
 **If you are the person who runs this, not the person who builds it, read
@@ -16,6 +16,7 @@ app ever makes are a one-time model download and a startup update check; see
 | | |
 |---|---|
 | Running it | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) |
+| No-installer Windows package | [`docs/PORTABLE.md`](docs/PORTABLE.md) |
 | Every message it can show you | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) |
 | What it does with your documents | [`docs/PRIVACY.md`](docs/PRIVACY.md) · [`docs/SECURITY.md`](docs/SECURITY.md) |
 | Why it is built this way | [`docs/DECISIONS.md`](docs/DECISIONS.md) |
@@ -317,7 +318,7 @@ python -m unittest discover -s sidecar/tests -t sidecar/tests
 python -m unittest discover -s models/tests -t models/tests
 pip install -r power-automate/requirements-dev.txt
 python power-automate/validate_examples.py
-node --test scripts/release-contract.test.mjs scripts/validate-release-workflow.test.mjs
+node --test scripts/release-contract.test.mjs scripts/portable-contract.test.mjs scripts/validate-release-workflow.test.mjs
 ```
 
 The trust core is separated out precisely so it needs none of the above: no

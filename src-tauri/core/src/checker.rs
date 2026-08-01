@@ -120,6 +120,15 @@ const SUBJECT_MAX_WORDS: usize = 10;
 const SUBJECT_MIN_CHARS_UNSPACED: usize = 4;
 const SUBJECT_MAX_CHARS_UNSPACED: usize = 40;
 
+// The sidecar schema and review command normally keep these fields small, but
+// the checker is the trust boundary and is also callable directly. Check the
+// budgets before normalization, regex passes, or error construction so a
+// malformed response cannot turn one proposal into several unbounded copies.
+const MAX_DATE_INPUT_CHARS: usize = 64;
+const MAX_DATE_SOURCE_INPUT_CHARS: usize = 64;
+const MAX_SUBJECT_INPUT_CHARS: usize = 4_096;
+const MAX_DESCRIPTION_INPUT_CHARS: usize = 4_096;
+
 /// Tokens that carry no information about what a document *is*. A subject whose
 /// content words are drawn entirely from this set is a scanner default, not a
 /// name — and before this list was consulted ahead of the word count it had
@@ -302,6 +311,26 @@ impl Checker {
         ettin_date: Option<&str>,
         source: Source,
     ) -> Result<Validated, CheckError> {
+        if exceeds_char_limit(&out.date_source, MAX_DATE_SOURCE_INPUT_CHARS) {
+            return Err(CheckError::BadDateSource(format!(
+                "input exceeds {MAX_DATE_SOURCE_INPUT_CHARS} characters"
+            )));
+        }
+        if exceeds_char_limit(&out.date, MAX_DATE_INPUT_CHARS) {
+            return Err(CheckError::BadDate(format!(
+                "input exceeds {MAX_DATE_INPUT_CHARS} characters"
+            )));
+        }
+        if exceeds_char_limit(&out.subject, MAX_SUBJECT_INPUT_CHARS) {
+            return Err(CheckError::BadSubject(format!(
+                "input exceeds {MAX_SUBJECT_INPUT_CHARS} characters"
+            )));
+        }
+        if exceeds_char_limit(&out.description, MAX_DESCRIPTION_INPUT_CHARS) {
+            return Err(CheckError::BadDescription(format!(
+                "input exceeds {MAX_DESCRIPTION_INPUT_CHARS} characters"
+            )));
+        }
         let mut soft_flags = Vec::new();
 
         // ---- date_source sanity -------------------------------------------
@@ -757,6 +786,13 @@ impl Checker {
     }
 }
 
+/// Return whether `s` contains more than `max` Unicode scalar values without
+/// counting or allocating the whole input. The checker's error paths must stay
+/// bounded even when a caller supplies an oversized field.
+fn exceeds_char_limit(s: &str, max: usize) -> bool {
+    s.chars().nth(max).is_some()
+}
+
 /// True when most of the letters are from a script that does not separate words
 /// with spaces, which is when a whitespace word count is structurally incapable
 /// of judging the text. A single Han/Kana/Thai character is not enough.
@@ -1184,6 +1220,52 @@ mod tests {
         assert_eq!(e.code(), "DATE_NOT_IN_EVIDENCE");
     }
 
+    #[test]
+    fn oversized_date_fields_fail_without_echoing_the_payload() {
+        let c = Checker::new(120);
+        let h = harvest_with(&["2026-07-20"]);
+
+        let mut source = ok_out();
+        source.date_source = format!("UNTRUSTED_SOURCE:{}", "x".repeat(128));
+        let source_error = c.check(&source, &h, &[], "2026-07-21", None).unwrap_err();
+        assert_eq!(source_error.code(), "BAD_DATE_SOURCE");
+        assert!(!source_error.to_string().contains("UNTRUSTED_SOURCE"));
+        assert!(source_error.to_string().len() < 200);
+
+        let mut date = ok_out();
+        date.date = format!("UNTRUSTED_DATE:{}", "x".repeat(128));
+        let date_error = c.check(&date, &h, &[], "2026-07-21", None).unwrap_err();
+        assert_eq!(date_error.code(), "BAD_DATE");
+        assert!(!date_error.to_string().contains("UNTRUSTED_DATE"));
+        assert!(date_error.to_string().len() < 200);
+    }
+
+    #[test]
+    fn oversized_subjects_are_rejected_before_word_trimming() {
+        let c = Checker::new(120);
+        let h = harvest_with(&["2026-07-20"]);
+        let mut out = ok_out();
+        out.subject = format!("Invoice {}", "Acme ".repeat(1_500));
+
+        let error = c.check(&out, &h, &[], "2026-07-21", None).unwrap_err();
+        assert_eq!(error.code(), "BAD_SUBJECT");
+    }
+
+    #[test]
+    fn oversized_descriptions_are_rejected_before_sentence_trimming() {
+        let c = Checker::new(120);
+        let h = harvest_with(&["2026-07-20"]);
+        let mut out = ok_out();
+        out.description = format!(
+            "Notice from Acme Corporation about the filing. {}{}",
+            "UNTRUSTED_DESCRIPTION ",
+            "tail ".repeat(1_500)
+        );
+
+        let error = c.check(&out, &h, &[], "2026-07-21", None).unwrap_err();
+        assert_eq!(error.code(), "BAD_DESCRIPTION");
+    }
+
     /// The boundary the suite was missing: an unevidenced proposal on a document
     /// that has **no date evidence at all** takes the mtime fallback instead of
     /// quarantining, while the same proposal against *any* real evidence stays a
@@ -1521,6 +1603,25 @@ mod tests {
         o.date = "2026-03-04".into();
         let v = c.check(&o, &h, &[], "2026-07-21", None).unwrap();
         assert!(!v.soft_flags.contains(&"DATE_AMBIGUOUS_FORMAT".to_string()));
+    }
+
+    #[test]
+    fn a_confident_tail_duplicate_prevents_an_ambiguous_date_flag() {
+        let c = Checker::new(120);
+        let markdown = format!(
+            "effective 04/03/2026\n{}March 4, 2026",
+            "filler ".repeat(1_100)
+        );
+        let h = harvest::harvest(&markdown);
+        let mut out = ok_out();
+        out.date = "2026-03-04".into();
+
+        let v = c.check(&out, &h, &[], "2026-07-21", None).unwrap();
+        assert!(
+            !v.soft_flags.contains(&"DATE_AMBIGUOUS_FORMAT".to_string()),
+            "the unambiguous tail evidence must clear the ambiguity flag: {:?}",
+            v.soft_flags
+        );
     }
 
     #[test]

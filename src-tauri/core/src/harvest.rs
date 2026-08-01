@@ -284,7 +284,13 @@ pub fn harvest(markdown: &str) -> Harvest {
     h.dates = extract_dates(head);
     for mut d in extract_dates(tail) {
         d.offset += tail_start;
-        if !h.dates.iter().any(|e| e.iso == d.iso) {
+        let has_same_date = h.dates.iter().any(|e| e.iso == d.iso);
+        let has_confident_reading = h.dates.iter().any(|e| e.iso == d.iso && !e.ambiguous);
+        // The first-page slice wins ordinary duplicates, but a confident
+        // reading in the tail must survive an ambiguous alternate in the head.
+        // Otherwise the checker can mark a date as a coin flip even though the
+        // same document prints it unambiguously later on.
+        if !has_same_date || (!d.ambiguous && !has_confident_reading) {
             h.dates.push(d);
         }
     }
@@ -498,6 +504,29 @@ mod tests {
         let h = harvest(md);
         assert!(h.subject_lines.iter().any(|s| s.contains("Termination")));
         assert!(!h.caption_lines.is_empty());
+    }
+
+    #[test]
+    fn harvest_keeps_a_confident_tail_reading_of_an_ambiguous_head_date() {
+        let md = format!(
+            "effective 04/03/2026\n{}March 4, 2026",
+            "filler ".repeat(1_100)
+        );
+        let h = harvest(&md);
+        let readings: Vec<&FoundDate> = h
+            .dates
+            .iter()
+            .filter(|date| date.iso == "2026-03-04")
+            .collect();
+
+        assert!(
+            readings.iter().any(|date| date.ambiguous),
+            "the head reading should still be retained"
+        );
+        assert!(
+            readings.iter().any(|date| !date.ambiguous),
+            "a later unambiguous reading must not be discarded as a duplicate"
+        );
     }
 
     #[test]

@@ -1698,14 +1698,20 @@ function buildReviewCard(job: Job): ReviewCard {
           </label>
         </div>
         <p class="blocker" hidden></p>
+        <pre id="evidence-${short}" class="evidence" hidden tabindex="0"
+          role="region" aria-label="Document text"></pre>
+        <div id="timeline-${short}" class="timeline" hidden tabindex="0"
+          role="region" aria-label="What happened"></div>
         <div class="card-actions">
           <button type="submit" class="primary" data-act="approve">Approve and file</button>
           <button type="button" class="ghost" data-act="reprocess">Try again</button>
           <button type="button" class="danger" data-act="dismiss">Can't fix this</button>
           <span class="spacer"></span>
           <button type="button" class="ghost" data-act="reveal">Show me the file</button>
-          <button type="button" class="ghost" data-act="evidence" aria-expanded="false">Document text</button>
-          <button type="button" class="ghost" data-act="events" aria-expanded="false">What happened</button>
+          <button type="button" class="ghost" data-act="evidence" aria-expanded="false"
+            aria-controls="evidence-${short}">Document text</button>
+          <button type="button" class="ghost" data-act="events" aria-expanded="false"
+            aria-controls="timeline-${short}">What happened</button>
         </div>
         <p class="err" role="alert"></p>
       </form>
@@ -1713,8 +1719,6 @@ function buildReviewCard(job: Job): ReviewCard {
         <span class="filing"></span>
         <button type="button" class="ghost" data-act="undo">Undo</button>
       </div>
-      <pre class="evidence" hidden tabindex="0"></pre>
-      <div class="timeline" hidden tabindex="0"></div>
     </article>`);
 
   const form = q<HTMLFormElement>(root, "form");

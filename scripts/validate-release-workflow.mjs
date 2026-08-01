@@ -5,6 +5,14 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { parse } from "yaml";
 
+import {
+  PORTABLE_WEBVIEW2_CAB_SHA256,
+  PORTABLE_WEBVIEW2_CAB_SIZE,
+  PORTABLE_WEBVIEW2_CAB_URL,
+  PORTABLE_WEBVIEW2_VERSION,
+  PORTABLE_WEBVIEW2_FILE_COUNT,
+} from "./portable-contract.mjs";
+
 const PRIMARY_SHA256 =
   "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031";
 const LLAMA_SHA256 =
@@ -78,9 +86,11 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
       String(preflight?.outputs?.version ?? "") !==
         "${{ steps.release-metadata.outputs.version }}" ||
       String(preflight?.outputs?.tag ?? "") !==
-        "${{ steps.release-metadata.outputs.tag }}"
+        "${{ steps.release-metadata.outputs.tag }}" ||
+      String(preflight?.outputs?.portable ?? "") !==
+        "${{ steps.release-metadata.outputs.portable }}"
     ) {
-      problems.push("release preflight must expose the validated version and tag");
+      problems.push("release preflight must expose the validated version, tag, and portable artifact");
     }
     const gate = preflightSteps.find((step) => step?.id === "release-gate");
     if (!stepRun(gate).includes("release-contract.mjs gate")) {
@@ -114,9 +124,14 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   }
   if (
     String(job?.env?.VERSION ?? "") !== "${{ needs.release-check.outputs.version }}" ||
-    String(job?.env?.TAG ?? "") !== "${{ needs.release-check.outputs.tag }}"
+    String(job?.env?.TAG ?? "") !== "${{ needs.release-check.outputs.tag }}" ||
+    String(job?.env?.PORTABLE ?? "") !==
+      "src-tauri/target/release/${{ needs.release-check.outputs.portable }}"
   ) {
-    problems.push("Windows release must consume the preflight's validated version and tag");
+    problems.push("Windows release must consume the preflight's validated version, tag, and portable artifact");
+  }
+  if (!String(job?.env?.WEBVIEW2_RUNTIME_DIR ?? "").includes("${{ runner.temp }}")) {
+    problems.push("Windows release must use a runner-local fixed WebView2 staging directory");
   }
   if (!String(job?.env?.INSTALLER ?? "").includes("BackLog_${{ needs.release-check.outputs.version }}_x64-setup.exe")) {
     problems.push("installer path must be derived from the validated release version");
@@ -178,6 +193,7 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     ["frontend validation", "npm run check"],
     ["Power Automate validation", "power-automate/validate_examples.py"],
     ["release input staging", "scripts/stage-release-inputs.ps1"],
+    ["fixed WebView2 runtime staging", "scripts/stage-webview2-runtime.ps1"],
     ["sidecar build", "scripts/build-sidecar.ps1"],
     ["binary release gate", "scripts/verify-binaries.ps1"],
   ]) {
@@ -197,6 +213,9 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
 
   const signedBuild = findNamed("Build signed installer");
   const unsignedBuild = findNamed("Build unsigned installer");
+  const webviewStage = findNamed("Stage pinned fixed WebView2 runtime");
+  const portableBuild = findNamed("Build installer-free portable ZIP");
+  const portableVerify = findNamed("Verify installer-free portable ZIP");
   const signedCondition = "steps.release-mode.outputs.signed=='true'";
   const unsignedCondition = "steps.release-mode.outputs.signed=='false'";
   if (normalizedIf(signedBuild) !== signedCondition) {
@@ -221,6 +240,34 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     !stepRun(unsignedBuild).includes("tauri.unsigned.conf.json")
   ) {
     problems.push("unsigned build must explicitly disable updater artifacts");
+  }
+  if (
+    !stepRun(portableBuild).includes("scripts/package-portable.ps1") ||
+    !stepRun(portableBuild).includes("-Version") ||
+    !stepRun(portableBuild).includes("-Output $env:PORTABLE") ||
+    !stepRun(portableBuild).includes("-WebView2RuntimeDir $env:WEBVIEW2_RUNTIME_DIR")
+  ) {
+    problems.push("release must build the portable ZIP with the staged fixed WebView2 runtime");
+  }
+  if (
+    !stepRun(portableVerify).includes("scripts/validate-portable-package.ps1") ||
+    !stepRun(portableVerify).includes("$env:PORTABLE")
+  ) {
+    problems.push("release must validate the portable ZIP after compression");
+  }
+  if (steps.indexOf(portableBuild) <= steps.indexOf(unsignedBuild)) {
+    problems.push("portable ZIP packaging must run after either signed or unsigned Tauri build");
+  }
+  if (steps.indexOf(portableVerify) <= steps.indexOf(portableBuild)) {
+    problems.push("portable ZIP validation must run after portable ZIP packaging");
+  }
+  if (
+    !stepRun(webviewStage).includes("scripts/stage-webview2-runtime.ps1") ||
+    !stepRun(webviewStage).includes("-Destination $env:WEBVIEW2_RUNTIME_DIR") ||
+    steps.indexOf(webviewStage) >= steps.indexOf(signedBuild) ||
+    steps.indexOf(webviewStage) >= steps.indexOf(unsignedBuild)
+  ) {
+    problems.push("fixed WebView2 runtime staging must finish before either Tauri build");
   }
 
   const manifest = findNamed("Create signed updater manifest");
@@ -261,6 +308,7 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   }
   for (const [label, alternatives] of [
     [".exe", [".exe", "$env:INSTALLER"]],
+    ["portable ZIP", [".zip", "$env:PORTABLE"]],
     [".sig", [".sig", "$env:SIGNATURE"]],
     ["latest.json", ["latest.json", "$env:MANIFEST"]],
     ["--target", ["--target"]],
@@ -284,6 +332,7 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     problems.push("unsigned publication must be a prerelease");
   }
   for (const required of [
+    "$env:PORTABLE",
     "--target",
     "RELEASE_SHA",
     "--draft",
@@ -424,6 +473,35 @@ export function validateBuildDependencyLock(buildScriptSource, buildLockSource) 
   return problems;
 }
 
+export function validateWebviewRuntimeSource(source) {
+  const problems = [];
+  for (const required of [
+    `$WebView2Version = "${PORTABLE_WEBVIEW2_VERSION}"`,
+    `$WebView2Url = "${PORTABLE_WEBVIEW2_CAB_URL}"`,
+    `$WebView2Sha256 = "${PORTABLE_WEBVIEW2_CAB_SHA256}"`,
+    `$WebView2CabSize = [int64]${PORTABLE_WEBVIEW2_CAB_SIZE}`,
+    `$WebView2FileCount = ${PORTABLE_WEBVIEW2_FILE_COUNT}`,
+    "$ChunkSize = [int64](16MB)",
+    "System.Net.Http.HttpClient",
+    "RangeHeaderValue",
+    "ResponseHeadersRead",
+    "StatusCode -ne 206",
+    "ReadAsStreamAsync",
+    "Get-FileHash",
+    "7za.exe",
+    "expand.exe",
+    "-F:*",
+    "msedgewebview2.exe",
+    "runtime-manifest.json",
+    "webview2-fixed",
+  ]) {
+    if (!source.includes(required)) {
+      problems.push(`fixed WebView2 staging script is missing ${required}`);
+    }
+  }
+  return problems;
+}
+
 export function validateRustToolchain(toolchainSource) {
   const channel = /^\s*channel\s*=\s*"([^"]+)"\s*$/m.exec(toolchainSource)?.[1];
   if (!channel) return ["rust-toolchain.toml must declare a channel"];
@@ -484,6 +562,10 @@ function runCli() {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const workflow = readFileSync(path.join(root, ".github/workflows/release.yml"), "utf8");
   const stage = readFileSync(path.join(root, "scripts/stage-release-inputs.ps1"), "utf8");
+  const webviewStage = readFileSync(
+    path.join(root, "scripts/stage-webview2-runtime.ps1"),
+    "utf8",
+  );
   const targetGuard = readFileSync(
     path.join(root, "scripts/assert-release-tag.ps1"),
     "utf8",
@@ -500,6 +582,7 @@ function runCli() {
   const toolchain = readFileSync(path.join(root, "rust-toolchain.toml"), "utf8");
   const problems = [
     ...validateReleaseWorkflow(workflow, stage),
+    ...validateWebviewRuntimeSource(webviewStage),
     ...validateBuildDependencyLock(buildScript, buildLock),
     ...validateRustToolchain(toolchain),
     ...validateReleaseTargetGuard(targetGuard),
@@ -512,7 +595,7 @@ function runCli() {
     return;
   }
   console.log(
-    "Release workflow contract holds: Windows 2022, pinned inputs, and guarded updater publication.",
+    "Release workflow contract holds: Windows 2022, pinned inputs, fixed WebView2 portable runtime, and guarded publication.",
   );
 }
 
