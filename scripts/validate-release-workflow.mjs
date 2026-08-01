@@ -136,8 +136,8 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   ) {
     problems.push("Windows release must consume the preflight's validated version, tag, and portable artifact");
   }
-  if (!String(job?.env?.WEBVIEW2_RUNTIME_DIR ?? "").includes("${{ runner.temp }}")) {
-    problems.push("Windows release must use a runner-local fixed WebView2 staging directory");
+  if (Object.prototype.hasOwnProperty.call(job?.env ?? {}, "WEBVIEW2_RUNTIME_DIR")) {
+    problems.push("runner context must not be used in Windows job-level environment variables");
   }
   if (!String(job?.env?.INSTALLER ?? "").includes("BackLog_${{ needs.release-check.outputs.version }}_x64-setup.exe")) {
     problems.push("installer path must be derived from the validated release version");
@@ -219,6 +219,7 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
 
   const signedBuild = findNamed("Build signed installer");
   const unsignedBuild = findNamed("Build unsigned installer");
+  const releasePaths = findNamed("Set runner-local release paths");
   const webviewStage = findNamed("Stage pinned fixed WebView2 runtime");
   const portableBuild = findNamed("Build installer-free portable ZIP");
   const portableVerify = findNamed("Verify installer-free portable ZIP");
@@ -266,6 +267,14 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   }
   if (steps.indexOf(portableVerify) <= steps.indexOf(portableBuild)) {
     problems.push("portable ZIP validation must run after portable ZIP packaging");
+  }
+  if (
+    !stepRun(releasePaths).includes("Join-Path $env:RUNNER_TEMP") ||
+    !stepRun(releasePaths).includes("WEBVIEW2_RUNTIME_DIR=") ||
+    !stepRun(releasePaths).includes("$env:GITHUB_ENV") ||
+    steps.indexOf(releasePaths) >= steps.indexOf(webviewStage)
+  ) {
+    problems.push("Windows release must initialize its runner-local fixed WebView2 staging directory in a step");
   }
   if (
     !stepRun(webviewStage).includes("scripts/stage-webview2-runtime.ps1") ||
