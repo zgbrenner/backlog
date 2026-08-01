@@ -509,6 +509,8 @@ export function validateWebviewRuntimeSource(source) {
     "msedgewebview2.exe",
     "runtime-manifest.json",
     "webview2-fixed",
+    "backlog-webview2-fixed-download",
+    "destination and download directory must be different paths",
   ]) {
     if (!source.includes(required)) {
       problems.push(`fixed WebView2 staging script is missing ${required}`);
