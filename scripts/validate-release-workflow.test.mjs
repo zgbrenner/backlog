@@ -13,21 +13,20 @@ import {
 const validWorkflow = `
 name: Release
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
+  push:
     branches: [main]
 permissions:
   contents: read
 concurrency:
-  group: release-\${{ github.event.workflow_run.head_sha }}
+  group: release-\${{ github.sha }}
   cancel-in-progress: true
 env:
-  RELEASE_SHA: \${{ github.event.workflow_run.head_sha }}
+  RELEASE_SHA: \${{ github.sha }}
 jobs:
   release-check:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     outputs:
       should-release: \${{ steps.release-gate.outputs.release }}
       version: \${{ steps.release-metadata.outputs.version }}
@@ -37,6 +36,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: \${{ env.RELEASE_SHA }}
+      - name: Wait for exact successful main CI
+        id: ci-gate
+        run: node scripts/release-contract.mjs ci-gate --sha "$RELEASE_SHA"
       - id: release-metadata
         run: node scripts/release-contract.mjs metadata
       - id: release-gate
@@ -198,23 +200,25 @@ test("a changed fixed WebView2 CAB hash is rejected", () => {
 
 test("a workflow that does not wait for successful main CI is rejected", () => {
   const manualOnly = validWorkflow.replace(
-    "  workflow_run:\n    workflows: [CI]\n    types: [completed]\n    branches: [main]\n",
+    "  push:\n    branches: [main]\n",
     "",
   );
   assert.match(
     validateReleaseWorkflow(manualOnly, validStageScript).join("\n"),
-    /successful CI on main/,
+    /main pushes/,
   );
 });
 
 test("a failed CI run cannot allocate the release build", () => {
   const unguarded = validWorkflow.replace(
-    "    if: github.event.workflow_run.conclusion == 'success'\n",
+    "      - name: Wait for exact successful main CI\n" +
+      "        id: ci-gate\n" +
+      "        run: node scripts/release-contract.mjs ci-gate --sha \"$RELEASE_SHA\"\n",
     "",
   );
   assert.match(
     validateReleaseWorkflow(unguarded, validStageScript).join("\n"),
-    /successful CI conclusion/,
+    /wait for successful CI on the exact main SHA/,
   );
 });
 
@@ -225,16 +229,16 @@ test("the release must check out and tag the CI-tested commit", () => {
   );
   assert.match(
     validateReleaseWorkflow(drifting, validStageScript).join("\n"),
-    /CI-tested commit/,
+    /exact pushed commit/,
   );
 });
 
 test("a manual dispatch path that bypasses exact successful CI provenance is rejected", () => {
   const manual = validWorkflow
-    .replace("  workflow_run:\n", "  workflow_dispatch:\n  workflow_run:\n")
+    .replace("  push:\n", "  workflow_dispatch:\n  push:\n")
     .replace(
-      "    if: github.event.workflow_run.conclusion == 'success'\n",
-      "    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'\n",
+      "    if: github.ref == 'refs/heads/main'\n",
+      "    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'\n",
     );
   assert.match(
     validateReleaseWorkflow(manual, validStageScript).join("\n"),

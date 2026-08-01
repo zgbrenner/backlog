@@ -123,10 +123,10 @@ Never synthesize a signature, upload a blank signature, or publish unsigned
 
 ## Trigger and clean skip
 
-After the prepared release commit reaches `main`, a successful **CI** run
-automatically starts the release workflow for that exact commit. Failed CI
-does not allocate the Windows release build. There is intentionally no manual
-dispatch path that can bypass that exact-commit CI result.
+After the prepared release commit reaches `main`, the release workflow starts
+from that exact push and waits for a successful **CI** run for the same commit.
+Failed CI does not allocate the Windows release build. There is intentionally
+no manual dispatch path that can bypass that exact-commit CI result.
 
 The first job derives the release tag from validated package metadata, then
 checks the exact remote tag and GitHub Release state before

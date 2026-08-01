@@ -1,27 +1,26 @@
 name: Release BackLog
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
+  push:
     branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.workflow_run.head_sha }}
+  group: release-${{ github.sha }}
   cancel-in-progress: true
 
 env:
-  RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
-  RELEASE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+  RELEASE_SHA: ${{ github.sha }}
+  RELEASE_BRANCH: ${{ github.ref_name }}
 
 jobs:
   release-check:
     name: Check whether the current release still needs publication
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
     outputs:
@@ -33,6 +32,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ env.RELEASE_SHA }}
+      - name: Wait for exact successful main CI
+        id: ci-gate
+        run: node scripts/release-contract.mjs ci-gate --sha "$RELEASE_SHA"
       - name: Read and validate release metadata
         id: release-metadata
         run: node scripts/release-contract.mjs metadata
