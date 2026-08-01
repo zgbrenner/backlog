@@ -32,10 +32,13 @@ if (-not $Destination) {
 }
 if (-not $DownloadDir) {
     $downloadRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
-    $DownloadDir = Join-Path $downloadRoot "backlog-webview2-fixed"
+    $DownloadDir = Join-Path $downloadRoot "backlog-webview2-fixed-download"
 }
 $Destination = [IO.Path]::GetFullPath($Destination)
 $DownloadDir = [IO.Path]::GetFullPath($DownloadDir)
+if ([StringComparer]::OrdinalIgnoreCase.Equals($Destination, $DownloadDir)) {
+    throw "WebView2 destination and download directory must be different paths"
+}
 $CabName = "Microsoft.WebView2.FixedVersionRuntime.$WebView2Version.x64.cab"
 $CabPath = Join-Path $DownloadDir $CabName
 $ExtractPath = Join-Path $DownloadDir "expanded-$WebView2Version"

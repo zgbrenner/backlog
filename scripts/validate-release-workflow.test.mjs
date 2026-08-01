@@ -184,6 +184,8 @@ expand.exe -F:* $cab $destination
 msedgewebview2.exe
 runtime-manifest.json
 webview2-fixed
+backlog-webview2-fixed-download
+destination and download directory must be different paths
 `;
 
 test("the guarded Windows release structure is accepted", () => {
