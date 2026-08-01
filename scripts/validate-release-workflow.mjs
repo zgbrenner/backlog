@@ -36,31 +36,27 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   if (Object.prototype.hasOwnProperty.call(workflow?.on ?? {}, "workflow_dispatch")) {
     problems.push("release workflow must not expose a manual CI bypass");
   }
-  const workflowRun = workflow?.on?.workflow_run;
+  const push = workflow?.on?.push;
   if (
-    !Array.isArray(workflowRun?.workflows) ||
-    !workflowRun.workflows.includes("CI") ||
-    !Array.isArray(workflowRun?.types) ||
-    !workflowRun.types.includes("completed") ||
-    !Array.isArray(workflowRun?.branches) ||
-    !workflowRun.branches.includes("main")
+    !Array.isArray(push?.branches) ||
+    !push.branches.includes("main")
   ) {
-    problems.push("release workflow must run after successful CI on main");
+    problems.push("release workflow must run from main pushes");
   }
   if (workflow?.permissions?.contents !== "read") {
     problems.push("release workflow default permissions must be read-only");
   }
   if (
-    workflow?.concurrency?.group !== "release-${{ github.event.workflow_run.head_sha }}" ||
+    workflow?.concurrency?.group !== "release-${{ github.sha }}" ||
     workflow?.concurrency?.["cancel-in-progress"] !== true
   ) {
     problems.push("a newer tested release must cancel superseded packaging work");
   }
   if (
     String(workflow?.env?.RELEASE_SHA ?? "") !==
-    "${{ github.event.workflow_run.head_sha }}"
+    "${{ github.sha }}"
   ) {
-    problems.push("release workflow must identify the exact CI-tested commit");
+    problems.push("release workflow must identify the exact pushed commit");
   }
 
   const preflight = workflow?.jobs?.["release-check"];
@@ -68,15 +64,25 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     problems.push("release workflow must define an absent-tag preflight job");
   } else {
     const preflightCondition = normalizedIf(preflight);
-    if (preflightCondition !== "github.event.workflow_run.conclusion=='success'") {
-      problems.push("release preflight must require a successful CI conclusion");
+    if (preflightCondition !== "github.ref=='refs/heads/main'") {
+      problems.push("release preflight must require a main-branch push");
+    }
+    if (preflight["timeout-minutes"] !== 20) {
+      problems.push("release preflight must wait within a bounded CI-gate timeout");
     }
     const preflightSteps = Array.isArray(preflight.steps) ? preflight.steps : [];
     const preflightCheckout = preflightSteps.find((step) =>
       String(step?.uses ?? "").startsWith("actions/checkout@"),
     );
     if (String(preflightCheckout?.with?.ref ?? "") !== "${{ env.RELEASE_SHA }}") {
-      problems.push("release preflight must check out the exact CI-tested commit");
+      problems.push("release preflight must check out the exact pushed commit");
+    }
+    const ciGate = preflightSteps.find((step) => step?.id === "ci-gate");
+    if (
+      !stepRun(ciGate).includes("release-contract.mjs ci-gate") ||
+      !stepRun(ciGate).includes("--sha \"$RELEASE_SHA\"")
+    ) {
+      problems.push("release preflight must wait for successful CI on the exact main SHA");
     }
     const metadata = preflightSteps.find((step) => step?.id === "release-metadata");
     if (!stepRun(metadata).includes("release-contract.mjs metadata")) {

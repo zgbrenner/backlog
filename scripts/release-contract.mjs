@@ -15,7 +15,32 @@ import { fileURLToPath } from "node:url";
 const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const REPOSITORY_RE = /^[0-9A-Za-z_.-]+\/[0-9A-Za-z_.-]+$/;
 const TAG_RE = /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Classify the newest ordinary push-triggered CI run for a release commit.
+ * A release must never accept a pull-request or manually-dispatched run as
+ * evidence for a main-branch package.
+ */
+export function ciGateStatus(runs, releaseSha) {
+  if (!FULL_SHA_RE.test(releaseSha ?? "") || !Array.isArray(runs)) {
+    return "failure";
+  }
+  const matching = runs
+    .filter(
+      (run) =>
+        String(run?.headSha ?? "").toLowerCase() === releaseSha.toLowerCase() &&
+        run?.headBranch === "main" &&
+        run?.event === "push",
+    )
+    .sort((left, right) =>
+      String(right?.createdAt ?? "").localeCompare(String(left?.createdAt ?? "")),
+    );
+  const latest = matching[0];
+  if (!latest || latest.status !== "completed") return "pending";
+  return latest.conclusion === "success" ? "success" : "failure";
+}
 
 /**
  * Read and cross-check the version authorities from the exact checked-out
@@ -144,6 +169,60 @@ async function fileExists(file) {
   }
 }
 
+function queryMainCiRuns(releaseSha) {
+  const args = [
+    "run",
+    "list",
+    "--workflow",
+    "ci.yml",
+    "--commit",
+    releaseSha,
+    "--limit",
+    "20",
+    "--json",
+    "headSha,headBranch,status,conclusion,event,createdAt",
+  ];
+  if (process.env.GITHUB_REPOSITORY) {
+    args.splice(2, 0, "--repo", process.env.GITHUB_REPOSITORY);
+  }
+  const result = spawnSync("gh", args, { encoding: "utf8" });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(
+      `could not inspect main CI for ${releaseSha}: ${
+        result.stderr.trim() || `gh exited ${result.status}`
+      }`,
+    );
+  }
+  try {
+    return JSON.parse(result.stdout);
+  } catch (error) {
+    throw new Error(`main CI lookup returned invalid JSON: ${error.message}`);
+  }
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForMainCi(releaseSha, {attempts = 45, intervalMs = 20_000} = {}) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const status = ciGateStatus(queryMainCiRuns(releaseSha), releaseSha);
+    if (status === "success") {
+      console.log(`Main CI passed for exact release commit ${releaseSha}.`);
+      return;
+    }
+    if (status === "failure") {
+      throw new Error(`main CI did not pass for release commit ${releaseSha}`);
+    }
+    if (attempt < attempts) {
+      console.log(`Waiting for main CI for ${releaseSha} (attempt ${attempt}/${attempts})...`);
+      await sleep(intervalMs);
+    }
+  }
+  throw new Error(`main CI did not finish successfully for ${releaseSha} before the release timeout`);
+}
+
 export async function verifyReleaseArtifacts({
   signed,
   installer,
@@ -191,6 +270,15 @@ function parseArgs(values) {
 
 async function runCli() {
   const [command, ...values] = process.argv.slice(2);
+
+  if (command === "ci-gate") {
+    const args = parseArgs(values);
+    if (!FULL_SHA_RE.test(args.sha ?? "")) {
+      throw new Error("--sha must be a full commit SHA");
+    }
+    await waitForMainCi(args.sha);
+    return;
+  }
 
   if (command === "gate") {
     const output = process.env.GITHUB_OUTPUT;

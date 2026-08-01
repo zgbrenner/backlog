@@ -6,10 +6,57 @@ import test from "node:test";
 
 import {
   buildUpdaterManifest,
+  ciGateStatus,
   releasePlan,
   shouldStartRelease,
   verifyReleaseArtifacts,
 } from "./release-contract.mjs";
+
+test("the release CI gate accepts only a successful main push for the exact SHA", () => {
+  const sha = "a".repeat(40);
+  assert.equal(
+    ciGateStatus(
+      [{
+        headSha: sha,
+        headBranch: "main",
+        event: "push",
+        status: "in_progress",
+        conclusion: "",
+        createdAt: "2026-08-01T08:00:00Z",
+      }],
+      sha,
+    ),
+    "pending",
+  );
+  assert.equal(
+    ciGateStatus(
+      [{
+        headSha: sha,
+        headBranch: "main",
+        event: "push",
+        status: "completed",
+        conclusion: "success",
+        createdAt: "2026-08-01T08:01:00Z",
+      }],
+      sha,
+    ),
+    "success",
+  );
+  assert.equal(
+    ciGateStatus(
+      [{
+        headSha: sha,
+        headBranch: "main",
+        event: "pull_request",
+        status: "completed",
+        conclusion: "success",
+        createdAt: "2026-08-01T08:02:00Z",
+      }],
+      sha,
+    ),
+    "pending",
+  );
+});
 
 test("the release starts only for main when the version tag is absent", () => {
   assert.equal(
