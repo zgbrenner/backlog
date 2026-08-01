@@ -56,11 +56,15 @@ jobs:
       TAG: \${{ needs.release-check.outputs.tag }}
       INSTALLER: "src-tauri/target/release/bundle/nsis/BackLog_\${{ needs.release-check.outputs.version }}_x64-setup.exe"
       PORTABLE: "src-tauri/target/release/\${{ needs.release-check.outputs.portable }}"
-      WEBVIEW2_RUNTIME_DIR: "\${{ runner.temp }}/backlog-webview2-fixed"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: \${{ env.RELEASE_SHA }}
+      - name: Set runner-local release paths
+        shell: pwsh
+        run: |
+          $runtimeDir = Join-Path $env:RUNNER_TEMP "backlog-webview2-fixed"
+          "WEBVIEW2_RUNTIME_DIR=$runtimeDir" >> $env:GITHUB_ENV
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
