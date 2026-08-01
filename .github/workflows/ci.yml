@@ -123,6 +123,8 @@ jobs:
         run: npm ci
       - name: Typecheck and build
         run: npm run check
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high
       # The harness renders the real frontend against a mock Tauri IPC and
       # exits non-zero on any console error, so it is the only automated proof
       # that the UI still boots. It needs a browser; the repo ships none.

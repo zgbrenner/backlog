@@ -1,4 +1,4 @@
-# BackLog v0.5.0 release checklist
+# BackLog v0.6.0 release checklist
 
 A release remains a pilot candidate until every applicable item has fresh
 evidence attached to the release record.
@@ -26,17 +26,17 @@ evidence attached to the release record.
 
 - [ ] `python power-automate/validate_examples.py` passes after installing
       `power-automate/requirements-dev.txt`.
-- [ ] `node .github/scripts/check-versions.mjs` reports 0.5.0, the `backlog`
-      package in `src-tauri/Cargo.lock` is 0.5.0, and `CHANGELOG.md` has the
-      0.5.0 section.
+- [ ] `node .github/scripts/check-versions.mjs` reports 0.6.0, the `backlog`
+      package in `src-tauri/Cargo.lock` is 0.6.0, and `CHANGELOG.md` has the
+      0.6.0 section.
 
 ## One-download package
 
 - [ ] The only required user download is
-      `BackLog_0.5.0_x64-setup.exe`.
+      `BackLog_0.6.0_x64-setup.exe`.
 - [ ] The installer contains the app, `convertd` with its Python runtime,
-      `llama-server` and every imported runtime DLL, Qwen3 0.6B Q8_0, and the
-      offline WebView2 runtime.
+      `llama-server` and every imported runtime DLL, Qwen3 0.6B Q8_0, the
+      pinned MiniLM semantic model/tokenizer, and the offline WebView2 runtime.
 - [ ] The primary model hash is
       `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`.
 - [ ] The Qwen3 1.7B Q8_0 model is not in the installer. Settings presents it
@@ -55,8 +55,8 @@ evidence attached to the release record.
       2.16.03 archive.
 - [ ] `npm ci`, Cargo `--locked` resolution, and
       `sidecar/requirements.lock` were used.
-- [ ] `scripts/stage-release-inputs.ps1` verified the primary model and the
-      `llama.cpp b10091` archive before staging.
+- [ ] `scripts/stage-release-inputs.ps1` verified the primary and semantic
+      model assets plus the `llama.cpp b10091` archive before staging.
 - [ ] `scripts/build-sidecar.ps1 -Clean` smoke-tested the built sidecar against
       real DOCX, PDF, and scanned-image fixtures.
 - [ ] `scripts/verify-binaries.ps1` passed: no file carries
@@ -125,11 +125,11 @@ evidence attached to the release record.
 
 ## Publication guard
 
-- [ ] `v0.5.0` does not exist before the prepared release commit reaches
+- [ ] `v0.6.0` does not exist before the prepared release commit reaches
       `main`; successful CI starts the release workflow automatically for that
       exact commit.
 - [ ] The release-state preflight starts Windows packaging only after successful
-      CI on `main` for the exact release commit. A published `v0.5.0` skips
+      CI on `main` for the exact release commit. A published `v0.6.0` skips
       cleanly; only a matching interrupted draft can resume, and a tag pointing
       at any other commit fails closed.
 - [ ] If `TAURI_SIGNING_PRIVATE_KEY` is present, it matches the updater public

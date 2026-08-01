@@ -29,6 +29,9 @@ src-tauri/resources/models/*.gguf
 models/**/*.safetensors
 models/**/*.bin
 models/**/*.onnx
+models/**/vocab.txt
+src-tauri/resources/models/**/*.onnx
+src-tauri/resources/models/**/vocab.txt
 
 # Training artifacts
 training/data/

@@ -28,8 +28,8 @@
 > `build_evidence` never flags a document over it: naming quality degrades
 > slightly (a generic doc-type hint, unranked evidence) but conversion, OCR,
 > language ID, and naming keep working. `models/download_models.py` and
-> `src-tauri/src/model_download.rs::MODEL_FILES` fetch only the two Qwen3
-> GGUFs now.
+> `src-tauri/src/model_download.rs::MODEL_FILES` fetch the two Qwen3 GGUFs
+> plus the hash-pinned `Xenova/all-MiniLM-L6-v2` ONNX semantic model assets.
 
 BackLog is an offline desktop application, but its installer and model bundle
 combine several independently licensed projects. Pin exact artifacts and hashes
@@ -40,10 +40,11 @@ requirements for the intended audience have been reviewed.
 
 | Component | BackLog contract | Status and release rule |
 |---|---|---|
-| Tauri 2 | Target-triple external binaries (`externalBin`) plus a resource map for `resources/*` and the llama runtime DLLs | Supported. **Models are not installer resources.** `bundle.resources` maps only `resources/*` and `binaries/*.dll`; `lib.rs` rehomes both GGUF paths to `app_data_dir()/models` (`%APPDATA%\ai.sonomos.backlog\models`) at startup, which is where the in-app downloader and `BACKLOG_MODELS_DIR` also point. A path a user set through Settings' Browse dialog passes through untouched. |
+| Tauri 2 | Target-triple external binaries (`externalBin`) plus a resource map for `resources/*` and the llama runtime DLLs | Supported. The release build stages the primary GGUF and the semantic ONNX/vocab subtree as installer resources, then `lib.rs` rehomes them to `app_data_dir()/models` (`%APPDATA%\ai.sonomos.backlog\models`) at startup, which is where the in-app downloader and `BACKLOG_MODELS_DIR` also point. A path a user set through Settings' Browse dialog passes through untouched. |
 | llama.cpp `llama-server` | Loopback-only `/health` and `/v1/chat/completions`; embedded Jinja chat templates; **`response_format: {"type": "json_schema"}` and `chat_template_kwargs`** | Verified against release `b10091`. Both request keys are required, not preferred: a build that accepts and ignores them yields free text, the checker rejects every proposal, and every document ends in `SLM_FAIL` blaming the model. Record `llama-server --version`, source release, and SHA-256 for every installer, plus the ~13 runtime DLLs the `.exe` loads. |
 | Qwen3-0.6B GGUF | `Qwen3-0.6B-Q8_0.gguf`, primary naming tier | Official Qwen repository, Apache-2.0. Bundle only the exact file recorded in `models.lock.json`. |
 | Qwen3-1.7B GGUF | `Qwen3-1.7B-Q8_0.gguf`, escalation tier | Official Qwen repository, Apache-2.0. Same lock and notice rule. |
+| Xenova all-MiniLM-L6-v2 ONNX | `semantic/all-MiniLM-L6-v2/model.onnx` plus `vocab.txt`, semantic paragraph ranking and cached-label entity extraction | Apache-2.0. Source repo `Xenova/all-MiniLM-L6-v2` at revision `751bff37182d3f1213fa05d7196b954e230abad9`; local files are SHA-256-pinned in `models.lock.json`, verified by staging, release binary verification, and `sidecar/semantic.py` before inference. |
 | RapidOCR | Unified `rapidocr` 3.x result-object API with legacy tuple normalization | Supported. The deprecated `rapidocr-onnxruntime` distribution is not used. The final retry is enhanced 600-DPI classical OCR, not a separately licensed vision-language model. |
 | Lingua 2.1.1 | Offline language identification with ISO 639-1 output | Apache-2.0 and Python 3.11 compatible. Packaged inside `convertd`; no external language weight file is downloaded at runtime. |
 | GLiClass | Not shipped in the slim sidecar profile | Removed from `sidecar/requirements.txt`. `sidecar/convertd.py::op_classify` degrades to `ok=true` with a neutral default label (`available: false`) when gliclass/transformers are absent, which they always are on this profile. See "Deliberately excluded" below. |
@@ -61,6 +62,7 @@ requirements for the intended audience have been reviewed.
 - llama.cpp server: <https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md>
 - Qwen3 0.6B GGUF: <https://huggingface.co/Qwen/Qwen3-0.6B-GGUF>
 - Qwen3 1.7B GGUF: <https://huggingface.co/Qwen/Qwen3-1.7B-GGUF>
+- Xenova all-MiniLM-L6-v2 ONNX: <https://huggingface.co/Xenova/all-MiniLM-L6-v2>
 - RapidOCR: <https://github.com/RapidAI/RapidOCR>
 - Lingua Python: <https://github.com/pemistahl/lingua-py>
 - GLiClass (not shipped; naming enhancement only): <https://github.com/Knowledgator/GLiClass>

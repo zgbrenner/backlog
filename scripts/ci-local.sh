@@ -67,6 +67,7 @@ step workspace "cargo fmt --check" \
 
 # --- frontend ---------------------------------------------------------------
 step frontend "npm run check" npm run check
+step frontend "npm audit" npm audit --audit-level=high
 # The harness renders the real frontend against a mock Tauri IPC and exits
 # non-zero on any console error — the only automated proof the UI still boots.
 step frontend "UI harness" npm run harness:shots

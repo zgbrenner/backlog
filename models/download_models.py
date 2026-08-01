@@ -12,13 +12,13 @@ Usage:
 ``--verify-only`` imports no Hub client and performs no network access. Ettin is
 a separate training input and is deliberately not part of this runtime bundle.
 
-This is the slim, torch-free sidecar profile's bundle: just the two Apache-2.0
-Qwen3 GGUFs. gliclass (doc-type classification) and granite (salience
-embeddings) are not fetched here -- they're torch-only naming enhancements
-that ``sidecar/convertd.py``'s ``_gliclass``/``_granite`` loaders degrade to
-deterministic fallbacks for when their libraries or snapshots are absent, and
-the slim sidecar never installs those libraries. See
-``docs/DEPENDENCY_COMPATIBILITY.md``.
+This is the slim, torch-free sidecar profile's bundle: the two Apache-2.0
+Qwen3 GGUFs plus the local ONNX MiniLM semantic ranker/tokenizer. gliclass
+(doc-type classification) and granite (salience embeddings) are not fetched
+here -- they're torch-only naming enhancements that ``sidecar/convertd.py``'s
+``_gliclass``/``_granite`` loaders degrade to deterministic fallbacks for when
+their libraries or snapshots are absent, and the slim sidecar never installs
+those libraries. See ``docs/DEPENDENCY_COMPATIBILITY.md``.
 """
 
 from __future__ import annotations
@@ -35,10 +35,17 @@ LOCK = HERE / "models.lock.json"
 
 
 class ModelSpec:
-    def __init__(self, repo_id: str, filename: str | None, target: str):
+    def __init__(
+        self,
+        repo_id: str,
+        filename: str | None,
+        target: str,
+        revision: str = "main",
+    ):
         self.repo_id = repo_id
         self.filename = filename
         self.target = target
+        self.revision = revision
 
 
 MODEL_SPECS = [
@@ -56,6 +63,21 @@ MODEL_SPECS = [
         "Qwen3-1.7B-Q8_0.gguf",
         "Qwen3-1.7B-Q8_0.gguf",
     ),
+    # Torch-free semantic evidence model. The Hub source keeps the ONNX graph
+    # under onnx/model_quantized.onnx; BackLog stages it at the path sidecar/semantic.py
+    # loads inside BACKLOG_MODELS_DIR.
+    ModelSpec(
+        "Xenova/all-MiniLM-L6-v2",
+        "onnx/model_quantized.onnx",
+        "semantic/all-MiniLM-L6-v2/model.onnx",
+        "751bff37182d3f1213fa05d7196b954e230abad9",
+    ),
+    ModelSpec(
+        "Xenova/all-MiniLM-L6-v2",
+        "vocab.txt",
+        "semantic/all-MiniLM-L6-v2/vocab.txt",
+        "751bff37182d3f1213fa05d7196b954e230abad9",
+    ),
 ]
 
 _TOOL_FILES = {"download_models.py", "models.lock.json"}
@@ -68,6 +90,7 @@ _PAYLOAD_SUFFIXES = {
     ".model",
     ".pt",
     ".pth",
+    ".txt",
 }
 
 
@@ -214,14 +237,17 @@ def _download_bundle() -> None:
                     hf_hub_download(
                         repo_id=spec.repo_id,
                         filename=spec.filename,
-                        local_dir=HERE,
+                        revision=spec.revision,
                     )
                 )
-                if downloaded.resolve() != destination.resolve():
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(downloaded, destination)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(downloaded, destination)
         else:
-            snapshot_download(repo_id=spec.repo_id, local_dir=destination)
+            snapshot_download(
+                repo_id=spec.repo_id,
+                revision=spec.revision,
+                local_dir=destination,
+            )
 
     allowed = {path.resolve() for path in _expected_payload_files(HERE)}
     unexpected = [

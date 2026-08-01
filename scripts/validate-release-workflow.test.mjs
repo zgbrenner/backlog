@@ -19,7 +19,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: release-v0.5.0
+  group: release-\${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: true
 env:
   RELEASE_SHA: \${{ github.event.workflow_run.head_sha }}
@@ -29,11 +29,17 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       should-release: \${{ steps.release-gate.outputs.release }}
+      version: \${{ steps.release-metadata.outputs.version }}
+      tag: \${{ steps.release-metadata.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: \${{ env.RELEASE_SHA }}
+      - id: release-metadata
+        run: node scripts/release-contract.mjs metadata
       - id: release-gate
+        env:
+          TAG: \${{ steps.release-metadata.outputs.tag }}
         run: node scripts/release-contract.mjs gate
   release:
     needs: release-check
@@ -41,6 +47,10 @@ jobs:
     runs-on: windows-2022
     permissions:
       contents: write
+    env:
+      VERSION: \${{ needs.release-check.outputs.version }}
+      TAG: \${{ needs.release-check.outputs.tag }}
+      INSTALLER: "src-tauri/target/release/bundle/nsis/BackLog_\${{ needs.release-check.outputs.version }}_x64-setup.exe"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -105,11 +115,11 @@ jobs:
         if: steps.release-mode.outputs.signed == 'true'
         run: |
           $release = gh release view "$tag" --json isDraft,name | ConvertFrom-Json
-          if ($release.name -ne "BackLog v0.5.0") { throw "different release mode" }
-          ./scripts/retarget-release-draft.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA" -ExpectedName "BackLog v0.5.0"
+           if ($release.name -ne "BackLog v$env:VERSION") { throw "different release mode" }
+           ./scripts/retarget-release-draft.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA" -ExpectedName "BackLog v$env:VERSION"
           ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
           gh release upload "$tag" "$installer"
-          gh release create "$tag" "BackLog_0.5.0_x64-setup.exe" "BackLog_0.5.0_x64-setup.exe.sig" "latest.json" --target "$env:RELEASE_SHA" --draft
+           gh release create "$tag" "$env:INSTALLER" "$env:SIGNATURE" "latest.json" --target "$env:RELEASE_SHA" --draft
           gh release view "$tag" --json assets
           Compare-Object $expected $actual
           ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
@@ -119,8 +129,8 @@ jobs:
         if: steps.release-mode.outputs.signed == 'false'
         run: |
           $release = gh release view "$tag" --json isDraft,name | ConvertFrom-Json
-          if ($release.name -ne "BackLog v0.5.0 (unsigned prerelease)") { throw "different release mode" }
-          ./scripts/retarget-release-draft.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA" -ExpectedName "BackLog v0.5.0 (unsigned prerelease)"
+           if ($release.name -ne "BackLog v$env:VERSION (unsigned prerelease)") { throw "different release mode" }
+           ./scripts/retarget-release-draft.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA" -ExpectedName "BackLog v$env:VERSION (unsigned prerelease)"
           ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
           gh release upload "$tag" "$installer"
           gh release create "$tag" "$installer" --target "$env:RELEASE_SHA" --draft --notes "Unsigned installer; v0.4.4 remains the stable updater"
@@ -168,8 +178,8 @@ test("a failed CI run cannot allocate the release build", () => {
 
 test("the release must check out and tag the CI-tested commit", () => {
   const drifting = validWorkflow.replace(
-    "${{ github.event.workflow_run.head_sha }}",
-    "${{ github.sha }}",
+    "          ref: ${{ env.RELEASE_SHA }}",
+    "          ref: ${{ github.sha }}",
   );
   assert.match(
     validateReleaseWorkflow(drifting, validStageScript).join("\n"),
@@ -249,8 +259,8 @@ test("a draft cannot publish until its remote assets exactly match its release m
 
 test("an interrupted draft must retain its original signed or unsigned mode", () => {
   const modeBlind = validWorkflow
-    .replace('          if ($release.name -ne "BackLog v0.5.0") { throw "different release mode" }\n', "")
-    .replace('          if ($release.name -ne "BackLog v0.5.0 (unsigned prerelease)") { throw "different release mode" }\n', "");
+    .replace('          if ($release.name -ne "BackLog v$env:VERSION") { throw "different release mode" }\n', "")
+    .replace('          if ($release.name -ne "BackLog v$env:VERSION (unsigned prerelease)") { throw "different release mode" }\n', "");
   assert.match(
     validateReleaseWorkflow(modeBlind, validStageScript).join("\n"),
     /durable signed or unsigned mode/,
@@ -259,7 +269,7 @@ test("an interrupted draft must retain its original signed or unsigned mode", ()
 
 test("an interrupted draft must be ancestry-checked before its asset is replaced", () => {
   const unsafeRetry = validWorkflow.replaceAll(
-    /^          \.\/scripts\/retarget-release-draft\.ps1.*\n/gm,
+    /^\s+\.\/scripts\/retarget-release-draft\.ps1.*\n/gm,
     "",
   );
   assert.match(

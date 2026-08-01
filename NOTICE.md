@@ -23,17 +23,20 @@ required by the same gate; they are not listed individually here.
 |---|---|---|---|
 | Qwen3-0.6B GGUF | `Qwen3-0.6B-Q8_0.gguf` | Apache-2.0 | <https://huggingface.co/Qwen/Qwen3-0.6B-GGUF> |
 | Qwen3-1.7B GGUF | `Qwen3-1.7B-Q8_0.gguf` | Apache-2.0 | <https://huggingface.co/Qwen/Qwen3-1.7B-GGUF> |
+| Xenova all-MiniLM-L6-v2 | `onnx/model_quantized.onnx` staged as `semantic/all-MiniLM-L6-v2/model.onnx` plus `vocab.txt`, revision `751bff37182d3f1213fa05d7196b954e230abad9` | Apache-2.0 | <https://huggingface.co/Xenova/all-MiniLM-L6-v2> |
 
-Both are quantized redistributions of models released by Alibaba Cloud under
-Apache-2.0. Apache-2.0 §4 requires that the license text and any `NOTICE` file
-from the upstream repository travel with a redistribution: archive the model
-card and `LICENSE` file for the exact revision recorded in
+The Qwen files are quantized redistributions of models released by Alibaba Cloud
+under Apache-2.0. The MiniLM ONNX file is the quantized Apache-2.0 artifact
+listed above; its SHA-256 and the tokenizer SHA-256 are pinned in
+`models/models.lock.json`. Apache-2.0 §4 requires that the license text and any
+`NOTICE` file from each upstream repository travel with a redistribution: archive
+the model cards and `LICENSE` files for the exact revisions recorded in
 `models/models.lock.json` alongside the release evidence.
 
-The GGUFs are **not** in the installer (`tauri.conf.json`'s `bundle.resources`
-maps only `resources/*` and `binaries/*.dll`). They land in
-`%APPDATA%\ai.sonomos.backlog\models` at first run. If you instead ship a model
-ZIP, that ZIP is a redistribution and carries the same obligation.
+The primary Qwen3 GGUF and semantic assets are in the installer and are copied
+into `%APPDATA%\ai.sonomos.backlog\models` at first run. The Qwen3 1.7B GGUF is
+not in the installer; it remains an optional in-app download. If a model ZIP is
+distributed separately, that ZIP carries the same obligation.
 
 ## 2. Native binaries in the installer
 

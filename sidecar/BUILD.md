@@ -49,7 +49,10 @@ xcopy /e /i /y dist\convertd ..\src-tauri\binaries\convertd
 ## Runtime environment variables
 
 - `BACKLOG_MODELS_DIR`: path to the models directory (defaults to `../models`
-  relative to the executable during dev).
+  relative to the executable during dev). The semantic evidence lane expects
+  `semantic/all-MiniLM-L6-v2/model.onnx` and `vocab.txt` under this directory;
+  `sidecar/semantic.py` verifies both against the pinned SHA-256 values before
+  creating the ONNX Runtime session.
 - `BACKLOG_ETTIN_DIR`: path to the fine-tuned Ettin token classifier. Unset
   disables the Ettin lane; the app degrades gracefully.
 
@@ -63,8 +66,9 @@ xcopy /e /i /y dist\convertd ..\src-tauri\binaries\convertd
   fallbacks (a neutral doc type, document-order sentences, no spans) instead
   of using gliclass/granite/Ettin models, per `convertd.py`'s module
   docstring and its `_gliclass`/`_granite`/`_ettin` loaders. `convert`, `ocr`,
-  `langid`, and naming are unaffected. `BACKLOG_ETTIN_DIR` unset (the default)
-  already disables the Ettin lane the same way.
+  `langid`, semantic evidence, and naming are unaffected when their required
+  local assets are present. `BACKLOG_ETTIN_DIR` unset (the default) already
+  disables the Ettin lane the same way.
 - `requirements.txt` asks for `markitdown[pdf,docx,pptx,xls,xlsx]`. Base
   `markitdown` ships no document parsers at all -- pdfminer/pdfplumber,
   mammoth+lxml, python-pptx, openpyxl and pandas+xlrd are all extras -- so
@@ -84,12 +88,14 @@ xcopy /e /i /y dist\convertd ..\src-tauri\binaries\convertd
 `ping` returns `{}` and every heavy component sits behind a lazy factory, so a
 ping-only check passes a build with a missed hidden import or an uncollected
 ONNX data file and fails on the customer's first real document. Drive the
-three fixtures in `sidecar/fixtures/` through ONE process instead -- that is
-one request per lane: markitdown/mammoth, markitdown/pdfminer, and
-rapidocr+onnxruntime. `scripts/build-sidecar.ps1` does exactly this and fails
-the build on an empty conversion; `sidecar/tests/test_convertd_unit.py`
-(`FixtureConversionTests`) runs the same fixtures against an unfrozen
-interpreter.
+three fixtures in `sidecar/fixtures/` plus two real semantic requests through
+ONE process instead -- that is one request per lane: markitdown/mammoth,
+markitdown/pdfminer, rapidocr+onnxruntime, semantic paragraph ranking, and
+semantic entity extraction. `scripts/build-sidecar.ps1` does exactly this and
+fails the build on an empty conversion, a missing or mismatched semantic asset,
+or either semantic operation reporting anything other than `available: true`;
+`sidecar/tests/test_convertd_unit.py` (`FixtureConversionTests`) runs the same
+document fixtures against an unfrozen interpreter.
 
 The `\` line-continuation above and the quoting below are POSIX-shell syntax
 and DIFFER on Windows.
@@ -101,11 +107,14 @@ printf '%s\n' \
   '{"id":2,"op":"convert","path":"fixtures/sample_letter.docx"}' \
   '{"id":3,"op":"convert","path":"fixtures/sample_text.pdf"}' \
   '{"id":4,"op":"ocr","path":"fixtures/sample_scan.png","dpi":300}' \
+  '{"id":5,"op":"rank_paragraphs","paragraphs":[{"index":0,"text":"Jane Doe terminates effective July 31, 2026 under the Acme Corporation agreement.","start_char":0,"end_char":83}],"probes":["employment termination date"],"top_k":1,"min_score":0.0}' \
+  '{"id":6,"op":"extract_entities","paragraphs":[{"index":0,"text":"Jane Doe terminates effective July 31, 2026 under the Acme Corporation agreement.","start_char":0,"end_char":83}],"threshold":0.0}' \
   | dist/convertd
 ```
 
 Every line must come back `"ok": true`; ids 2 and 3 must carry non-empty
-`markdown`, and id 4 must report `"ocr_used": true` with `page_count >= 1`.
+`markdown`, id 4 must report `"ocr_used": true` with `page_count >= 1`, and
+ids 5 and 6 must report `"available": true`.
 
 Regenerate the fixtures with `python3 sidecar/fixtures/make_fixtures.py`
 (standard library only -- it must not need the parsers it exists to test).

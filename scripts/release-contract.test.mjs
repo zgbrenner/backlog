@@ -11,7 +11,7 @@ import {
   verifyReleaseArtifacts,
 } from "./release-contract.mjs";
 
-test("the release starts only for main when v0.5.0 is absent", () => {
+test("the release starts only for main when the version tag is absent", () => {
   assert.equal(
     shouldStartRelease({
       ref: "refs/heads/main",
@@ -87,23 +87,23 @@ test("a present updater key selects a stable signed release", () => {
 test("the updater manifest points at the signed installer for the exact tag", () => {
   assert.deepEqual(
     buildUpdaterManifest({
-      version: "0.5.0",
+      version: "0.6.0",
       repository: "zgbrenner/backlog",
-      installerName: "BackLog_0.5.0_x64-setup.exe",
+      installerName: "BackLog_0.6.0_x64-setup.exe",
       signature: "literal-signature",
       pubDate: "2026-07-30T12:00:00Z",
-      notes: "BackLog 0.5.0",
+      notes: "BackLog 0.6.0",
     }),
     {
-      version: "0.5.0",
-      notes: "BackLog 0.5.0",
+      version: "0.6.0",
+      notes: "BackLog 0.6.0",
       pub_date: "2026-07-30T12:00:00Z",
       platforms: {
         "windows-x86_64": {
           signature: "literal-signature",
           url:
             "https://github.com/zgbrenner/backlog/releases/download/" +
-            "v0.5.0/BackLog_0.5.0_x64-setup.exe",
+            "v0.6.0/BackLog_0.6.0_x64-setup.exe",
         },
       },
     },
@@ -114,9 +114,9 @@ test("a blank signature cannot produce updater metadata", () => {
   assert.throws(
     () =>
       buildUpdaterManifest({
-        version: "0.5.0",
+        version: "0.6.0",
         repository: "zgbrenner/backlog",
-        installerName: "BackLog_0.5.0_x64-setup.exe",
+        installerName: "BackLog_0.6.0_x64-setup.exe",
         signature: " \n",
         pubDate: "2026-07-30T12:00:00Z",
         notes: "",
@@ -127,7 +127,7 @@ test("a blank signature cannot produce updater metadata", () => {
 
 test("an unsigned artifact set is rejected if updater files exist", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "backlog-release-"));
-  const installer = path.join(dir, "BackLog_0.5.0_x64-setup.exe");
+  const installer = path.join(dir, "BackLog_0.6.0_x64-setup.exe");
   const signature = `${installer}.sig`;
   const manifest = path.join(dir, "latest.json");
   await writeFile(installer, "installer");
@@ -145,7 +145,7 @@ test("an unsigned artifact set is rejected if updater files exist", async () => 
 
 test("a signed artifact set requires a nonempty signature matching latest.json", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "backlog-release-"));
-  const installer = path.join(dir, "BackLog_0.5.0_x64-setup.exe");
+  const installer = path.join(dir, "BackLog_0.6.0_x64-setup.exe");
   const signature = `${installer}.sig`;
   const manifest = path.join(dir, "latest.json");
   await writeFile(installer, "installer");
@@ -154,7 +154,7 @@ test("a signed artifact set requires a nonempty signature matching latest.json",
     manifest,
     JSON.stringify(
       buildUpdaterManifest({
-        version: "0.5.0",
+        version: "0.6.0",
         repository: "zgbrenner/backlog",
         installerName: path.basename(installer),
         signature: "literal-signature",

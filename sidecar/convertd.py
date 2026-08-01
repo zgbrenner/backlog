@@ -14,16 +14,15 @@ Operations:
   langid        {text} -> {lang}
   classify      {text, labels} -> {label, score, available}
   salience      {sentences, probes, top_k} -> {indices, available}
+  rank_paragraphs {paragraphs, probes, top_k} -> exact ranked paragraphs
+  extract_entities {paragraphs, labels} -> exact cached-label spans
   ettin_spans   {text} -> {spans}
 
-classify, salience, and ettin_spans are naming ENHANCEMENTS layered on top of
-the deterministic harvest. This is the slim, torch-free sidecar profile:
-gliclass/transformers/sentence-transformers are not installed (and, even on a
-full install, the gliclass/granite model snapshots or BACKLOG_ETTIN_DIR may
-be absent). All three ops degrade to cheap deterministic fallbacks instead of
-failing -- ok=true always, with available:false on classify/salience when the
-real model wasn't used -- so a missing enhancement lane never flags a
-document as a processing failure upstream.
+The two semantic evidence operations share a small local quantized ONNX
+sentence embedder and preserve unchanged source text plus source offsets. They
+never summarize. All optional naming enhancements degrade to structured
+unavailable results or deterministic fallbacks rather than failing the
+document, so a missing/corrupt enhancement model never flags the core pipeline.
 """
 
 from __future__ import annotations
@@ -38,6 +37,11 @@ import sys
 import traceback
 from pathlib import Path
 
+_SIDECAR_DIR = Path(__file__).resolve().parent
+if str(_SIDECAR_DIR) not in sys.path:
+    sys.path.insert(0, str(_SIDECAR_DIR))
+import semantic as semantic_evidence
+
 # Missing local assets must fail rather than silently reaching a model hub.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -49,7 +53,7 @@ _DEFAULT_MODELS_DIR = (
     else Path(__file__).resolve().parent.parent / "models"
 )
 MODELS_DIR = Path(os.environ.get("BACKLOG_MODELS_DIR", _DEFAULT_MODELS_DIR))
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 _CACHE: dict[str, object] = {}
 _UNAVAILABLE = object()  # sentinel: an optional loader's factory raised once
 
@@ -163,6 +167,20 @@ def _granite():
         )
 
     return _get_optional("granite", create)
+
+
+def _semantic_embedder():
+    """One torch-free ONNX embedder shared by ranking and label extraction.
+
+    The loader only consults BACKLOG_MODELS_DIR. `semantic.load_embedder`
+    contains no network path, and `_get_optional` ensures a missing or corrupt
+    model is probed once per process rather than once per document.
+    """
+
+    return _get_optional(
+        "semantic_embedder",
+        lambda: semantic_evidence.load_embedder(MODELS_DIR),
+    )
 
 
 def _ettin():
@@ -909,6 +927,99 @@ def op_salience(args: dict) -> dict:
     return {"indices": np.argsort(-scores)[:top_k].tolist(), "available": True}
 
 
+def _paragraph_source_chars(paragraphs) -> int:
+    total = 0
+    for paragraph in paragraphs or []:
+        if isinstance(paragraph, dict):
+            total += len(str(paragraph.get("text") or ""))
+    return total
+
+
+def _semantic_rank_unavailable(paragraphs, reason: str) -> dict:
+    return {
+        "available": False,
+        "model": semantic_evidence.MODEL_ID,
+        "reason": reason,
+        "results": [],
+        "source_chars": _paragraph_source_chars(paragraphs),
+        "selected_chars": 0,
+    }
+
+
+def op_rank_paragraphs(args: dict) -> dict:
+    """Rank exact source paragraphs with a local semantic model.
+
+    Missing assets and inference faults are intentionally data, not protocol
+    errors. The Rust filter owns the deterministic fallback and conservative
+    bypass decision, so this operation never invents replacement text.
+    """
+
+    paragraphs = args.get("paragraphs") or []
+    if not paragraphs:
+        return {
+            "available": True,
+            "model": semantic_evidence.MODEL_ID,
+            "results": [],
+            "source_chars": 0,
+            "selected_chars": 0,
+        }
+    embedder = _semantic_embedder()
+    if embedder is None:
+        return _semantic_rank_unavailable(paragraphs, "model_unavailable")
+    try:
+        return semantic_evidence.rank_paragraphs(
+            embedder,
+            paragraphs,
+            args.get("probes") or [],
+            top_k=max(0, int(args.get("top_k", 12))),
+            min_score=float(args.get("min_score", 0.12)),
+            diversity=float(args.get("diversity", 0.22)),
+        )
+    except Exception:
+        return _semantic_rank_unavailable(paragraphs, "inference_failed")
+
+
+def _semantic_entities_unavailable(reason: str) -> dict:
+    return {
+        "available": False,
+        "model": semantic_evidence.MODEL_ID,
+        "reason": reason,
+        "spans": [],
+        "label_cache_key": "",
+        "label_embeddings_reused": False,
+        "candidates_considered": 0,
+    }
+
+
+def op_extract_entities(args: dict) -> dict:
+    """Classify deterministic full-document candidates with cached labels."""
+
+    paragraphs = args.get("paragraphs") or []
+    if not paragraphs:
+        return {
+            "available": True,
+            "model": semantic_evidence.MODEL_ID,
+            "spans": [],
+            "label_cache_key": "",
+            "label_embeddings_reused": False,
+            "candidates_considered": 0,
+        }
+    embedder = _semantic_embedder()
+    if embedder is None:
+        return _semantic_entities_unavailable("model_unavailable")
+    try:
+        return semantic_evidence.extract_entities(
+            embedder,
+            paragraphs,
+            args.get("labels") or semantic_evidence.DEFAULT_ENTITY_LABELS,
+            threshold=float(args.get("threshold", 0.42)),
+            max_per_label=max(1, int(args.get("max_per_label", 8))),
+            candidate_limit=max(1, int(args.get("candidate_limit", 512))),
+        )
+    except Exception:
+        return _semantic_entities_unavailable("inference_failed")
+
+
 def _normalize_span_date(text: str) -> str | None:
     import datetime
 
@@ -986,6 +1097,8 @@ OPS = {
     "langid": op_langid,
     "classify": op_classify,
     "salience": op_salience,
+    "rank_paragraphs": op_rank_paragraphs,
+    "extract_entities": op_extract_entities,
     "ettin_spans": op_ettin_spans,
 }
 

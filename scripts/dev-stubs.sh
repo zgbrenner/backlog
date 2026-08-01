@@ -29,8 +29,12 @@ STUB_MARKER="BACKLOG-DEV-STUB-DO-NOT-SHIP"
 
 bin="$(cd "$(dirname "$0")/.." && pwd)/src-tauri/binaries"
 model="$(cd "$(dirname "$0")/.." && pwd)/src-tauri/resources/models/Qwen3-0.6B-Q8_0.gguf"
+semantic_dir="$(cd "$(dirname "$0")/.." && pwd)/src-tauri/resources/models/semantic/all-MiniLM-L6-v2"
+semantic_model="$semantic_dir/model.onnx"
+semantic_vocab="$semantic_dir/vocab.txt"
 mkdir -p "$bin"
 mkdir -p "$(dirname "$model")"
+mkdir -p "$semantic_dir"
 
 host="$(rustc -vV | awk '/^host: /{print $2}')"
 if [ -z "$host" ]; then
@@ -83,6 +87,16 @@ fi
 # and must be able to run this script safely before packaging.
 if [ ! -e "$model" ] || [ ! -s "$model" ]; then
   stub "$model"
+fi
+
+# bundle.resources also requires both files in the nested semantic glob. They
+# are deliberately marked fixtures: a release replaces them with the exact
+# hash-pinned ONNX graph and vocabulary before verification.
+if [ ! -e "$semantic_model" ] || [ ! -s "$semantic_model" ]; then
+  stub "$semantic_model"
+fi
+if [ ! -e "$semantic_vocab" ] || [ ! -s "$semantic_vocab" ]; then
+  stub "$semantic_vocab"
 fi
 
 echo "Dev stub sidecars and primary-model fixture staged for host '$host' and x86_64-pc-windows-msvc."

@@ -1,14 +1,14 @@
 <#
 .SYNOPSIS
-  Download and stage the hash-pinned model and llama.cpp runtime for a Windows
-  release build.
+  Download and stage the hash-pinned models and llama.cpp runtime for a
+  Windows release build.
 
 .DESCRIPTION
   This script is intentionally release-only. It downloads the exact primary
-  model and llama.cpp archive, verifies both before copying anything into the
-  Tauri bundle, rejects the development marker, and stages the Visual C++
-  runtime files imported by llama.cpp. It never downloads the optional 1.7B
-  escalation model.
+  naming model, semantic ONNX model/tokenizer, and llama.cpp archive, verifies
+  each before copying anything into the Tauri bundle, rejects the development
+  marker for executable/model payloads, and stages the Visual C++ runtime files
+  imported by llama.cpp. It never downloads the optional 1.7B escalation model.
 #>
 [CmdletBinding()]
 param(
@@ -21,10 +21,18 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $BinDir = Join-Path $RepoRoot "src-tauri\binaries"
 $ModelDir = Join-Path $RepoRoot "src-tauri\resources\models"
 $Model = Join-Path $ModelDir "Qwen3-0.6B-Q8_0.gguf"
+$SemanticDir = Join-Path $ModelDir "semantic\all-MiniLM-L6-v2"
+$SemanticModel = Join-Path $SemanticDir "model.onnx"
+$SemanticVocab = Join-Path $SemanticDir "vocab.txt"
 
 $StubMarker = "BACKLOG-DEV-STUB-DO-NOT-SHIP"
 $PrimaryModelUrl = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf?download=true"
 $PrimaryModelSha256 = "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031"
+$SemanticRevision = "751bff37182d3f1213fa05d7196b954e230abad9"
+$SemanticModelUrl = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/$SemanticRevision/onnx/model_quantized.onnx?download=true"
+$SemanticModelSha256 = "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1"
+$SemanticVocabUrl = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/$SemanticRevision/vocab.txt?download=true"
+$SemanticVocabSha256 = "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
 $LlamaArchiveUrl = "https://github.com/ggml-org/llama.cpp/releases/download/b10091/llama-b10091-bin-win-cpu-x64.zip"
 $LlamaArchiveSha256 = "b2d991bdd37258bb51309f50e9fb7a52a16fe662ba71b2cbbbbb9303b47b5dee"
 $LlamaServerSha256 = "78af9cfb34f346b0de1e4f9c1577061cb3d55e8be55c8d540fde878e56bd0fe2"
@@ -36,9 +44,10 @@ if (-not $DownloadDir) {
 
 if ($Clean) {
     if (Test-Path $BinDir) { Remove-Item -Recurse -Force $BinDir }
+    if (Test-Path $ModelDir) { Remove-Item -Recurse -Force $ModelDir }
     if (Test-Path $DownloadDir) { Remove-Item -Recurse -Force $DownloadDir }
 }
-New-Item -ItemType Directory -Force $BinDir, $ModelDir, $DownloadDir | Out-Null
+New-Item -ItemType Directory -Force $BinDir, $ModelDir, $SemanticDir, $DownloadDir | Out-Null
 
 function Test-CarriesStubMarker {
     param([Parameter(Mandatory)][string] $Path)
@@ -64,21 +73,54 @@ function Assert-Hash {
     )
     $actual = (Get-FileHash $Path -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actual -ne $Expected) {
+        if ($Label -eq "Primary model") {
+            throw "Primary model hash mismatch: expected $Expected, computed $actual"
+        }
         throw "$Label hash mismatch: expected $Expected, computed $actual"
     }
 }
 
+function Stage-VerifiedDownload {
+    param(
+        [Parameter(Mandatory)][string] $Url,
+        [Parameter(Mandatory)][string] $DownloadName,
+        [Parameter(Mandatory)][string] $Destination,
+        [Parameter(Mandatory)][string] $ExpectedSha256,
+        [Parameter(Mandatory)][string] $Label,
+        [switch] $RejectStubMarker
+    )
+    $download = Join-Path $DownloadDir "$DownloadName.download"
+    Invoke-WebRequest -Uri $Url -OutFile $download -UseBasicParsing
+    Assert-Hash $download $ExpectedSha256 $Label
+    if ($RejectStubMarker -and (Test-CarriesStubMarker $download)) {
+        throw "$Label contains $StubMarker"
+    }
+    $parent = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Force $parent | Out-Null
+    Move-Item -Force $download $Destination
+    Assert-Hash $Destination $ExpectedSha256 "staged $Label"
+}
+
 # Download to a temporary path and verify before replacing the bundle resource.
-$modelDownload = Join-Path $DownloadDir "Qwen3-0.6B-Q8_0.gguf.download"
-Invoke-WebRequest -Uri $PrimaryModelUrl -OutFile $modelDownload -UseBasicParsing
-$expected = "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031"
-if ((Get-FileHash $modelDownload -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
-    throw "Primary model hash mismatch"
-}
-if (Test-CarriesStubMarker $modelDownload) {
-    throw "Primary model contains $StubMarker"
-}
-Move-Item -Force $modelDownload $Model
+Stage-VerifiedDownload `
+    -Url $PrimaryModelUrl `
+    -DownloadName "Qwen3-0.6B-Q8_0.gguf" `
+    -Destination $Model `
+    -ExpectedSha256 $PrimaryModelSha256 `
+    -Label "Primary model" `
+    -RejectStubMarker
+Stage-VerifiedDownload `
+    -Url $SemanticModelUrl `
+    -DownloadName "semantic-all-MiniLM-L6-v2-model.onnx" `
+    -Destination $SemanticModel `
+    -ExpectedSha256 $SemanticModelSha256 `
+    -Label "semantic\all-MiniLM-L6-v2\model.onnx"
+Stage-VerifiedDownload `
+    -Url $SemanticVocabUrl `
+    -DownloadName "semantic-all-MiniLM-L6-v2-vocab.txt" `
+    -Destination $SemanticVocab `
+    -ExpectedSha256 $SemanticVocabSha256 `
+    -Label "semantic\all-MiniLM-L6-v2\vocab.txt"
 
 $llamaArchive = Join-Path $DownloadDir "llama-b10091-bin-win-cpu-x64.zip"
 Invoke-WebRequest -Uri $LlamaArchiveUrl -OutFile $llamaArchive -UseBasicParsing
@@ -132,9 +174,10 @@ foreach ($name in $crtFiles) {
     Copy-Item (Join-Path $crtDir $name) $BinDir
 }
 
-Assert-Hash $Model $PrimaryModelSha256 "staged primary model"
 Write-Host "Staged hash-verified release inputs:" -ForegroundColor Green
 Write-Host "  primary model  $PrimaryModelSha256"
+Write-Host "  semantic model $SemanticModelSha256"
+Write-Host "  semantic vocab $SemanticVocabSha256"
 Write-Host "  llama archive  $LlamaArchiveSha256"
 Write-Host "  llama server   $LlamaServerSha256"
 Write-Host "  runtime DLLs   $($runtimeDlls.Count + $crtFiles.Count)"

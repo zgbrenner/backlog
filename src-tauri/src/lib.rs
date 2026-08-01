@@ -1408,6 +1408,45 @@ pub fn run() {
                     log::warn!("could not place the bundled {name} into the models folder");
                 }
             }
+            for (target, expected_sha256) in [
+                (
+                    model_download::SEMANTIC_MODEL_TARGET,
+                    model_download::SEMANTIC_MODEL_SHA256,
+                ),
+                (
+                    model_download::SEMANTIC_VOCAB_TARGET,
+                    model_download::SEMANTIC_VOCAB_SHA256,
+                ),
+            ] {
+                let dest = models_dir.join(target);
+                if dest.is_file()
+                    && pipeline::hash_file(&dest)
+                        .map(|actual| actual == expected_sha256)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                let bundled = resource(app.handle(), &format!("models/{target}"));
+                if !bundled.is_file() {
+                    continue;
+                }
+                match pipeline::hash_file(&bundled) {
+                    Ok(actual) if actual == expected_sha256 => {
+                        if let Some(parent) = dest.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        if std::fs::copy(&bundled, &dest).is_ok() {
+                            log::info!("copied bundled {target} into the models folder");
+                        } else {
+                            log::warn!("could not copy bundled {target} into the models folder");
+                        }
+                    }
+                    Ok(actual) => log::warn!(
+                        "bundled {target} has SHA-256 {actual}, expected {expected_sha256}; ignoring it"
+                    ),
+                    Err(error) => log::warn!("could not hash bundled {target}: {error}"),
+                }
+            }
             // After the bundled step, so a machine that received only the
             // primary still gets a usable escalation rung pointed at it.
             cfg.normalize();
@@ -2477,21 +2516,30 @@ mod tests {
         );
     }
 
-    /// A hung or quarantined convertd must cost an approval seconds, not the
-    /// 45-second per-request timeout the running pipeline uses.
+    /// Review-time provenance probes use the same bounded cold-start allowance
+    /// as Settings preflight: configured timeout, clamped to 1..=60 seconds.
     #[test]
-    fn the_review_path_probes_convertd_on_the_short_preflight_bound() {
-        let cfg = Config {
-            sidecar_timeout_secs: 45,
-            ..Default::default()
-        };
-        assert_eq!(review_probe_timeout(&cfg), Duration::from_secs(5));
+    fn the_review_path_tracks_the_bounded_preflight_timeout() {
+        assert_eq!(
+            review_probe_timeout(&Config {
+                sidecar_timeout_secs: 45,
+                ..Default::default()
+            }),
+            Duration::from_secs(45)
+        );
         assert_eq!(
             review_probe_timeout(&Config {
                 sidecar_timeout_secs: 0,
                 ..Default::default()
             }),
             Duration::from_secs(1)
+        );
+        assert_eq!(
+            review_probe_timeout(&Config {
+                sidecar_timeout_secs: 300,
+                ..Default::default()
+            }),
+            Duration::from_secs(60)
         );
     }
 }

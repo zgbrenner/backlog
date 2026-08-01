@@ -9,10 +9,11 @@
 //! Layout on disk mirrors `models/download_models.py`'s targets one-to-one:
 //! the two Qwen GGUFs land wherever `Config::slm_primary_gguf` /
 //! `slm_escalation_gguf` point (normally `app_data/models/…`, see
-//! [`resolve_configured_model_path`]). That's the whole bundle: the slim,
-//! torch-free sidecar profile ships without the gliclass/granite naming
-//! enhancements (see `sidecar/convertd.py`'s `_gliclass`/`_granite` loaders
-//! and `docs/DEPENDENCY_COMPATIBILITY.md`), so there are no torch-only model
+//! [`resolve_configured_model_path`]), and the semantic ONNX/tokenizer pair
+//! lands under `app_data/models/semantic/…`. The slim, torch-free sidecar
+//! profile ships without the gliclass/granite naming enhancements (see
+//! `sidecar/convertd.py`'s `_gliclass`/`_granite` loaders and
+//! `docs/DEPENDENCY_COMPATIBILITY.md`), so there are no torch-only model
 //! snapshots left to fetch or verify here.
 //!
 //! ## Integrity
@@ -20,11 +21,12 @@
 //! Each entry carries a compile-time [`ModelFile::expected_sha256`]. Nothing
 //! is ever renamed into place, or accepted as already-present, unless its
 //! digest matches that constant exactly. There is deliberately no
-//! trust-on-first-use path: the digests are what a 2.4 GB blob that
-//! llama.cpp mmaps and parses is checked against, and a lock file written by
-//! the same run that fetched the bytes cannot vouch for them. The committed
-//! `models/models.lock.json` records the same two digests for the staging
-//! script and the release checklist; a test below keeps the two in step.
+//! trust-on-first-use path: the digests are what every downloaded asset is
+//! checked against, including the 2.4 GB of Qwen bytes that llama.cpp mmaps
+//! and parses. A lock file written by the same run that fetched the bytes
+//! cannot vouch for them. The committed `models/models.lock.json` records the
+//! same four digests for the staging script and release checklist; a test below
+//! keeps the two in step.
 
 use crate::AppState;
 use serde::Serialize;
@@ -42,12 +44,18 @@ use tauri::{AppHandle, Emitter, Manager};
 pub const PRIMARY_GGUF_NAME: &str = "Qwen3-0.6B-Q8_0.gguf";
 /// Default basename for the escalation-tier GGUF.
 pub const ESCALATION_GGUF_NAME: &str = "Qwen3-1.7B-Q8_0.gguf";
+pub const SEMANTIC_MODEL_TARGET: &str = "semantic/all-MiniLM-L6-v2/model.onnx";
+pub const SEMANTIC_VOCAB_TARGET: &str = "semantic/all-MiniLM-L6-v2/vocab.txt";
+pub const SEMANTIC_MODEL_SHA256: &str =
+    "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1";
+pub const SEMANTIC_VOCAB_SHA256: &str =
+    "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3";
 
 const HF_HOST: &str = "https://huggingface.co";
 
 /// One file BackLog's runtime bundle needs, mirroring a `ModelSpec` entry in
-/// `models/download_models.py`. `repo` + `hf_path` address the file on the
-/// Hub (`{HF_HOST}/{repo}/resolve/main/{hf_path}`); `target` is the
+/// `models/download_models.py`. `repo` + `revision` + `hf_path` address the
+/// file on the Hub (`{HF_HOST}/{repo}/resolve/{revision}/{hf_path}`); `target` is the
 /// project-relative destination `download_models.py` and `models.lock.json`
 /// use, and doubles as this downloader's provenance key so the two tools
 /// describe the same bundle in the same vocabulary.
@@ -55,10 +63,12 @@ const HF_HOST: &str = "https://huggingface.co";
 /// The slim, torch-free sidecar profile has no gliclass/granite model
 /// snapshots to fetch (see `sidecar/convertd.py`'s `_gliclass`/`_granite`
 /// loaders, which degrade to deterministic fallbacks when those libraries or
-/// snapshots are absent), so this list is just the two Apache-2.0 Qwen3
-/// GGUFs. Verified against the live repo trees on 2026-07-22.
+/// snapshots are absent). This list contains the two Apache-2.0 Qwen3 GGUFs
+/// and the Apache-2.0 MiniLM semantic assets. The MiniLM files use an exact
+/// immutable revision; the Qwen repositories retain their existing hash gate.
 pub struct ModelFile {
     pub repo: &'static str,
+    pub revision: &'static str,
     pub hf_path: &'static str,
     pub target: &'static str,
     /// SHA-256 the downloaded bytes must hash to, pinned at compile time.
@@ -73,11 +83,12 @@ pub struct ModelFile {
 }
 
 pub const MODEL_FILES: &[ModelFile] = &[
-    // Apache-2.0 Qwen3 GGUFs served by llama.cpp. This is the whole bundle
-    // on the slim, torch-free sidecar profile -- no gliclass/granite
-    // snapshots to fetch (see the module doc comment above).
+    // Apache-2.0 Qwen3 GGUFs served by llama.cpp, plus the Apache-2.0
+    // MiniLM semantic assets. There are no gliclass/granite snapshots to
+    // fetch (see the module doc comment above).
     ModelFile {
         repo: "Qwen/Qwen3-0.6B-GGUF",
+        revision: "main",
         hf_path: PRIMARY_GGUF_NAME,
         target: PRIMARY_GGUF_NAME,
         expected_sha256: "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
@@ -85,20 +96,42 @@ pub const MODEL_FILES: &[ModelFile] = &[
     },
     ModelFile {
         repo: "Qwen/Qwen3-1.7B-GGUF",
+        revision: "main",
         hf_path: ESCALATION_GGUF_NAME,
         target: ESCALATION_GGUF_NAME,
         expected_sha256: "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
         size_hint: 1_834_426_016,
     },
+    ModelFile {
+        repo: "Xenova/all-MiniLM-L6-v2",
+        revision: "751bff37182d3f1213fa05d7196b954e230abad9",
+        hf_path: "onnx/model_quantized.onnx",
+        target: SEMANTIC_MODEL_TARGET,
+        expected_sha256: SEMANTIC_MODEL_SHA256,
+        size_hint: 22_972_370,
+    },
+    ModelFile {
+        repo: "Xenova/all-MiniLM-L6-v2",
+        revision: "751bff37182d3f1213fa05d7196b954e230abad9",
+        hf_path: "vocab.txt",
+        target: SEMANTIC_VOCAB_TARGET,
+        expected_sha256: SEMANTIC_VOCAB_SHA256,
+        size_hint: 231_508,
+    },
 ];
 
-/// Builds a Hugging Face `resolve/main` URL for one [`ModelFile`]. HF resolve
-/// URLs 302 to a CDN, so the client keeps redirects on — but capped, and
+/// Builds a Hugging Face `resolve/{revision}` URL for one [`ModelFile`]. HF
+/// resolve URLs 302 to a CDN, so the client keeps redirects on — but capped, and
 /// HTTPS-only, so a redirect can never walk the transfer down to plaintext.
+#[allow(dead_code)]
 pub fn download_url(repo: &str, hf_path: &str) -> String {
+    download_url_at(repo, "main", hf_path)
+}
+
+pub fn download_url_at(repo: &str, revision: &str, hf_path: &str) -> String {
     let encoded_segments: Vec<String> = hf_path.split('/').map(percent_encode_segment).collect();
     format!(
-        "{HF_HOST}/{repo}/resolve/main/{}",
+        "{HF_HOST}/{repo}/resolve/{revision}/{}",
         encoded_segments.join("/")
     )
 }
@@ -173,9 +206,9 @@ struct DownloadTarget {
 }
 
 /// Maps every [`MODEL_FILES`] entry onto a concrete destination: distinct
-/// configured GGUF paths are honored, while a legacy/collapsed pair is
-/// separated into the canonical filenames under `models_dir` so one download
-/// can never overwrite the other.
+/// configured GGUF paths are honored, semantic assets stay under their fixed
+/// subtree, and a legacy/collapsed GGUF pair is separated into the canonical
+/// filenames under `models_dir` so one download can never overwrite the other.
 fn download_targets(
     models_dir: &Path,
     primary_gguf: &Path,
@@ -202,7 +235,7 @@ fn download_targets(
             };
             DownloadTarget {
                 key: f.target,
-                url: download_url(f.repo, f.hf_path),
+                url: download_url_at(f.repo, f.revision, f.hf_path),
                 expected_sha256: f.expected_sha256,
                 dest,
                 size_hint: f.size_hint,
@@ -946,6 +979,18 @@ mod tests {
     }
 
     #[test]
+    fn download_url_can_pin_a_specific_revision() {
+        assert_eq!(
+            download_url_at(
+                "Xenova/all-MiniLM-L6-v2",
+                "751bff37182d3f1213fa05d7196b954e230abad9",
+                "onnx/model_quantized.onnx",
+            ),
+            "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/751bff37182d3f1213fa05d7196b954e230abad9/onnx/model_quantized.onnx"
+        );
+    }
+
+    #[test]
     fn download_url_percent_encodes_reserved_characters() {
         assert_eq!(
             download_url("owner/repo", "a file.bin"),
@@ -958,10 +1003,10 @@ mod tests {
         // Cheap sanity net for future MODEL_FILES edits: every entry must
         // still produce a well-formed https URL under the HF host.
         for file in MODEL_FILES {
-            let url = download_url(file.repo, file.hf_path);
+            let url = download_url_at(file.repo, file.revision, file.hf_path);
             assert!(url.starts_with("https://huggingface.co/"), "{url}");
             assert!(
-                url.ends_with(&format!("/resolve/main/{}", file.hf_path)),
+                url.ends_with(&format!("/resolve/{}/{}", file.revision, file.hf_path)),
                 "{url}"
             );
         }

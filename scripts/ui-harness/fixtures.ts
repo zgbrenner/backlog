@@ -455,7 +455,7 @@ const EVENTS_BY_SHA: Record<string, Event[]> = {
 };
 
 const DIAGNOSTICS = {
-  app_version: "0.5.0",
+  app_version: "0.6.0",
   platform: "windows x86_64",
   sidecar_versions: {
     convertd: "0.4.1",
@@ -470,7 +470,7 @@ const DIAGNOSTICS = {
  *  `sidecar_versions.error`. get_diagnostics has no failure path that rejects,
  *  so a fixture that threw was evidence of an unreachable state. */
 const DIAGNOSTICS_NO_SIDECAR = {
-  app_version: "0.5.0",
+  app_version: "0.6.0",
   platform: "windows x86_64",
   sidecar_versions: { error: "convertd is not installed" },
 };
