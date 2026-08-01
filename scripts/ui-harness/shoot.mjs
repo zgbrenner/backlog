@@ -108,12 +108,32 @@ function watch(page) {
   return problems;
 }
 
-async function boot(page, name) {
-  await page.goto(`${base}/?scenario=${encodeURIComponent(name)}`, { waitUntil: "networkidle" });
+async function boot(page, name, { disableLazyEvidence = false } = {}) {
+  if (disableLazyEvidence) {
+    // The evidence retry assertion needs the first get_evidence call to come
+    // from the button, not the date-chip observer. This is a harness-only
+    // control; production keeps the lazy date extraction behavior.
+    await page.addInitScript(() => {
+      window.IntersectionObserver = class {
+        observe() {}
+        disconnect() {}
+      };
+    });
+  }
+  // Vite keeps a development HMR connection open, and the production shell
+  // may start a background update check. Neither is part of first paint; using
+  // networkidle here made a healthy page hang for 30 seconds before the actual
+  // selector/assertion checks could run. DOM readiness plus the shell selector
+  // below proves the app booted without coupling the harness to background
+  // traffic.
+  await page.goto(`${base}/?scenario=${encodeURIComponent(name)}`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#app .shell, #app .fatal", { timeout: 10_000 });
   const wanted = SCENARIOS[name]?.view;
   if (wanted) {
-    await page.click(`nav button[data-v="${wanted}"]`);
+    const tab = wanted === "flagged"
+      ? page.getByRole("tab", { name: /Needs Review/ })
+      : page.getByRole("tab", { name: wanted === "settings" ? "Settings" : "Queue" });
+    await tab.click();
   }
   // Let the microtask queue, the render loop and the header coalescer settle.
   await page.waitForTimeout(600);
@@ -214,6 +234,83 @@ for (const name of names) {
 // ---------------------------------------------------------------------------
 
 const CHECKS = [
+  {
+    name: "a hanging loading read becomes a retryable error",
+    async run(page) {
+      await boot(page, "loading");
+      const problems = [];
+      await page.getByRole("tab", { name: "Settings" }).click();
+      await page.getByRole("heading", { name: "Folders" }).waitFor({ state: "visible", timeout: 5000 });
+      await page.getByRole("tab", { name: "Queue" }).click();
+      const error = page.locator(".err-state");
+      await error.waitFor({ state: "visible", timeout: 5000 });
+      if (!/taking too long to answer/i.test(await error.innerText())) {
+        problems.push("the hung read did not become a plain-language timeout");
+      }
+      const before = await page.evaluate(() =>
+        window.__harness.invocations.filter((i) => i.cmd === "get_stats").length
+      );
+      await error.getByRole("button", { name: "Try again" }).click();
+      await error.waitFor({ state: "visible", timeout: 5000 });
+      const after = await page.evaluate(() =>
+        window.__harness.invocations.filter((i) => i.cmd === "get_stats").length
+      );
+      if (after <= before) problems.push("Try again did not issue a fresh bounded read");
+      return problems;
+    },
+  },
+  {
+    name: "folder Browse buttons have unique accessible names",
+    async run(page) {
+      await boot(page, "first-run");
+      const browse = page.getByRole("button", { name: /^Browse for / });
+      const names = await browse.evaluateAll((buttons) =>
+        buttons.map((button) => button.getAttribute("aria-label") ?? "")
+      );
+      const problems = [];
+      if (names.length !== 3) problems.push(`expected 3 visible folder Browse buttons, saw ${names.length}`);
+      if (new Set(names).size !== names.length) problems.push("visible Browse buttons still share an accessible name");
+      for (const folder of ["Processing folder", "Outbox folder", "Quarantine folder"]) {
+        if (!names.some((name) => name.startsWith(`Browse for ${folder}`))) {
+          problems.push(`no accessible Browse name for ${folder}`);
+        }
+      }
+      return problems;
+    },
+  },
+  {
+    name: "the narrow queue stays readable without page-wide clipping",
+    async run(page) {
+      await boot(page, "ready");
+      await page.setViewportSize({ width: 480, height: 720 });
+      await page.waitForTimeout(100);
+      const metrics = await page.getByRole("table").evaluate((table) => {
+        const wrap = table.parentElement;
+        const cell = table.querySelector("td.mono");
+        if (!wrap || !cell) return null;
+        const wrapStyle = getComputedStyle(wrap);
+        const cellStyle = getComputedStyle(cell);
+        return {
+          overflowX: wrapStyle.overflowX,
+          tableWidth: table.scrollWidth,
+          wrapWidth: wrap.clientWidth,
+          pageWidth: document.documentElement.scrollWidth,
+          viewportWidth: window.innerWidth,
+          wordBreak: cellStyle.wordBreak,
+        };
+      });
+      const problems = [];
+      if (!metrics) return ["queue table metrics were unavailable"];
+      if (metrics.overflowX !== "auto") problems.push(`queue overflow was ${metrics.overflowX}, not auto`);
+      if (metrics.tableWidth <= metrics.wrapWidth) problems.push("the narrow table had no reachable overflow");
+      if (metrics.pageWidth > metrics.viewportWidth + 1) problems.push("the page itself overflowed horizontally");
+      if (metrics.wordBreak === "break-word") problems.push("filenames still break into narrow fragments");
+      if (!(await page.getByText("On a narrow window, scroll horizontally to see all queue columns.").isVisible())) {
+        problems.push("the narrow queue did not explain how to reach the remaining columns");
+      }
+      return problems;
+    },
+  },
   {
     name: "a job-updated event never touches a card being edited",
     async run(page) {
@@ -593,25 +690,73 @@ const CHECKS = [
     name: "navigation keeps a pending approval undoable",
     async run(page) {
       await boot(page, "review");
-      const card = page.locator(".card").first();
+      const card = page.getByRole("article", { name: "Review IMG_20260214_113355.jpg" });
+      const sha = await card.getAttribute("data-sha");
       await card.locator('[name="date"]').fill("2026-02-14");
       await card.locator('[name="subject"]').fill("Riverside lease agreement");
       await card.locator('[name="description"]').fill(
         "Signed lease agreement for the Riverside unit between Contoso and A. Patel."
       );
       await card.locator('[data-act="approve"]').click();
-      await page.click('nav button[data-v="settings"]');
-      await page.waitForTimeout(300);
+      await page.getByRole("tab", { name: "Settings" }).click();
+      await page.getByRole("heading", { name: "Folders" }).waitFor({ state: "visible" });
+      await page.getByRole("tab", { name: /Needs Review/ }).click();
+      const returned = page.locator(`[data-sha="${sha}"]`);
+      await returned.waitFor({ state: "attached" });
       const problems = [];
       if (!(await page.locator("#pending-approval-tray").isVisible())) {
         problems.push("pending approval disappeared on navigation");
       }
-      await page.locator("#pending-approval-tray [data-act=undo]").click();
+      if (!(await returned.locator(".undo-strip").isVisible())) {
+        problems.push("the parked card did not return with its Undo strip");
+      }
+      if (await returned.locator("form").isVisible()) {
+        problems.push("the parked card returned as an editable form");
+      }
+      await page.locator("#pending-approval-tray").getByRole("button", { name: "Undo" }).click();
       await page.waitForTimeout(300);
       const called = await page.evaluate(() =>
         window.__harness.invocations.some((i) => i.cmd === "resubmit" || i.cmd === "approve_job")
       );
       if (called) problems.push("Undo after navigation still filed the document");
+      return problems;
+    },
+  },
+  {
+    name: "evidence read failures are distinct and retryable",
+    async run(page) {
+      await boot(page, "review-evidence-retry", { disableLazyEvidence: true });
+      const card = page.getByRole("article", { name: "Review IMG_20260214_113355.jpg" });
+      await card.getByRole("button", { name: "Document text" }).click();
+      const failure = card.locator(".evidence-error");
+      await failure.waitFor({ state: "visible" });
+      const problems = [];
+      if (!/could not read the saved text/i.test(await failure.innerText())) {
+        problems.push("the read failure was not identified as a read failure");
+      }
+      if (/no saved text/i.test(await failure.innerText())) {
+        problems.push("the read failure was presented as missing evidence");
+      }
+      const before = await page.evaluate(() =>
+        window.__harness.invocations.filter((i) => i.cmd === "get_evidence").length
+      );
+      await failure.getByRole("button", { name: "Try again" }).click();
+      const evidence = card.locator("pre.evidence");
+      await evidence.waitFor({ state: "visible" });
+      if (!/Tenancy Agreement/.test(await evidence.innerText())) {
+        problems.push("Retry did not restore the saved evidence");
+      }
+      const after = await page.evaluate(() =>
+        window.__harness.invocations.filter((i) => i.cmd === "get_evidence").length
+      );
+      if (after <= before) problems.push("Retry did not issue a fresh evidence read");
+
+      const missing = page.getByRole("article", { name: "Review payroll-run-locked.pdf" });
+      await missing.getByRole("button", { name: "Document text" }).click();
+      await missing.locator("pre.evidence").waitFor({ state: "visible" });
+      if (!/no saved text/i.test(await missing.locator("pre.evidence").innerText())) {
+        problems.push("a missing evidence file did not retain its distinct message");
+      }
       return problems;
     },
   },

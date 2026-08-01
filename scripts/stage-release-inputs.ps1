@@ -17,7 +17,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$RepoRoot = [IO.Path]::GetFullPath((Resolve-Path (Join-Path $PSScriptRoot "..")).Path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
 $BinDir = Join-Path $RepoRoot "src-tauri\binaries"
 $ModelDir = Join-Path $RepoRoot "src-tauri\resources\models"
 $Model = Join-Path $ModelDir "Qwen3-0.6B-Q8_0.gguf"
@@ -41,13 +41,49 @@ if (-not $DownloadDir) {
     $tempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
     $DownloadDir = Join-Path $tempRoot "backlog-release-inputs"
 }
+$DownloadDir = [IO.Path]::GetFullPath($DownloadDir).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+
+function Test-PathWithin {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Root
+    )
+    $pathWithSeparator = "$Path$([IO.Path]::DirectorySeparatorChar)"
+    $rootWithSeparator = "$($Root.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))$([IO.Path]::DirectorySeparatorChar)"
+    return $pathWithSeparator.StartsWith($rootWithSeparator, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-SafeDownloadDirectory {
+    param([Parameter(Mandatory)][string] $Path)
+
+    $root = [IO.Path]::GetPathRoot($Path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $profile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    $profile = if ($profile) { [IO.Path]::GetFullPath($profile).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) } else { "" }
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $isDedicatedTempPath = Test-PathWithin -Path $Path -Root $tempRoot
+    if (-not $Path -or $Path -eq $root -or $Path -eq $RepoRoot -or
+        (Test-PathWithin -Path $Path -Root $RepoRoot) -or
+        (Test-PathWithin -Path $RepoRoot -Root $Path) -or
+        ($profile -and -not $isDedicatedTempPath -and ($Path -eq $profile -or (Test-PathWithin -Path $Path -Root $profile) -or (Test-PathWithin -Path $profile -Root $Path)))) {
+        throw "Refusing unsafe release download directory '$Path'. Use a dedicated temporary directory outside the repository and user profile."
+    }
+}
+
+Assert-SafeDownloadDirectory -Path $DownloadDir
+$DownloadMarker = Join-Path $DownloadDir ".backlog-release-inputs.marker"
 
 if ($Clean) {
+    if ((Test-Path $DownloadDir) -and -not (Test-Path $DownloadMarker -PathType Leaf)) {
+        throw "Refusing to recursively delete '$DownloadDir': the BackLog staging marker is missing."
+    }
     if (Test-Path $BinDir) { Remove-Item -Recurse -Force $BinDir }
     if (Test-Path $ModelDir) { Remove-Item -Recurse -Force $ModelDir }
     if (Test-Path $DownloadDir) { Remove-Item -Recurse -Force $DownloadDir }
 }
 New-Item -ItemType Directory -Force $BinDir, $ModelDir, $SemanticDir, $DownloadDir | Out-Null
+if (-not (Test-Path $DownloadMarker -PathType Leaf)) {
+    [IO.File]::WriteAllText($DownloadMarker, "BackLog release staging directory. Do not use for unrelated data.`n")
+}
 
 function Test-CarriesStubMarker {
     param([Parameter(Mandatory)][string] $Path)

@@ -61,7 +61,7 @@ pub fn spawn(pipeline: Arc<Pipeline>, dir: PathBuf) -> anyhow::Result<()> {
                     DebounceEventResult::Ok(events) => {
                         for ev in events {
                             for p in ev.paths.clone() {
-                                if is_candidate(&p) {
+                                if is_safe_path_under_root(&dir, &p) && is_candidate(&p) {
                                     enqueue(&pipeline, p);
                                 }
                             }
@@ -110,6 +110,10 @@ fn enqueue(pipeline: &Arc<Pipeline>, path: PathBuf) {
 }
 
 fn is_candidate(p: &Path) -> bool {
+    if is_reparse_point(p) {
+        log::warn!("ignoring reparse-point path outside the configured root: {p:?}");
+        return false;
+    }
     if !p.is_file() {
         return false;
     }
@@ -122,6 +126,76 @@ fn is_candidate(p: &Path) -> bool {
         return false;
     }
     true
+}
+
+/// Symlinks and Windows junctions are not documents. Checking metadata without
+/// following links is important: `Path::is_file` and `Path::is_dir` both follow
+/// them, which can make a recursive watcher ingest an unrelated tree.
+fn is_reparse_point(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return true;
+    };
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// Validate a path at every watcher boundary, not only when the notify event
+/// arrives. A sync provider can replace a regular file with a symlink/junction
+/// between the event and the worker; rechecking the canonical location and all
+/// existing path components makes the worker fail closed instead of hashing or
+/// quarantining a path that escaped Processing.
+pub(crate) fn is_safe_path_under_root(root: &Path, path: &Path) -> bool {
+    is_within_root(root, path) && !contains_reparse_component(path)
+}
+
+fn is_within_root(root: &Path, path: &Path) -> bool {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = path_identity_key(&root);
+    let candidate = path_identity_key(&candidate);
+    candidate == root
+        || (candidate.starts_with(&root) && candidate.as_bytes().get(root.len()) == Some(&b'/'))
+}
+
+fn path_identity_key(path: &Path) -> String {
+    let mut key = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    key.make_ascii_lowercase();
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    key
+}
+
+fn contains_reparse_component(path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A file is "stable" when its size stops changing across probes and it can
@@ -171,6 +245,9 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
         if let Ok(entries) = std::fs::read_dir(&d) {
             for e in entries.flatten() {
                 let p = e.path();
+                if !is_safe_path_under_root(dir, &p) || is_reparse_point(&p) {
+                    continue;
+                }
                 if p.is_dir() {
                     stack.push(p);
                 } else if is_candidate(&p) {
@@ -228,5 +305,55 @@ mod tests {
         let stable = wait_stable(&path).await;
         writer.await.unwrap();
         assert!(stable, "it settles once writing stops");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_does_not_follow_a_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.pdf");
+        std::fs::write(&outside_file, b"outside").unwrap();
+        let link = dir.path().join("linked-folder");
+        symlink(outside.path(), &link).unwrap();
+
+        let files = walk(dir.path());
+        assert!(!files.iter().any(|path| path == &outside_file));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_symlink_is_not_safe_even_when_its_target_is_inside_the_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.pdf");
+        let link = dir.path().join("alias.pdf");
+        std::fs::write(&target, b"inside").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(!is_safe_path_under_root(dir.path(), &link));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn walk_does_not_follow_a_directory_junction() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.pdf");
+        std::fs::write(&outside_file, b"outside").unwrap();
+        let junction = dir.path().join("linked-folder");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(outside.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not create junction for test");
+
+        let files = walk(dir.path());
+        assert!(!files.iter().any(|path| path == &outside_file));
     }
 }

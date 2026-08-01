@@ -56,6 +56,16 @@ xcopy /e /i /y dist\convertd ..\src-tauri\binaries\convertd
 - `BACKLOG_ETTIN_DIR`: path to the fine-tuned Ettin token classifier. Unset
   disables the Ettin lane; the app degrades gracefully.
 
+## Protocol and input limits
+
+- Every JSON-line request must carry an unsigned 64-bit integer `id`. ID `0`
+  is reserved for structured protocol errors whose malformed request ID cannot
+  safely be echoed.
+- `convertd` rejects input files larger than 64 MiB before PDF, MarkItDown, or
+  OCR parsing. This pre-parser ceiling is separate from the 200,000-character
+  Markdown response ceiling; oversized inputs fail closed with a structured
+  sidecar error.
+
 ## Notes
 
 - This is the slim, torch-free sidecar profile: `requirements.txt` has no

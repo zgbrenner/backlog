@@ -32,6 +32,7 @@ use crate::AppState;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -299,6 +300,26 @@ const FREE_SPACE_MARGIN: u64 = 512 * 1024 * 1024;
 /// singleton operation the user starts from one button.
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
+/// The UI exposes one bundle operation, and the process must enforce that
+/// invariant even if two windows or stale IPC callbacks press the button at
+/// the same time. A guard makes the flag exception-safe on every return path.
+static ACTIVE_DOWNLOAD: AtomicBool = AtomicBool::new(false);
+
+struct DownloadSession;
+
+fn begin_download_session() -> Result<DownloadSession, String> {
+    ACTIVE_DOWNLOAD
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .map(|_| DownloadSession)
+        .map_err(|_| "a model download is already in progress".to_string())
+}
+
+impl Drop for DownloadSession {
+    fn drop(&mut self) {
+        ACTIVE_DOWNLOAD.store(false, Ordering::Release);
+    }
+}
+
 /// Last terminal outcome, so a user who navigated away from Settings (or
 /// stepped away for the six seconds a toast lives) can still be told what
 /// happened.
@@ -491,10 +512,22 @@ impl ProgressReporter<'_> {
 
 /// Failure modes the bundle loop has to tell apart: an operator stop is not
 /// an error and must never be reported as one.
+#[derive(Debug)]
 enum DownloadError {
     Cancelled,
     Failed(String),
 }
+
+impl fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("download cancelled"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for DownloadError {}
 
 impl From<String> for DownloadError {
     fn from(message: String) -> Self {
@@ -553,6 +586,14 @@ async fn download_one(
     let mut hasher = Sha256::new();
     let mut resume_from = hash_existing_prefix(&part_path, &mut hasher)
         .map_err(|e| format!("{}: {e}", part_path.display()))?;
+    if resume_from > target.size_hint {
+        // A partial from a different bundle revision cannot be resumed safely
+        // once it is larger than the pinned payload. Start clean; the final
+        // digest remains the authority for every byte.
+        let _ = std::fs::remove_file(&part_path);
+        resume_from = 0;
+        hasher = Sha256::new();
+    }
 
     let send = |from: u64| {
         let mut request = client.get(&target.url);
@@ -590,9 +631,20 @@ async fn download_one(
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|text| text.parse::<u64>().ok());
-    let file_bytes_total = declared_body_len
-        .map(|len| resume_from + len)
-        .unwrap_or(target.size_hint);
+    if let Some(declared) = declared_body_len {
+        if resume_from
+            .checked_add(declared)
+            .is_none_or(|total| total > target.size_hint)
+        {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(format!(
+                "download of {} exceeds its pinned size ceiling of {} bytes",
+                target.url, target.size_hint
+            )
+            .into());
+        }
+    }
+    let file_bytes_total = target.size_hint;
 
     let mut file = if resume_from > 0 {
         std::fs::OpenOptions::new()
@@ -623,6 +675,16 @@ async fn download_one(
                 return Err(format!("download of {} interrupted: {e}", target.url).into());
             }
         };
+        let total_before = resume_from.saturating_add(body_written);
+        if chunk.len() as u64 > target.size_hint.saturating_sub(total_before) {
+            let _ = file.sync_all();
+            let _ = std::fs::remove_file(&part_path);
+            return Err(format!(
+                "download of {} exceeded its pinned size ceiling of {} bytes",
+                target.url, target.size_hint
+            )
+            .into());
+        }
         file.write_all(&chunk)
             .map_err(|e| format!("{}: {e}", part_path.display()))?;
         hasher.update(&chunk);
@@ -656,6 +718,13 @@ async fn download_one(
     }
 
     let total = resume_from + body_written;
+    if total != target.size_hint {
+        return Err(format!(
+            "download of {} ended at {total} bytes; pinned size is {}",
+            target.url, target.size_hint
+        )
+        .into());
+    }
     let digest = hex::encode(hasher.finalize());
     if digest != target.expected_sha256 {
         let _ = std::fs::remove_file(&part_path);
@@ -754,6 +823,21 @@ pub async fn download_models(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let _session = match begin_download_session() {
+        Ok(session) => session,
+        Err(error) => {
+            record_outcome(
+                Some(&app),
+                DownloadDone {
+                    ok: false,
+                    cancelled: false,
+                    error: Some(error.clone()),
+                    finished_at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
+            return Err(error);
+        }
+    };
     let models_dir = resolve_models_dir(&app);
     std::fs::create_dir_all(&models_dir)
         .map_err(|e| format!("could not create {}: {e}", models_dir.display()))?;
@@ -949,6 +1033,15 @@ mod tests {
             dest,
             size_hint: body.len() as u64,
         }
+    }
+
+    #[test]
+    fn only_one_download_session_can_be_active() {
+        let first = begin_download_session().expect("the first session should be admitted");
+        assert!(begin_download_session().is_err());
+        drop(first);
+        let second = begin_download_session().expect("the guard should be reusable");
+        drop(second);
     }
 
     fn emitter_for<'a>(sink: ProgressSink<'a>, key: &'a str, total: u64) -> ProgressReporter<'a> {
@@ -1247,6 +1340,26 @@ mod tests {
             !part_path_for(&dest).exists(),
             "a body that failed verification must not be left to be resumed"
         );
+    }
+
+    #[tokio::test]
+    async fn download_one_rejects_a_body_over_the_known_size_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        let body = b"oversized body".to_vec();
+        let (url, _rx) = serve_once(body.clone(), true);
+        let digest: &'static str = Box::leak(hex::encode(Sha256::digest(&body)).into_boxed_str());
+        let mut target = target_for(dest.clone(), url, &body, digest);
+        target.size_hint = (body.len() - 1) as u64;
+        let sink = noop_sink();
+        let emitter = emitter_for(&sink, target.key, target.size_hint);
+
+        let error = download_one(&test_client(), &target, &emitter, &AtomicBool::new(false))
+            .await
+            .expect_err("the stream must be bounded by the pinned size");
+        assert!(error.to_string().contains("size ceiling"), "{error}");
+        assert!(!dest.exists());
+        assert!(!part_path_for(&dest).exists());
     }
 
     #[tokio::test]

@@ -269,6 +269,10 @@ impl Pipeline {
         while self.paused.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
+        if !crate::watcher::is_safe_path_under_root(&self.cfg.processing_dir, &path) {
+            log::warn!("refusing an intake path that is outside Processing or uses a reparse point: {path:?}");
+            return;
+        }
         // The timeout drops `process_inner` mid-flight, so the sha it computed
         // would be lost with it. Hoist it out through a shared slot, set the
         // moment this worker actually owns the row, so the handler below knows
@@ -329,6 +333,10 @@ impl Pipeline {
 
     async fn process_inner(self: Arc<Self>, path: PathBuf, clock: Arc<WorkClock>) {
         // ---- Ingest --------------------------------------------------------
+        if !crate::watcher::is_safe_path_under_root(&self.cfg.processing_dir, &path) {
+            log::warn!("refusing an intake path that is outside Processing or uses a reparse point: {path:?}");
+            return;
+        }
         // Streams the whole file through SHA-256; off the async runtime so a
         // large file can't starve other in-flight jobs' wakeups. A JoinError
         // (blocking task panicked) is folded into the same anyhow::Result as
@@ -347,6 +355,10 @@ impl Pipeline {
                 return;
             }
         };
+        if !crate::watcher::is_safe_path_under_root(&self.cfg.processing_dir, &path) {
+            log::warn!("intake path changed while hashing; refusing to continue: {path:?}");
+            return;
+        }
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -805,7 +817,7 @@ impl Pipeline {
     ) -> Option<ConvertResult> {
         let p = path.to_string_lossy().to_string();
         let (hp, tp) = (self.cfg.max_head_pages, self.cfg.max_tail_pages);
-        for attempt in 1..=self.cfg.max_stage_attempts {
+        for attempt in 1..=self.cfg.max_stage_attempts.max(1) {
             // Clone the Arc<Sidecar> + an owned copy of the path per attempt
             // so the blocking convert/OCR round-trip runs off the async
             // runtime; convert_slots stays acquired around this whole loop in
@@ -911,7 +923,10 @@ impl Pipeline {
             // validator rejected attempt 1, the caller quotes the violation.
             2 => (Tier::Primary, filter::trimmed_bundle(ev, budget)),
             // Attempt 3: escalate to Qwen3-1.7B AND widen the evidence.
-            _ => (Tier::Escalation, filter::widened_bundle(ev, budget * 2)),
+            _ => (
+                Tier::Escalation,
+                filter::widened_bundle(ev, budget.saturating_mul(2)),
+            ),
         }
     }
 
@@ -933,7 +948,7 @@ impl Pipeline {
         // No classifier ran means no type to declare; saying so beats naming a
         // type the sidecar never actually decided on.
         let doc_type_hint = ev.doc_type.as_deref().unwrap_or("unknown");
-        for attempt in 1..=self.cfg.max_stage_attempts {
+        for attempt in 1..=self.cfg.max_stage_attempts.max(1) {
             let (tier, bundle) = self.rung(attempt, ev);
             let out = self
                 .slm
@@ -1267,7 +1282,9 @@ impl Pipeline {
         // instead of silently leaving the file orphaned in Processing while the
         // manifest claims it was quarantined.
         let _ = std::fs::create_dir_all(&self.cfg.quarantine_dir);
-        let quarantined_path = if path.exists() {
+        let source_is_safe =
+            crate::watcher::is_safe_path_under_root(&self.cfg.processing_dir, path);
+        let quarantined_path = if source_is_safe && path.is_file() {
             let dest = self.quarantine_dest(&mid, path);
             let moved = std::fs::rename(path, &dest).is_ok()
                 || match copy_then_remove(path, &dest) {
@@ -1377,6 +1394,9 @@ impl Pipeline {
             .ledger
             .get(sha)?
             .ok_or_else(|| anyhow::anyhow!("unknown job"))?;
+        if job.state != JobState::Flagged {
+            anyhow::bail!("Only Flagged jobs in Needs Review may be resubmitted");
+        }
         let md = std::fs::read_to_string(self.cfg.cache_dir.join(format!("{sha}.md")))
             .unwrap_or_default();
         let h = crate::harvest::harvest(&md);
@@ -1467,7 +1487,9 @@ impl Pipeline {
         // symptom this ordering exists to prevent. Roll the reservation back the
         // same way the write-failure branch does, so the only two outcomes stay
         // "fully corrected" and "untouched, still flagged with its reason".
-        let owned = self.ledger.set_state(sha, JobState::Emitted);
+        let owned = self
+            .ledger
+            .set_state_if_current(sha, JobState::Flagged, JobState::Emitted);
         if !matches!(owned, Ok(true)) {
             let _ = self
                 .ledger
@@ -1900,6 +1922,29 @@ mod tests {
         assert_ne!(
             manifest_id(&sha, "a/one.pdf"),
             manifest_id(&sha, "a/two.pdf")
+        );
+    }
+
+    #[tokio::test]
+    async fn resubmit_refuses_a_non_flagged_job_before_writing_a_manifest() {
+        let h = Harness::new();
+        let (sha, _path) = h.seed("not-review.pdf", "a converted document body");
+
+        let error = h
+            .pipeline
+            .resubmit(
+                &sha,
+                "2024-03-05".into(),
+                "Invoice - Acme".into(),
+                "A valid human correction sentence.".into(),
+            )
+            .await
+            .expect_err("only flagged jobs may be resubmitted");
+        assert!(error.to_string().contains("Flagged"), "{error:#}");
+        assert!(h.manifest(&sha, "not-review.pdf").is_none());
+        assert_eq!(
+            h.pipeline.ledger.get(&sha).unwrap().unwrap().state,
+            JobState::Ingested
         );
     }
 

@@ -3,6 +3,7 @@
 //! the folder paths filled in from the UI.
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +100,62 @@ fn lexical_norm(p: &Path) -> PathBuf {
     // Lexical normalization only — folders may not exist yet, so canonicalize
     // isn't available. Good enough to catch equal/nested paths.
     p.components().collect()
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("backlog.config.json");
+    path.with_file_name(format!(".{name}.bak"))
+}
+
+/// Stable comparison key for configured roots. Windows path identity is
+/// case-insensitive even when the `Path` methods used by a Linux CI runner are
+/// not, so the separator/case normalization lives here rather than relying on
+/// `PathBuf::starts_with`.
+fn path_key(path: &Path) -> String {
+    let mut key = lexical_norm(path).to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    key.make_ascii_lowercase();
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    key
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    let left = path_key(left);
+    let right = path_key(right);
+    left == right
+        || (left.starts_with(&right) && left.as_bytes().get(right.len()) == Some(&b'/'))
+        || (right.starts_with(&left) && right.as_bytes().get(left.len()) == Some(&b'/'))
+}
+
+/// Return true when an existing component of a configured root is a symbolic
+/// link or, on Windows, a reparse point (junctions and mount points included).
+/// The watcher must not follow these because a seemingly harmless Processing
+/// path could otherwise ingest files from outside the operator's chosen root.
+fn contains_reparse_point(path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Trim surrounding whitespace and one matched pair of surrounding quotes.
@@ -249,13 +306,35 @@ fn slm_parallel_for_ram(gib: Option<u64>) -> u8 {
 
 impl Config {
     pub fn load(path: &Path) -> Self {
-        let mut cfg = match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-                log::warn!("config parse failed ({e}); using defaults");
-                Self::default()
-            }),
-            Err(_) => Self::default(),
+        let parse = |candidate: &Path| -> Option<Self> {
+            let contents = std::fs::read_to_string(candidate).ok()?;
+            match serde_json::from_str(&contents) {
+                Ok(cfg) => Some(cfg),
+                Err(error) => {
+                    log::warn!("config parse failed for {} ({error})", candidate.display());
+                    None
+                }
+            }
         };
+        let backup = backup_path(path);
+        let (mut cfg, recovered_from_backup) = match parse(path) {
+            Some(cfg) => (cfg, false),
+            None => match parse(&backup) {
+                Some(cfg) => {
+                    if !path.exists() {
+                        log::warn!(
+                            "config file is missing; recovering the last complete backup from {}",
+                            backup.display()
+                        );
+                    }
+                    (cfg, true)
+                }
+                None => (Self::default(), false),
+            },
+        };
+        if recovered_from_backup {
+            let _ = std::fs::rename(&backup, path);
+        }
         cfg.normalize();
         cfg.clamp_resources_to_machine();
         cfg
@@ -361,7 +440,63 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+
+        // Never truncate the live config in place. A power loss or an
+        // antivirus scan during a direct write used to leave the next launch
+        // with an empty file and therefore a silently reset configuration.
+        // The temporary file is fully synced before it replaces the target.
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("backlog.config.json");
+        let temp_path = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&temp_path);
+        let mut bytes = serde_json::to_vec_pretty(self)?;
+        bytes.push(b'\n');
+        let write_result = (|| -> anyhow::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+
+        #[cfg(not(windows))]
+        let replace_result = std::fs::rename(&temp_path, path).map_err(anyhow::Error::from);
+
+        #[cfg(windows)]
+        let replace_result = {
+            let backup_path = backup_path(path);
+            let had_previous = path.exists();
+            (|| -> anyhow::Result<()> {
+                let _ = std::fs::remove_file(&backup_path);
+                if had_previous {
+                    std::fs::rename(path, &backup_path)?;
+                }
+                if let Err(error) = std::fs::rename(&temp_path, path) {
+                    if had_previous {
+                        let _ = std::fs::rename(&backup_path, path);
+                    }
+                    return Err(error.into());
+                }
+                if had_previous {
+                    let _ = std::fs::remove_file(&backup_path);
+                }
+                Ok(())
+            })()
+        };
+
+        if let Err(error) = replace_result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -394,6 +529,72 @@ impl Config {
                 self.llama_port
             ));
         }
+        if !(1..=4).contains(&self.slm_parallel) {
+            return Err(format!(
+                "slm_parallel must be between 1 and 4; got {}.",
+                self.slm_parallel
+            ));
+        }
+        if self.evidence_token_budget == 0 || self.evidence_token_budget > 16_384 {
+            return Err(format!(
+                "evidence_token_budget must be between 1 and 16384; got {}.",
+                self.evidence_token_budget
+            ));
+        }
+        if self.convert_workers == 0 || self.convert_workers > 8 {
+            return Err(format!(
+                "convert_workers must be between 1 and 8; got {}.",
+                self.convert_workers
+            ));
+        }
+        if self.sidecar_timeout_secs == 0 || self.sidecar_timeout_secs > 300 {
+            return Err(format!(
+                "sidecar_timeout_secs must be between 1 and 300; got {}.",
+                self.sidecar_timeout_secs
+            ));
+        }
+        if self.manifest_emit_per_min > 100_000 {
+            return Err(format!(
+                "manifest_emit_per_min must be 0 or at most 100000; got {}.",
+                self.manifest_emit_per_min
+            ));
+        }
+        if self.max_head_pages == 0 || self.max_head_pages > 1_000 {
+            return Err(format!(
+                "max_head_pages must be between 1 and 1000; got {}.",
+                self.max_head_pages
+            ));
+        }
+        if self.max_tail_pages > 1_000 {
+            return Err(format!(
+                "max_tail_pages must be at most 1000; got {}.",
+                self.max_tail_pages
+            ));
+        }
+        if self.max_filename_len < 32 || self.max_filename_len > 240 {
+            return Err(format!(
+                "max_filename_len must be between 32 and 240; got {}.",
+                self.max_filename_len
+            ));
+        }
+        if self.max_stage_attempts == 0 || self.max_stage_attempts > 10 {
+            return Err(format!(
+                "max_stage_attempts must be between 1 and 10; got {}.",
+                self.max_stage_attempts
+            ));
+        }
+        if self.per_file_wall_clock_secs == 0 || self.per_file_wall_clock_secs > 3_600 {
+            return Err(format!(
+                "per_file_wall_clock_secs must be between 1 and 3600; got {}.",
+                self.per_file_wall_clock_secs
+            ));
+        }
+        if self.cache_ttl_days == 0 || self.cache_ttl_days > 3_650 {
+            return Err(format!(
+                "cache_ttl_days must be between 1 and 3650; got {}.",
+                self.cache_ttl_days
+            ));
+        }
         let named: [(&str, &Path); 4] = [
             ("Processing", self.processing_dir.as_path()),
             ("Outbox", self.outbox_dir.as_path()),
@@ -405,18 +606,22 @@ impl Config {
             if a_path.as_os_str().is_empty() {
                 continue;
             }
-            let a = lexical_norm(a_path);
+            if contains_reparse_point(a_path) {
+                return Err(format!(
+                    "{a_name} folder contains a symlink or Windows reparse point; choose a real folder."
+                ));
+            }
+            let a = a_path;
             for (b_name, b_path) in named.iter().skip(i + 1) {
                 if b_path.as_os_str().is_empty() {
                     continue;
                 }
-                let b = lexical_norm(b_path);
-                if a == b {
-                    return Err(format!("{a_name} and {b_name} folders must be different."));
-                }
-                if a.starts_with(&b) || b.starts_with(&a) {
+                if paths_overlap(a, b_path) {
+                    if path_key(a) == path_key(b_path) {
+                        return Err(format!("{a_name} and {b_name} folders must be different."));
+                    }
                     return Err(format!(
-                        "{a_name} and {b_name} folders must not be nested inside each other."
+                        "{a_name} and {b_name} folders cannot be nested inside one another."
                     ));
                 }
             }
@@ -475,6 +680,109 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_and_unbounded_resource_or_retry_values() {
+        let mut cases = Vec::new();
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.slm_parallel = 0;
+        cases.push((c, "slm_parallel"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.evidence_token_budget = 0;
+        cases.push((c, "evidence_token_budget"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.convert_workers = 0;
+        cases.push((c, "convert_workers"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.sidecar_timeout_secs = 0;
+        cases.push((c, "sidecar_timeout_secs"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.max_head_pages = 0;
+        cases.push((c, "max_head_pages"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.max_filename_len = 0;
+        cases.push((c, "max_filename_len"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.max_stage_attempts = 0;
+        cases.push((c, "max_stage_attempts"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.per_file_wall_clock_secs = 0;
+        cases.push((c, "per_file_wall_clock_secs"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.cache_ttl_days = 0;
+        cases.push((c, "cache_ttl_days"));
+
+        for (cfg, field) in cases {
+            let error = cfg.validate().expect_err(field);
+            assert!(error.contains(field), "{field}: {error}");
+        }
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.manifest_emit_per_min = u32::MAX;
+        let error = c.validate().expect_err("manifest_emit_per_min");
+        assert!(error.contains("manifest_emit_per_min"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_configured_root_that_contains_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-processing");
+        let link = dir.path().join("processing-link");
+        std::fs::create_dir_all(&real).unwrap();
+        symlink(&real, &link).unwrap();
+
+        let c = cfg(
+            link.to_str().unwrap(),
+            dir.path().join("out").to_str().unwrap(),
+            dir.path().join("quar").to_str().unwrap(),
+            dir.path().join("cache").to_str().unwrap(),
+        );
+        let error = c.validate().expect_err("symlinked roots must be rejected");
+        assert!(
+            error.contains("reparse") || error.contains("symlink"),
+            "{error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_a_configured_root_that_contains_a_junction() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-processing");
+        let junction = dir.path().join("processing-junction");
+        std::fs::create_dir_all(&real).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&real)
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not create junction for test");
+
+        let c = cfg(
+            junction.to_str().unwrap(),
+            dir.path().join("out").to_str().unwrap(),
+            dir.path().join("quar").to_str().unwrap(),
+            dir.path().join("cache").to_str().unwrap(),
+        );
+        let error = c.validate().expect_err("junction roots must be rejected");
+        assert!(
+            error.contains("reparse") || error.contains("junction"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn normalize_strips_quotes_and_padding_from_every_path_field() {
         // Exactly what Explorer's "Copy as path" pastes, plus the stray
         // spaces a hand-edited config picks up.
@@ -519,6 +827,28 @@ mod tests {
         let cfg = Config::load(&path);
         assert_eq!(cfg.processing_dir, PathBuf::from("C:\\Processing"));
         assert_eq!(cfg.outbox_dir, PathBuf::from("C:\\Outbox"));
+    }
+
+    #[test]
+    fn load_recovers_a_complete_backup_when_the_live_config_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backlog.config.json");
+        let backup = backup_path(&path);
+        let expected = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        std::fs::write(&backup, serde_json::to_vec(&expected).unwrap()).unwrap();
+
+        let loaded = Config::load(&path);
+
+        assert_eq!(loaded.processing_dir, expected.processing_dir);
+        assert_eq!(loaded.outbox_dir, expected.outbox_dir);
+        assert!(
+            path.is_file(),
+            "a recovered backup should restore the live path"
+        );
+        assert!(
+            !backup.exists(),
+            "the recovered backup should not be replayed twice"
+        );
     }
 
     /// `slm_parallel` is a memory knob: `slm.rs` derives `--ctx-size` as
