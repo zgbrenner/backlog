@@ -15,9 +15,9 @@ The fixed runtime pin is WebView2 `151.0.4129.59` x64: the complete CAB is
 `056858a027a7bf29893b6013c0eb0c6ea7e29755a20c9d043be469d9d78657dc`, and it
 contains 256 expanded files. `runtime-manifest.json` and
 `portable-manifest.json` repeat those values. The release stager downloads the
-CAB in 16 MiB HTTP ranges and uses 7za when present, with the pinned
-`windows-2022` inbox CAB extractor as a verified equivalent fallback; a single
-download response is never accepted.
+CAB in 16 MiB HTTP ranges and uses 7za on the pinned `windows-2022` release
+runner; any fallback extractor must still produce the exact 256-file payload or
+the release fails closed. A single download response is never accepted.
 
 ## Install-free setup
 
@@ -33,6 +33,9 @@ Keep the extracted folder together. If Windows reports that a runtime file is
 missing, delete that incomplete extraction and extract the ZIP again. The
 portable package does not update itself in place; download a newer portable ZIP
 when a new release is published.
+
+The ZIP is the complete release payload: after extraction, no installer,
+runtime package, Python setup, or model download is needed for the first launch.
 
 BackLog stores its ledger, logs, configuration, and downloaded optional models
 in the current Windows user's app-data directory, not beside the executable.
