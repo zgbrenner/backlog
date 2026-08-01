@@ -47,6 +47,7 @@ export function releaseMetadata(root = ROOT) {
     version,
     tag: `v${version}`,
     installer,
+    portable: `BackLog_${version}_x64-portable.zip`,
     signature: `${installer}.sig`,
     manifest: "latest.json",
   };
@@ -310,7 +311,7 @@ async function runCli() {
     console.log(
       plan.signed
         ? "Updater key available: stable signed publication enabled."
-        : "Updater key absent: installer-only prerelease selected.",
+        : "Updater key absent: unsigned prerelease selected.",
     );
     return;
   }
@@ -345,7 +346,7 @@ async function runCli() {
     console.log(
       args.signed === "true"
         ? "Signed release contains installer, matching signature, and latest.json."
-        : "Unsigned release contains the installer only.",
+        : "Unsigned release contains the installer and portable ZIP; updater files are absent.",
     );
     return;
   }

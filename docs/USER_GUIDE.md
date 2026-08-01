@@ -6,10 +6,19 @@ name, and hands it to the Power Automate flow that files it in SharePoint.
 You do not need a terminal, Python, a separate model download, or a developer
 to install it.
 
-## 1. Install one file
+## 1. Install one file - or use the no-installer package
 
-Download **`BackLog_0.6.0_x64-setup.exe`** from the BackLog v0.6.0 release page
+For the normal per-user install, download **`BackLog_0.7.0_x64-setup.exe`**
+from the [BackLog v0.7.0 release page](https://github.com/zgbrenner/backlog/releases)
 and double-click it. This is the only required download.
+
+If you are moving BackLog to another Windows x64 laptop and do not want an
+installer, download **`BackLog_0.7.0_x64-portable.zip`**, extract it completely,
+and double-click **`BackLog-Portable.cmd`**. The portable ZIP includes its own
+fixed WebView2 runtime and does not require a separate runtime, Python, VC++
+Redistributable, administrator password, or model download to launch. Keep the
+extracted folder together. See [`PORTABLE.md`](PORTABLE.md) for the short
+version.
 
 The installer includes:
 
@@ -21,7 +30,9 @@ The installer includes:
 - the offline WebView2 runtime.
 
 It installs for your Windows user account and does not need the internet during
-installation. It must not ask for an administrator password.
+installation. It must not ask for an administrator password. The portable
+package has the same app and model contents, but is updated by downloading a
+new ZIP rather than through the installer/updater path.
 
 Windows will probably show **Windows protected your PC** because the installer
 does not yet have a trusted Authenticode certificate. Click **More info**, then
@@ -135,13 +146,13 @@ key already inside the app.
 
 That updater signature is different from Windows Authenticode signing. The
 first protects the in-app update channel; the second establishes publisher
-identity and SmartScreen reputation for the installer. BackLog v0.6.0 can have
+identity and SmartScreen reputation for the installer. BackLog v0.7.0 can have
 a valid updater signature while still showing a SmartScreen warning because a
 trusted Authenticode certificate has not yet been configured.
 
-An unsigned v0.6.0 build may appear as a prerelease for manual testing. It is
+An unsigned v0.7.0 build may appear as a prerelease for manual testing. It is
 not offered through the stable updater; v0.4.4 remains the stable updater until
-a correctly signed v0.6.0 release exists.
+a correctly signed v0.7.0 release exists.
 
 ## Help
 

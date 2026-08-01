@@ -109,8 +109,9 @@ Before any installer or model bundle leaves the internal pilot group:
 The release procedure (`RELEASING.md`) requires SHA-256-pinned archives for
 llama-server (Build step 2, hash checked inline before extraction) and for the model
 bundle (`models.lock.json`, verified by `models/download_models.py
---verify-only`). `npm run tauri build` never downloads model weights: the
-models are not installer resources at all — they reach the machine through the
-in-app downloader or a hand copy into `%APPDATA%\ai.sonomos.backlog\models`
-(Build step 6). `scripts/verify-binaries.ps1` (Build step 4) is the gate that stops a
-dev-stubbed or truncated binary reaching the bundle.
+--verify-only`). `npm run tauri build` never downloads model weights: the release
+stager places the verified primary and semantic assets in bundle resources, and
+the app copies them into `%APPDATA%\ai.sonomos.backlog\models` on first launch.
+Only the optional 1.7B escalation model uses the in-app downloader or a hand copy.
+`scripts/verify-binaries.ps1` (Build step 4) is the gate that stops a dev-stubbed
+or truncated binary reaching the bundle.

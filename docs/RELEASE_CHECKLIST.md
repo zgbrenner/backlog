@@ -1,4 +1,4 @@
-# BackLog v0.6.0 release checklist
+# BackLog v0.7.0 release checklist
 
 A release remains a pilot candidate until every applicable item has fresh
 evidence attached to the release record.
@@ -26,14 +26,14 @@ evidence attached to the release record.
 
 - [ ] `python power-automate/validate_examples.py` passes after installing
       `power-automate/requirements-dev.txt`.
-- [ ] `node .github/scripts/check-versions.mjs` reports 0.6.0, the `backlog`
-      package in `src-tauri/Cargo.lock` is 0.6.0, and `CHANGELOG.md` has the
-      0.6.0 section.
+- [ ] `node .github/scripts/check-versions.mjs` reports 0.7.0, the `backlog`
+      package in `src-tauri/Cargo.lock` is 0.7.0, and `CHANGELOG.md` has the
+      0.7.0 section.
 
 ## One-download package
 
-- [ ] The only required user download is
-      `BackLog_0.6.0_x64-setup.exe`.
+- [ ] The installer download is `BackLog_0.7.0_x64-setup.exe`; the
+      installer-free option is `BackLog_0.7.0_x64-portable.zip`.
 - [ ] The installer contains the app, `convertd` with its Python runtime,
       `llama-server` and every imported runtime DLL, Qwen3 0.6B Q8_0, the
       pinned MiniLM semantic model/tokenizer, and the offline WebView2 runtime.
@@ -45,6 +45,10 @@ evidence attached to the release record.
 - [ ] A clean install can process a document with the network disabled and
       without Python, a VC++ redistributable, a model script, or any second
       installer.
+- [ ] A complete portable extraction launches through `BackLog-Portable.cmd`
+      with its bundled fixed WebView2 runtime and no separate runtime download;
+      the launcher rejects UNC paths and applies the Windows 10 AppContainer
+      read/execute ACLs.
 - [ ] First launch moves the bundled primary model into the per-user model
       directory without changing an operator's custom absolute model path.
 
@@ -57,6 +61,9 @@ evidence attached to the release record.
       `sidecar/requirements.lock` were used.
 - [ ] `scripts/stage-release-inputs.ps1` verified the primary and semantic
       model assets plus the `llama.cpp b10091` archive before staging.
+- [ ] `scripts/stage-webview2-runtime.ps1` verified WebView2 151.0.4129.59,
+      SHA-256 `056858a027a7bf29893b6013c0eb0c6ea7e29755a20c9d043be469d9d78657dc`,
+      and all 256 runtime files before portable packaging.
 - [ ] `scripts/build-sidecar.ps1 -Clean` smoke-tested the built sidecar against
       real DOCX, PDF, and scanned-image fixtures.
 - [ ] `scripts/verify-binaries.ps1` passed: no file carries
@@ -125,11 +132,11 @@ evidence attached to the release record.
 
 ## Publication guard
 
-- [ ] `v0.6.0` does not exist before the prepared release commit reaches
+- [ ] `v0.7.0` does not exist before the prepared release commit reaches
       `main`; successful CI starts the release workflow automatically for that
       exact commit.
 - [ ] The release-state preflight starts Windows packaging only after successful
-      CI on `main` for the exact release commit. A published `v0.6.0` skips
+      CI on `main` for the exact release commit. A published `v0.7.0` skips
       cleanly; only a matching interrupted draft can resume, and a tag pointing
       at any other commit fails closed.
 - [ ] If `TAURI_SIGNING_PRIVATE_KEY` is present, it matches the updater public
@@ -138,8 +145,8 @@ evidence attached to the release record.
       the detached signature, cryptographically verifies against the embedded
       key over this installer, and its URL resolves to this installer.
 - [ ] If the updater key is absent, the release is a prerelease containing the
-      installer only. There is no `.sig` and no `latest.json`, and the notes
-      explicitly say v0.4.4 remains the stable updater.
+      installer and portable ZIP. There is no `.sig` and no `latest.json`, and
+      the notes explicitly say v0.4.4 remains the stable updater.
 - [ ] No signature was generated, copied, or fabricated outside the Tauri
       signing path.
 - [ ] Updater signing and Authenticode are recorded separately: updater signing

@@ -63,7 +63,7 @@ test("a matching interrupted draft can be retried without moving its tag", () =>
   );
 });
 
-test("an absent updater key selects an installer-only prerelease", () => {
+test("an absent updater key selects an unsigned prerelease", () => {
   assert.deepEqual(releasePlan(""), {
     signed: false,
     prerelease: true,

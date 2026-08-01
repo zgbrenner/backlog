@@ -7,6 +7,7 @@ import {
   validateReleaseWorkflow,
   validateReleaseTargetGuard,
   validateRustToolchain,
+  validateWebviewRuntimeSource,
 } from "./validate-release-workflow.mjs";
 
 const validWorkflow = `
@@ -31,6 +32,7 @@ jobs:
       should-release: \${{ steps.release-gate.outputs.release }}
       version: \${{ steps.release-metadata.outputs.version }}
       tag: \${{ steps.release-metadata.outputs.tag }}
+      portable: \${{ steps.release-metadata.outputs.portable }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -51,6 +53,8 @@ jobs:
       VERSION: \${{ needs.release-check.outputs.version }}
       TAG: \${{ needs.release-check.outputs.tag }}
       INSTALLER: "src-tauri/target/release/bundle/nsis/BackLog_\${{ needs.release-check.outputs.version }}_x64-setup.exe"
+      PORTABLE: "src-tauri/target/release/\${{ needs.release-check.outputs.portable }}"
+      WEBVIEW2_RUNTIME_DIR: "\${{ runner.temp }}/backlog-webview2-fixed"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -83,6 +87,8 @@ jobs:
         run: python power-automate/validate_examples.py
       - name: Stage verified release inputs
         run: pwsh scripts/stage-release-inputs.ps1
+      - name: Stage pinned fixed WebView2 runtime
+        run: pwsh scripts/stage-webview2-runtime.ps1 -Destination $env:WEBVIEW2_RUNTIME_DIR -Clean
       - name: Build sidecar
         run: pwsh scripts/build-sidecar.ps1 -Clean
       - name: Verify release binaries
@@ -100,6 +106,10 @@ jobs:
       - name: Build unsigned installer
         if: steps.release-mode.outputs.signed == 'false'
         run: npm run tauri build -- --config scripts/tauri.unsigned.conf.json
+      - name: Build installer-free portable ZIP
+        run: pwsh scripts/package-portable.ps1 -Version $env:VERSION -Output $env:PORTABLE -WebView2RuntimeDir $env:WEBVIEW2_RUNTIME_DIR
+      - name: Verify installer-free portable ZIP
+        run: pwsh scripts/validate-portable-package.ps1 -Archive $env:PORTABLE -Version $env:VERSION
       - name: Create signed updater manifest
         if: steps.release-mode.outputs.signed == 'true'
         run: node scripts/release-contract.mjs manifest --out latest.json
@@ -118,8 +128,8 @@ jobs:
            if ($release.name -ne "BackLog v$env:VERSION") { throw "different release mode" }
            ./scripts/retarget-release-draft.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA" -ExpectedName "BackLog v$env:VERSION"
           ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
-          gh release upload "$tag" "$installer"
-           gh release create "$tag" "$env:INSTALLER" "$env:SIGNATURE" "latest.json" --target "$env:RELEASE_SHA" --draft
+           gh release upload "$tag" "$installer" "$env:PORTABLE"
+            gh release create "$tag" "$env:INSTALLER" "$env:PORTABLE" "$env:SIGNATURE" "latest.json" --target "$env:RELEASE_SHA" --draft
           gh release view "$tag" --json assets
           Compare-Object $expected $actual
           ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
@@ -132,8 +142,8 @@ jobs:
            if ($release.name -ne "BackLog v$env:VERSION (unsigned prerelease)") { throw "different release mode" }
            ./scripts/retarget-release-draft.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA" -ExpectedName "BackLog v$env:VERSION (unsigned prerelease)"
           ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
-          gh release upload "$tag" "$installer"
-          gh release create "$tag" "$installer" --target "$env:RELEASE_SHA" --draft --notes "Unsigned installer; v0.4.4 remains the stable updater"
+           gh release upload "$tag" "$installer" "$env:PORTABLE"
+           gh release create "$tag" "$installer" "$env:PORTABLE" --target "$env:RELEASE_SHA" --draft --notes "Unsigned installer; v0.4.4 remains the stable updater"
           gh release view "$tag" --json assets
           Compare-Object $expected $actual
           ./scripts/assert-release-tag.ps1 -Tag "$tag" -ExpectedSha "$env:RELEASE_SHA"
@@ -150,8 +160,40 @@ if ((Get-FileHash $model -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Primary
 }
 `;
 
+const validWebviewRuntimeSource = `
+$WebView2Version = "151.0.4129.59"
+$WebView2Url = "https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/3cb717d2-b86d-4160-a13e-f3860141dc7f/Microsoft.WebView2.FixedVersionRuntime.151.0.4129.59.x64.cab"
+$WebView2Sha256 = "056858a027a7bf29893b6013c0eb0c6ea7e29755a20c9d043be469d9d78657dc"
+$WebView2CabSize = [int64]304114944
+$WebView2FileCount = 256
+$ChunkSize = [int64](16MB)
+[System.Net.Http.HttpClient]::new()
+[System.Net.Http.Headers.RangeHeaderValue]::new($start, $end)
+[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+if ([int]$response.StatusCode -ne 206) { throw "not a range" }
+$response.Content.ReadAsStreamAsync()
+Get-FileHash -LiteralPath $cab -Algorithm SHA256
+7za.exe x $cab "-o$destination" -y
+expand.exe -F:* $cab $destination
+msedgewebview2.exe
+runtime-manifest.json
+webview2-fixed
+`;
+
 test("the guarded Windows release structure is accepted", () => {
   assert.deepEqual(validateReleaseWorkflow(validWorkflow, validStageScript), []);
+});
+
+test("the portable build pins and stages a fixed WebView2 runtime", () => {
+  assert.deepEqual(validateWebviewRuntimeSource(validWebviewRuntimeSource), []);
+});
+
+test("a changed fixed WebView2 CAB hash is rejected", () => {
+  const changed = validWebviewRuntimeSource.replace("056858a0", "00000000");
+  assert.match(
+    validateWebviewRuntimeSource(changed).join("\n"),
+    /WebView2 staging script is missing.*056858/,
+  );
 });
 
 test("a workflow that does not wait for successful main CI is rejected", () => {
@@ -329,8 +371,8 @@ test("a Windows build that is not gated by the absent-tag check is rejected", ()
 
 test("an unsigned publication that uploads updater metadata is rejected", () => {
   const unsafe = validWorkflow.replace(
-    'gh release create "$tag" "$installer" --target',
-    'gh release create "$tag" "$installer" "$manifest" --target',
+    'gh release create "$tag" "$installer" "$env:PORTABLE" --target',
+    'gh release create "$tag" "$installer" "$env:PORTABLE" "$manifest" --target',
   );
   assert.match(
     validateReleaseWorkflow(unsafe, validStageScript).join("\n"),

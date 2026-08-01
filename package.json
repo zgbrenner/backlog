@@ -1,7 +1,7 @@
 {
   "name": "backlog",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Local-first document naming and indexing pipeline (Tauri frontend).",
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
@@ -10,7 +10,7 @@
     "build": "tsc && vite build",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm run build",
-    "check:release": "node --test scripts/release-contract.test.mjs scripts/validate-release-workflow.test.mjs && node scripts/validate-release-workflow.mjs",
+    "check:release": "node --test scripts/release-contract.test.mjs scripts/portable-contract.test.mjs scripts/validate-release-workflow.test.mjs && node scripts/validate-release-workflow.mjs",
     "harness": "vite --config scripts/ui-harness/vite.harness.config.ts",
     "harness:shots": "node scripts/ui-harness/shoot.mjs",
     "preview": "vite preview",

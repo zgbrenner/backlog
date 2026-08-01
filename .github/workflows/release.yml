@@ -28,6 +28,7 @@ jobs:
       should-release: ${{ steps.release-gate.outputs.release }}
       version: ${{ steps.release-metadata.outputs.version }}
       tag: ${{ steps.release-metadata.outputs.tag }}
+      portable: ${{ steps.release-metadata.outputs.portable }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -53,8 +54,10 @@ jobs:
       VERSION: ${{ needs.release-check.outputs.version }}
       TAG: ${{ needs.release-check.outputs.tag }}
       INSTALLER: "src-tauri/target/release/bundle/nsis/BackLog_${{ needs.release-check.outputs.version }}_x64-setup.exe"
+      PORTABLE: "src-tauri/target/release/${{ needs.release-check.outputs.portable }}"
       SIGNATURE: "src-tauri/target/release/bundle/nsis/BackLog_${{ needs.release-check.outputs.version }}_x64-setup.exe.sig"
       MANIFEST: "src-tauri/target/release/bundle/nsis/latest.json"
+      WEBVIEW2_RUNTIME_DIR: '${{ runner.temp }}\backlog-webview2-fixed'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -154,6 +157,10 @@ jobs:
         shell: pwsh
         run: ./scripts/stage-release-inputs.ps1 -Clean
 
+      - name: Stage pinned fixed WebView2 runtime
+        shell: pwsh
+        run: ./scripts/stage-webview2-runtime.ps1 -Destination $env:WEBVIEW2_RUNTIME_DIR -Clean
+
       - name: Build sidecar
         shell: pwsh
         run: ./scripts/build-sidecar.ps1 -Python (Get-Command python).Source -Clean
@@ -182,16 +189,31 @@ jobs:
         if: steps.release-mode.outputs.signed == 'false'
         run: npm run tauri build -- --config scripts/tauri.unsigned.conf.json
 
+      - name: Build installer-free portable ZIP
+        shell: pwsh
+        run: ./scripts/package-portable.ps1 -Version $env:VERSION -Output $env:PORTABLE -WebView2RuntimeDir $env:WEBVIEW2_RUNTIME_DIR
+
+      - name: Verify installer-free portable ZIP
+        shell: pwsh
+        run: ./scripts/validate-portable-package.ps1 -Archive $env:PORTABLE -Version $env:VERSION
+
       - name: Write release notes
         shell: pwsh
         run: |
           if (-not (Test-Path $env:INSTALLER)) { throw "Expected installer missing: $env:INSTALLER" }
+          if (-not (Test-Path $env:PORTABLE)) { throw "Expected portable ZIP missing: $env:PORTABLE" }
           $sha = (Get-FileHash $env:INSTALLER -Algorithm SHA256).Hash.ToLowerInvariant()
+          $portableSha = (Get-FileHash $env:PORTABLE -Algorithm SHA256).Hash.ToLowerInvariant()
           @"
-          BackLog $env:VERSION is the one-download Windows package. It includes the
-          primary model, conversion runtime, llama server, and offline WebView2.
+          BackLog $env:VERSION includes a one-download Windows installer and an
+          installer-free portable ZIP. Both include the primary model, conversion
+          runtime, llama server, and app-local runtime DLLs.
 
           Installer SHA-256: $sha
+          Portable ZIP SHA-256: $portableSha
+          The portable ZIP includes fixed WebView2 $((Get-Content (Join-Path $env:WEBVIEW2_RUNTIME_DIR 'runtime-manifest.json') -Raw | ConvertFrom-Json).version)
+          under webview2-fixed and starts through BackLog-Portable.cmd; it does
+          not require an Evergreen WebView2 install or a runtime download.
           "@ | Set-Content "$env:RUNNER_TEMP\release-notes.md" -Encoding utf8
 
       - name: Create signed updater manifest
@@ -254,9 +276,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $assets = @($env:INSTALLER, $env:SIGNATURE, $env:MANIFEST)
+          $assets = @($env:INSTALLER, $env:PORTABLE, $env:SIGNATURE, $env:MANIFEST)
           $expected = @(
             (Split-Path $env:INSTALLER -Leaf),
+            (Split-Path $env:PORTABLE -Leaf),
             (Split-Path $env:SIGNATURE -Leaf),
             (Split-Path $env:MANIFEST -Leaf)
           ) | Sort-Object
@@ -313,8 +336,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           Add-Content "$env:RUNNER_TEMP\release-notes.md" `
-            "`nThis installer has no updater signature. v0.4.4 remains the stable updater."
-          $expected = @((Split-Path $env:INSTALLER -Leaf))
+            "`nThis unsigned prerelease has no updater signature. v0.4.4 remains the stable updater."
+          $expected = @(
+            (Split-Path $env:INSTALLER -Leaf),
+            (Split-Path $env:PORTABLE -Leaf)
+          ) | Sort-Object
           $release = gh release view $env:TAG --json isDraft,name 2>$null | ConvertFrom-Json
           if ($LASTEXITCODE -eq 0) {
             if (-not $release.isDraft) { throw "$env:TAG is already published; refusing to overwrite it" }
@@ -331,16 +357,16 @@ jobs:
             if (@($existingAssets | Where-Object { $_ -notin $expected }).Count -ne 0) {
               throw "Unsigned draft contains updater assets; refusing to downgrade or modify it"
             }
-            gh release upload $env:TAG $env:INSTALLER --clobber
+            gh release upload $env:TAG $env:INSTALLER $env:PORTABLE --clobber
           } else {
             $tag = git ls-remote --exit-code --tags origin "refs/tags/$env:TAG"
             if ($LASTEXITCODE -eq 0) {
               ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
-              gh release create $env:TAG $env:INSTALLER --verify-tag --draft `
+              gh release create $env:TAG $env:INSTALLER $env:PORTABLE --verify-tag --draft `
                 --title "BackLog v$env:VERSION (unsigned prerelease)" `
                 --notes-file "$env:RUNNER_TEMP\release-notes.md"
             } elseif ($LASTEXITCODE -eq 2) {
-              gh release create $env:TAG $env:INSTALLER --target $env:RELEASE_SHA --draft `
+              gh release create $env:TAG $env:INSTALLER $env:PORTABLE --target $env:RELEASE_SHA --draft `
                 --title "BackLog v$env:VERSION (unsigned prerelease)" `
                 --notes-file "$env:RUNNER_TEMP\release-notes.md"
             } else {
