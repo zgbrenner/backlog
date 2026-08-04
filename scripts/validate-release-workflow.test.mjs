@@ -116,6 +116,13 @@ jobs:
         run: pwsh scripts/package-portable.ps1 -Version $env:VERSION -Output $env:PORTABLE -WebView2RuntimeDir $env:WEBVIEW2_RUNTIME_DIR
       - name: Verify installer-free portable ZIP
         run: pwsh scripts/validate-portable-package.ps1 -Archive $env:PORTABLE -Version $env:VERSION
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @"
+          Local Output writes direct local delivery receipts under .backlog/receipts.
+          Power Automate / SharePoint remains the Flow 1/Flow 2 manifest handoff.
+          "@ | Set-Content "$env:RUNNER_TEMP\release-notes.md" -Encoding utf8
       - name: Create signed updater manifest
         if: steps.release-mode.outputs.signed == 'true'
         run: node scripts/release-contract.mjs manifest --out latest.json
@@ -190,6 +197,14 @@ destination and download directory must be different paths
 
 test("the guarded Windows release structure is accepted", () => {
   assert.deepEqual(validateReleaseWorkflow(validWorkflow, validStageScript), []);
+});
+
+test("release notes must retain Local Output and the Power Automate handoff", () => {
+  const missingMode = validWorkflow.replace("Local Output", "Native folder");
+  assert.match(
+    validateReleaseWorkflow(missingMode, validStageScript).join("\n"),
+    /release notes must describe Local Output and the preserved Power Automate mode/,
+  );
 });
 
 test("the portable build pins and stages a fixed WebView2 runtime", () => {

@@ -15,6 +15,34 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.8.0] — native Local Output delivery
+
+### Added
+
+- An explicit **Local folder** output mode alongside the existing default
+  **Power Automate / SharePoint** handoff. Local mode writes a finished renamed
+  document directly to the selected Local Output folder and records one JSON
+  receipt per delivery under `.backlog/receipts`.
+- Mode-aware setup, readiness, folder selection, and Needs Review guidance.
+  Power Automate mode continues to write manifests to Outbox for Flow 2; Local
+  mode does not write a Power Automate manifest, SharePoint index, or cloud
+  archive.
+- Receipt-backed no-overwrite delivery and recovery. Local Output retains an
+  unrelated existing file, selects a deterministic collision suffix, and only
+  removes a source after its output and receipt are durable.
+
+### Changed
+
+- A job's delivery mode and root are pinned at ingest. Later Settings changes
+  cannot redirect a flagged correction or recovery between Local Output and
+  Power Automate.
+
+### Release notes
+
+- Local testing covers the application contracts and bounded Local Output
+  acceptance path. Target-tenant Power Automate Flow 1/Flow 2 testing,
+  Authenticode, and updater signing remain separate release gates.
+
 ## [0.7.0] — portable offline release and trust-boundary hardening
 
 ### Added

@@ -13,7 +13,7 @@
 //! terminal, the technical form in `detail`, and — where the app can fix it
 //! itself — an `action` the UI turns into a button.
 
-use crate::config::Config;
+use crate::config::{Config, OutputMode};
 use crate::sidecar::Sidecar;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -59,12 +59,18 @@ pub struct RuntimeProblem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatus {
+    #[serde(default)]
+    pub output_mode: OutputMode,
     pub configured: bool,
     pub checked: bool,
     pub running: bool,
     pub paused: bool,
     pub processing_dir_ready: bool,
     pub outbox_writable: bool,
+    /// Readiness of the native delivery root. It is additive so older webviews
+    /// can continue using `outbox_writable` unchanged.
+    #[serde(default)]
+    pub local_output_writable: bool,
     pub quarantine_writable: bool,
     pub cache_writable: bool,
     pub sidecar_found: bool,
@@ -89,10 +95,9 @@ pub struct RuntimeStatus {
 impl RuntimeStatus {
     /// Every boolean check in display order, paired with the plain-language
     /// name used when something has to name it in a sentence.
-    fn checks(&self) -> [(&'static str, bool); 11] {
-        [
+    fn checks(&self) -> Vec<(&'static str, bool)> {
+        let mut checks = vec![
             ("the Processing folder", self.processing_dir_ready),
-            ("the Outbox folder", self.outbox_writable),
             ("the Quarantine folder", self.quarantine_writable),
             ("the working folder", self.cache_writable),
             ("the document converter", self.sidecar_found),
@@ -102,7 +107,15 @@ impl RuntimeStatus {
             ("the naming rules file", self.grammar_found),
             ("the everyday model file", self.primary_model_found),
             ("the backup model file", self.escalation_model_found),
-        ]
+        ];
+        checks.insert(
+            1,
+            match self.output_mode {
+                OutputMode::PowerAutomate => ("the Outbox folder", self.outbox_writable),
+                OutputMode::Local => ("the Local Output folder", self.local_output_writable),
+            },
+        );
+        checks
     }
 
     /// Fail-closed default for "no preflight has run yet" (fresh launch, or
@@ -110,12 +123,14 @@ impl RuntimeStatus {
     /// disabled until a real check passes.
     pub fn unchecked(running: bool, paused: bool) -> Self {
         Self {
+            output_mode: OutputMode::PowerAutomate,
             configured: false,
             checked: false,
             running,
             paused,
             processing_dir_ready: false,
             outbox_writable: false,
+            local_output_writable: false,
             quarantine_writable: false,
             cache_writable: false,
             sidecar_found: false,
@@ -251,13 +266,28 @@ pub async fn run_with(
     }
 
     let processing = check_processing_dir(&mut problems, &cfg.processing_dir);
-    let outbox_writable = check_writable_root(
-        &mut problems,
-        "outbox_dir",
-        "outbox_not_writable",
-        &cfg.outbox_dir,
-        &cfg.manifests_dir(),
-    );
+    let (outbox_writable, local_output_writable) = match cfg.output_mode {
+        OutputMode::PowerAutomate => (
+            check_writable_root(
+                &mut problems,
+                "outbox_dir",
+                "outbox_not_writable",
+                &cfg.outbox_dir,
+                &cfg.manifests_dir(),
+            ),
+            false,
+        ),
+        OutputMode::Local => (
+            false,
+            check_writable_root(
+                &mut problems,
+                "local_output_dir",
+                "local_output_not_writable",
+                &cfg.local_output_dir,
+                &cfg.local_output_dir,
+            ) && check_local_output_publication(&mut problems, &cfg.local_output_dir),
+        ),
+    };
     let quarantine_writable = check_writable_root(
         &mut problems,
         "quarantine_dir",
@@ -487,7 +517,10 @@ pub async fn run_with(
         .iter()
         .all(|problem| problem.severity != ProblemSeverity::Error)
         && processing.ready
-        && outbox_writable
+        && match cfg.output_mode {
+            OutputMode::PowerAutomate => outbox_writable,
+            OutputMode::Local => local_output_writable,
+        }
         && quarantine_writable
         && cache_writable
         && sidecar_found
@@ -498,12 +531,14 @@ pub async fn run_with(
         && primary_model_found;
 
     RuntimeStatus {
+        output_mode: cfg.output_mode,
         configured,
         checked: true,
         running,
         paused: running && paused,
         processing_dir_ready: processing.ready,
         outbox_writable,
+        local_output_writable,
         quarantine_writable,
         cache_writable,
         sidecar_found,
@@ -527,6 +562,7 @@ pub async fn run_with(
 pub const CREATABLE_DIR_FIELDS: &[&str] = &[
     "processing_dir",
     "outbox_dir",
+    "local_output_dir",
     "quarantine_dir",
     "cache_dir",
 ];
@@ -698,10 +734,73 @@ fn check_writable_root(
     }
 }
 
+/// Local Output publishes with `hard_link` as the no-replace primitive. A
+/// normal write probe cannot establish that this filesystem supports that
+/// required operation, so test it in the destination filesystem itself.
+fn check_local_output_publication(problems: &mut Vec<RuntimeProblem>, root: &Path) -> bool {
+    match hard_link_publication_probe(root, |from, to| std::fs::hard_link(from, to)) {
+        Ok(()) => true,
+        Err(detail) => {
+            problems.push(RuntimeProblem {
+                field: "local_output_dir".into(),
+                code: "local_output_no_create_new_publication".into(),
+                message: "This Local Output folder cannot safely publish files without overwriting an existing file. Choose a local NTFS folder or ask IT to enable hard links.".into(),
+                detail: Some(detail),
+                severity: ProblemSeverity::Error,
+                action: Some(ProblemAction::CreateFolder),
+            });
+            false
+        }
+    }
+}
+
+fn hard_link_publication_probe(
+    root: &Path,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    if root.as_os_str().is_empty() {
+        return Err("Select a non-empty Local Output folder.".into());
+    }
+    std::fs::create_dir_all(root)
+        .map_err(|error| format!("Folder cannot be created ({}): {error}", root.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let source = root.join(format!(
+        ".backlog-link-source-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let destination = root.join(format!(
+        ".backlog-link-destination-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&source)?;
+        file.write_all(b"backlog-hard-link-probe")?;
+        file.sync_all()?;
+        drop(file);
+        link(&source, &destination)?;
+        if !destination.is_file() {
+            return Err(std::io::Error::other(
+                "hard link destination was not created",
+            ));
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&destination);
+    let _ = std::fs::remove_file(&source);
+    result.map_err(|error| format!("{}: {error}", root.display()))
+}
+
 fn friendly_field(field: &str) -> &str {
     match field {
         "processing_dir" => "Processing",
         "outbox_dir" => "Outbox",
+        "local_output_dir" => "Local Output",
         "quarantine_dir" => "Quarantine",
         "cache_dir" => "working",
         other => other,
@@ -845,6 +944,20 @@ mod tests {
         let target = root.path().join("not-a-directory");
         std::fs::write(&target, b"fixture").unwrap();
         assert!(writable_directory(&target).is_err());
+    }
+
+    #[test]
+    fn local_output_hard_link_probe_cleans_up_after_success_and_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("local-output");
+        hard_link_publication_probe(&target, |from, to| std::fs::hard_link(from, to)).unwrap();
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+
+        let err = hard_link_publication_probe(&target, |_, _| {
+            Err(std::io::Error::other("injected unsupported hard links"))
+        });
+        assert!(err.is_err());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
     }
 
     #[test]

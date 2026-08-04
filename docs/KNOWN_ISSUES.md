@@ -1,6 +1,6 @@
 # Known issues and deferred work
 
-This list describes limitations that remain after BackLog v0.7.0. Resolved
+This list describes limitations that remain after BackLog v0.8.0. Resolved
 pipeline recovery, model fallback, first-run/download, CI-resource, and release
 automation issues have been removed rather than kept as misleading open work.
 
@@ -14,12 +14,13 @@ and manifest state are still coupled.
 The deferred redesign would represent physical deliveries separately from
 content, make manifest persistence transactional, and define resubmission and
 duplicate behavior as first-class ledger operations. It is intentionally
-outside v0.7.0 because it requires a data migration and coordinated Flow 2
+outside v0.8.0 because it requires a data migration and coordinated Flow 2
 compatibility work.
 
 Until then:
 
-- Flow 2 must use `manifest_id`, never content SHA-256, as its idempotency key;
+- in Power Automate mode, Flow 2 must use `manifest_id`, never content SHA-256,
+  as its idempotency key;
 - a resolved file delivered again at the same relative path is not a new job;
 - the same bytes delivered at a different path are a distinct physical copy
   and receive a distinct manifest.
@@ -88,16 +89,22 @@ hash-checking mode.
 Quarantine, but once confirmed, the app has no Dismissed view or Undismiss
 action. Recovery is manual filing.
 
-Adding one requires a decision about reopening ledger state and what Flow 2
-does with the existing dismissed row. Re-delivering the file under another path
-is not a safe substitute because it represents a new physical delivery.
+Adding one requires a decision about reopening ledger state and what the
+selected delivery mode does with the existing dismissed row. In Local folder
+mode a dismissal deliberately leaves the file in Quarantine; its receipt
+records that review outcome but has no delivered output path. In Power Automate
+mode the handoff policy also needs a decision. Re-delivering the file under
+another path is not a safe substitute because it represents a new physical
+delivery.
 
 ## 9. Retention and plaintext handoff policy remain deployment decisions
 
 The SQLCipher ledger is encrypted, but its value-free event trail has no
-automatic retention period. Manifests must be plaintext while waiting for
-Power Automate; they contain the proposed filename and one-sentence
-description, not document text, and Flow 2 deletes them after commit.
+automatic retention period. In Power Automate mode, manifests must be plaintext
+while waiting for Flow 2; they contain the proposed filename and one-sentence
+description, not document text, and Flow 2 deletes them after commit. Local
+folder mode has no manifest handoff, but its JSON receipts need a deployment
+retention decision too.
 
 Each deployment still needs to choose an event-retention policy and document
 the accepted plaintext handoff window.
@@ -116,3 +123,12 @@ The current Vite 5 tree includes an esbuild advisory reachable through the
 development server. The installed Tauri app serves a static production bundle
 and does not expose that server. Moving to a newer Vite major remains deferred
 until its build and harness behavior is revalidated.
+
+## 12. Power Automate tenant E2E is not certified by Local folder tests
+
+The Local folder path can be acceptance-tested entirely on one Windows machine:
+renamed output, receipt, no-overwrite collision handling, and recovery do not
+need a cloud tenant. That evidence does not prove the Power Automate / SharePoint
+path. The target tenant still needs its actual Flow 1 and Flow 2 connectors,
+permissions, manifest pickup, index/archive writes, throttling, and checkpoint
+recovery tested before a rollout claim is made.

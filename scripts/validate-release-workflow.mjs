@@ -223,6 +223,7 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   const webviewStage = findNamed("Stage pinned fixed WebView2 runtime");
   const portableBuild = findNamed("Build installer-free portable ZIP");
   const portableVerify = findNamed("Verify installer-free portable ZIP");
+  const releaseNotes = findNamed("Write release notes");
   const signedCondition = "steps.release-mode.outputs.signed=='true'";
   const unsignedCondition = "steps.release-mode.outputs.signed=='false'";
   if (normalizedIf(signedBuild) !== signedCondition) {
@@ -261,6 +262,22 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     !stepRun(portableVerify).includes("$env:PORTABLE")
   ) {
     problems.push("release must validate the portable ZIP after compression");
+  }
+  const releaseNotesRun = stepRun(releaseNotes);
+  for (const required of [
+    "Local Output",
+    "Power Automate /",
+    "SharePoint",
+    ".backlog/receipts",
+    "Flow 1/Flow 2",
+  ]) {
+    if (!releaseNotesRun.includes(required)) {
+      problems.push("release notes must describe Local Output and the preserved Power Automate mode");
+      break;
+    }
+  }
+  if (steps.indexOf(releaseNotes) <= steps.indexOf(portableVerify)) {
+    problems.push("release notes must be written after portable ZIP verification");
   }
   if (steps.indexOf(portableBuild) <= steps.indexOf(unsignedBuild)) {
     problems.push("portable ZIP packaging must run after either signed or unsigned Tauri build");

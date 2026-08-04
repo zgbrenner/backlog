@@ -6,14 +6,38 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Where a validated document is delivered.  The default intentionally keeps
+/// every existing config and Power Automate installation byte-compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputMode {
+    #[default]
+    PowerAutomate,
+    Local,
+}
+
+impl OutputMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PowerAutomate => "power_automate",
+            Self::Local => "local",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Delivery contract. Missing in legacy JSON means Power Automate.
+    pub output_mode: OutputMode,
     /// OneDrive-synced folder Power Automate Flow 1 moves intake files into.
     pub processing_dir: PathBuf,
     /// OneDrive-synced folder the app writes per-file manifests into
     /// (Flow 2 triggers on `<outbox_dir>/_manifests`).
     pub outbox_dir: PathBuf,
+    /// Native destination root. Its `.backlog` child is private transaction
+    /// state; delivered documents themselves are placed directly in this root.
+    pub local_output_dir: PathBuf,
     /// Local quarantine for flagged files (not synced).
     pub quarantine_dir: PathBuf,
     /// Local cache: converted markdown + evidence bundles, keyed by sha256.
@@ -69,8 +93,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            output_mode: OutputMode::PowerAutomate,
             processing_dir: PathBuf::new(),
             outbox_dir: PathBuf::new(),
+            local_output_dir: PathBuf::new(),
             quarantine_dir: PathBuf::new(),
             cache_dir: PathBuf::new(),
             llama_port: 8137,
@@ -409,6 +435,7 @@ impl Config {
         for dir in [
             &mut self.processing_dir,
             &mut self.outbox_dir,
+            &mut self.local_output_dir,
             &mut self.quarantine_dir,
             &mut self.cache_dir,
             &mut self.slm_primary_gguf,
@@ -504,9 +531,60 @@ impl Config {
         self.outbox_dir.join("_manifests")
     }
 
+    pub fn active_output_dir(&self) -> &Path {
+        match self.output_mode {
+            OutputMode::PowerAutomate => &self.outbox_dir,
+            OutputMode::Local => &self.local_output_dir,
+        }
+    }
+
+    /// Check an output root stored on an already-ingested job before using it.
+    /// Settings validation only sees current roots; recovery also has to reject
+    /// an old pinned root that has since become a protected tree or a reparse
+    /// path. The active root of the same delivery mode is allowed so ordinary
+    /// jobs remain recoverable after a restart without a settings change.
+    pub fn validate_pinned_delivery_root(
+        &self,
+        delivery_mode: &str,
+        root: &Path,
+    ) -> Result<(), String> {
+        if root.as_os_str().is_empty() {
+            return Err("pinned delivery root is empty".into());
+        }
+        if contains_reparse_point(root)
+            || (delivery_mode == "power_automate"
+                && contains_reparse_point(&root.join("_manifests")))
+        {
+            return Err("pinned delivery root contains a symlink or Windows reparse point".into());
+        }
+        let protected: Vec<(&str, &Path)> = match delivery_mode {
+            "local" => vec![
+                ("Processing", &self.processing_dir),
+                ("Outbox", &self.outbox_dir),
+                ("Quarantine", &self.quarantine_dir),
+                ("Cache", &self.cache_dir),
+            ],
+            "power_automate" => vec![
+                ("Processing", &self.processing_dir),
+                ("Local Output", &self.local_output_dir),
+                ("Quarantine", &self.quarantine_dir),
+                ("Cache", &self.cache_dir),
+            ],
+            _ => return Err("invalid pinned delivery mode".into()),
+        };
+        for (name, protected_root) in protected {
+            if !protected_root.as_os_str().is_empty() && paths_overlap(root, protected_root) {
+                return Err(format!(
+                    "pinned delivery root overlaps protected {name} folder"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn ready(&self) -> bool {
         !self.processing_dir.as_os_str().is_empty()
-            && !self.outbox_dir.as_os_str().is_empty()
+            && !self.active_output_dir().as_os_str().is_empty()
             && !self.quarantine_dir.as_os_str().is_empty()
     }
 
@@ -517,7 +595,15 @@ impl Config {
     /// pipeline as if they were intake documents.
     pub fn validate(&self) -> Result<(), String> {
         if !self.ready() {
-            return Err("Set the Processing, Outbox, and Quarantine folders first.".into());
+            return Err(match self.output_mode {
+                OutputMode::PowerAutomate => {
+                    "Set the Processing, Outbox, and Quarantine folders first."
+                }
+                OutputMode::Local => {
+                    "Set the Processing, Local Output, and Quarantine folders first."
+                }
+            }
+            .into());
         }
         // `SlmLane` binds `llama_port` and `llama_port + 1`, so the top of the
         // range is not merely unusable — it overflows the u16 add. Reject it
@@ -595,9 +681,13 @@ impl Config {
                 self.cache_ttl_days
             ));
         }
-        let named: [(&str, &Path); 4] = [
+        // A configured but inactive Outbox remains a protected root.  In
+        // particular, Local Output must never point into its `_manifests`
+        // trigger tree where a native receipt could wake Power Automate.
+        let named: [(&str, &Path); 5] = [
             ("Processing", self.processing_dir.as_path()),
             ("Outbox", self.outbox_dir.as_path()),
+            ("Local Output", self.local_output_dir.as_path()),
             ("Quarantine", self.quarantine_dir.as_path()),
             ("Cache", self.cache_dir.as_path()),
         ];
@@ -946,5 +1036,56 @@ mod tests {
         assert_eq!(cfg.slm_escalation_gguf, dir.path().join("missing.gguf"));
         assert_eq!(cfg.effective_escalation_gguf(), primary.as_path());
         assert!(cfg.using_primary_for_escalation());
+    }
+
+    #[test]
+    fn legacy_config_defaults_to_power_automate() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"processing_dir":"P:/processing","outbox_dir":"P:/outbox","quarantine_dir":"P:/quarantine"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.output_mode, OutputMode::PowerAutomate);
+        assert!(cfg.local_output_dir.as_os_str().is_empty());
+        assert!(cfg.ready());
+    }
+
+    #[test]
+    fn local_mode_requires_local_output_and_rejects_outbox_overlap() {
+        let mut cfg = Config {
+            output_mode: OutputMode::Local,
+            processing_dir: "/work/processing".into(),
+            local_output_dir: "/work/output".into(),
+            quarantine_dir: "/work/quarantine".into(),
+            cache_dir: "/work/cache".into(),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+        cfg.outbox_dir = "/work/output/_manifests".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn pinned_delivery_root_fails_closed_when_settings_make_it_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            processing_dir: dir.path().join("processing"),
+            outbox_dir: dir.path().join("outbox"),
+            local_output_dir: dir.path().join("local-output"),
+            quarantine_dir: dir.path().join("quarantine"),
+            cache_dir: dir.path().join("cache"),
+            ..Default::default()
+        };
+        assert!(cfg
+            .validate_pinned_delivery_root("local", &cfg.outbox_dir)
+            .is_err());
+        assert!(cfg
+            .validate_pinned_delivery_root("power_automate", &cfg.local_output_dir)
+            .is_err());
+        assert!(cfg
+            .validate_pinned_delivery_root("local", &cfg.local_output_dir)
+            .is_ok());
+        assert!(cfg
+            .validate_pinned_delivery_root("power_automate", &cfg.outbox_dir)
+            .is_ok());
     }
 }

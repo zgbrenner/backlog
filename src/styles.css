@@ -493,11 +493,29 @@ button.danger:hover { background: var(--bad-soft); }
   color: var(--dim); margin: 22px 0 10px;
 }
 .settings > h2:first-child { margin-top: 0; }
+.output-mode {
+  padding: 12px; border: 1px solid var(--accent-line); border-radius: 8px;
+  background: var(--accent-soft);
+}
+.output-mode select { display: block; width: min(100%, 360px); margin-top: 5px; }
+.output-mode .field-note { display: block; margin-top: 7px; max-width: 720px; }
+.mode-folder[hidden] { display: none; }
+/* On a new computer, the primary action belongs in the first viewport. The
+ * selector still carries its full delivery explanation; the repeated folder
+ * notes can wait until the operator has completed first-run setup. */
+.settings.first-run-settings .field-note { display: none; }
+.settings.first-run-settings .output-mode { padding: 8px 10px; }
+.settings.first-run-settings .output-mode .field-note { display: block; margin-top: 4px; }
+.settings.first-run-settings .output-mode select { margin-top: 2px; }
 .pick { display: flex; gap: 8px; }
 .pick input { flex: 1; min-width: 0; }
 .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .settings label { margin-bottom: 10px; }
 .field-note { color: var(--dim); font-size: 11.5px; line-height: 1.45; }
+.delivery-note {
+  margin: 0 0 12px; padding: 8px 10px; border-left: 3px solid var(--accent);
+  background: var(--accent-soft); color: var(--text); font-size: 12px; line-height: 1.45;
+}
 
 details.advanced {
   border: 1px solid var(--border); border-radius: 10px;

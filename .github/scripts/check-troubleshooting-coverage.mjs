@@ -54,6 +54,7 @@ const NOT_CODES = new Set([
   // not a code a user is ever told to quote.
   "cache_dir",
   "outbox_dir",
+  "local_output_dir",
   "processing_dir",
   "quarantine_dir",
   "install_dir",
