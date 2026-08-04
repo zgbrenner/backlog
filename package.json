@@ -10,7 +10,7 @@
     "build": "tsc && vite build",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm run build",
-    "check:release": "node --test scripts/release-contract.test.mjs scripts/portable-contract.test.mjs scripts/validate-release-workflow.test.mjs scripts/signed-release-policy.test.mjs",
+    "check:release": "node --test scripts/release-contract.test.mjs scripts/portable-contract.test.mjs scripts/validate-release-workflow.test.mjs scripts/signed-release-policy.test.mjs && node scripts/validate-release-workflow.mjs",
     "harness": "vite --config scripts/ui-harness/vite.harness.config.ts",
     "harness:shots": "node scripts/ui-harness/shoot.mjs",
     "preview": "vite preview",
