@@ -5,7 +5,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: apply-signed-release-fix-pr
@@ -93,10 +93,19 @@ jobs:
           npm ci
           node -e "const fs=require('fs'); const YAML=require('yaml'); const w=YAML.parse(fs.readFileSync('.github/workflows/repair-v0.8.0.yml','utf8')); if(!w?.jobs?.preflight || !w?.jobs?.repair) process.exit(1)"
           npm run check:release
-      - name: Commit verified implementation
+      - name: Package verified implementation
         run: |
-          git config user.name "BackLog Release Bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add -A
-          git commit -m "fix: require signed releases and repair v0.8.0 [signed-release-fix]"
-          git push origin HEAD:release/signed-v0.8.0-exec
+          zip -r /tmp/signed-release-fix.zip \
+            .github/workflows/release.yml \
+            .github/workflows/repair-v0.8.0.yml \
+            RELEASING.md \
+            docs/RELEASE_CHECKLIST.md \
+            scripts/release-contract.mjs \
+            scripts/release-contract.test.mjs \
+            scripts/validate-release-workflow.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-release-fix
+          path: /tmp/signed-release-fix.zip
+          if-no-files-found: error
+          retention-days: 1
