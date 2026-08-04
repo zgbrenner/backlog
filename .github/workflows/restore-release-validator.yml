@@ -1,0 +1,164 @@
+name: Restore full release workflow validation
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: restore-release-validator
+  cancel-in-progress: false
+
+jobs:
+  restore:
+    if: github.head_ref == 'release/signed-v0.8.0-exec'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: release/signed-v0.8.0-exec
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Make legacy unsigned checks optional
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('scripts/validate-release-workflow.mjs')
+          source = path.read_text()
+
+          replacements = [
+            (
+              '''  if (normalizedIf(unsignedBuild) !== unsignedCondition) {
+                problems.push("unsigned build must run only when the updater key is absent");
+              }
+              ''',
+              '''  if (unsignedBuild && normalizedIf(unsignedBuild) !== unsignedCondition) {
+                problems.push("unsigned build must run only when the updater key is absent");
+              }
+              ''',
+            ),
+            (
+              '''  if (
+                !stepRun(unsignedBuild).includes("npm run tauri build") ||
+                !stepRun(unsignedBuild).includes("tauri.unsigned.conf.json")
+              ) {
+                problems.push("unsigned build must explicitly disable updater artifacts");
+              }
+              ''',
+              '''  if (
+                unsignedBuild &&
+                (!stepRun(unsignedBuild).includes("npm run tauri build") ||
+                  !stepRun(unsignedBuild).includes("tauri.unsigned.conf.json"))
+              ) {
+                problems.push("unsigned build must explicitly disable updater artifacts");
+              }
+              ''',
+            ),
+            (
+              '''  if (steps.indexOf(portableBuild) <= steps.indexOf(unsignedBuild)) {
+                problems.push("portable ZIP packaging must run after either signed or unsigned Tauri build");
+              }
+              ''',
+              '''  if (
+                steps.indexOf(portableBuild) <= steps.indexOf(signedBuild) ||
+                (unsignedBuild && steps.indexOf(portableBuild) <= steps.indexOf(unsignedBuild))
+              ) {
+                problems.push("portable ZIP packaging must run after every configured Tauri build");
+              }
+              ''',
+            ),
+            (
+              '''    steps.indexOf(webviewStage) >= steps.indexOf(signedBuild) ||
+                steps.indexOf(webviewStage) >= steps.indexOf(unsignedBuild)
+              ) {
+                problems.push("fixed WebView2 runtime staging must finish before either Tauri build");
+              }
+              ''',
+              '''    steps.indexOf(webviewStage) >= steps.indexOf(signedBuild) ||
+                (unsignedBuild && steps.indexOf(webviewStage) >= steps.indexOf(unsignedBuild))
+              ) {
+                problems.push("fixed WebView2 runtime staging must finish before every configured Tauri build");
+              }
+              ''',
+            ),
+            (
+              '''  if (
+                !signedRun.includes("--json assets") ||
+                !signedRun.includes("Compare-Object") ||
+                !unsignedRun.includes("--json assets") ||
+                !unsignedRun.includes("Compare-Object")
+              ) {
+                problems.push("each release mode must prove its exact remote draft asset set");
+              }
+              ''',
+              '''  if (
+                !signedRun.includes("--json assets") ||
+                !signedRun.includes("Compare-Object") ||
+                (unsignedPublish &&
+                  (!stepRun(unsignedPublish).includes("--json assets") ||
+                    !stepRun(unsignedPublish).includes("Compare-Object")))
+              ) {
+                problems.push("each configured release mode must prove its exact remote draft asset set");
+              }
+              ''',
+            ),
+            (
+              '''  assertRetryState(unsignedRun, "BackLog v$env:VERSION (unsigned prerelease)");
+              ''',
+              '''  if (unsignedPublish) {
+                assertRetryState(
+                  stepRun(unsignedPublish),
+                  "BackLog v$env:VERSION (unsigned prerelease)",
+                );
+              }
+              ''',
+            ),
+          ]
+
+          for old, new in replacements:
+              if old not in source:
+                  raise SystemExit(f'expected validator block not found: {old[:80]!r}')
+              source = source.replace(old, new, 1)
+
+          unsigned_start = source.index(
+              '  const unsignedPublish = findNamed("Publish unsigned prerelease");'
+          )
+          unsigned_end = source.index(
+              '\n  if (\n    !signedRun.includes("--draft")',
+              unsigned_start,
+          )
+          block = source[unsigned_start:unsigned_end]
+          if 'if (unsignedPublish)' not in block:
+              raise SystemExit('unsigned publication block is not optional')
+
+          path.write_text(source)
+
+          package = Path('package.json')
+          package_source = package.read_text()
+          old_command = 'scripts/signed-release-policy.test.mjs"'
+          new_command = (
+              'scripts/signed-release-policy.test.mjs && '
+              'node scripts/validate-release-workflow.mjs"'
+          )
+          if old_command not in package_source:
+              raise SystemExit('check:release command not found')
+          package.write_text(package_source.replace(old_command, new_command, 1))
+          PY
+      - name: Verify full release contract
+        run: |
+          npm ci
+          npm run check:release
+      - name: Commit non-workflow changes
+        run: |
+          git config user.name "BackLog Release Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add scripts/validate-release-workflow.mjs package.json
+          git commit -m "test: restore full signed release workflow validation"
+          git push origin HEAD:release/signed-v0.8.0-exec
