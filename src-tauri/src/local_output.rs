@@ -849,7 +849,10 @@ fn recover_intent_inner(
             manifest.new_filename = Some(current_name.to_string());
             intent.receipt.output_relpath = manifest.new_filename.clone();
             intent.receipt.manifest = manifest.clone();
-            intent.collision_observed = false;
+            // Preserve a collision marker while normalizing the intent to the
+            // ledger's newer reservation. Until `deliver_with_remove` sees
+            // that name free, a same-hash file there is still foreign and
+            // must force another suffix rather than be adopted.
             rewrite_intent(root, manifest_id, &intent)?;
         }
     }
@@ -876,7 +879,10 @@ fn recover_intent_inner(
                 intent.output_base_name = base_name.clone();
                 intent.receipt.output_relpath = manifest.new_filename.clone();
                 intent.receipt.manifest = manifest.clone();
-                intent.collision_observed = false;
+                // The next reservation has not been proven free yet. Keep
+                // the non-adoptable marker across the ledger-before-intent
+                // boundary; delivery clears it only after observing no file.
+                intent.collision_observed = true;
                 rewrite_intent(root, manifest_id, &intent)?;
                 after_collision_rewrite()?;
             }

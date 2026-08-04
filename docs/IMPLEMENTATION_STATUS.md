@@ -74,7 +74,7 @@ single-run hosted CI result on the exact candidate commit.
 
 | Check | Result |
 |---|---|
-| Rust app suite | 247 passed, 3 ignored; updater coverage: 1 passed |
+| Rust app suite | 252 passed, 3 ignored; updater coverage: 1 passed |
 | `cargo test -p backlog-core --locked` | 65 passed |
 | `npm run check` (`tsc --noEmit` + `vite build`) | passed |
 | `npm audit --audit-level=high` | passed |
