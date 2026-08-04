@@ -216,6 +216,13 @@ jobs:
           installer-free portable ZIP. Both include the primary model, conversion
           runtime, llama server, and app-local runtime DLLs.
 
+          This release adds Local Output: BackLog can write finished renamed
+          documents directly to a selected local folder with one receipt per
+          delivery under .backlog/receipts. The existing Power Automate /
+          SharePoint mode is preserved and continues to write the Flow 2
+          handoff manifest to Outbox. Local Output does not validate or replace
+          a target tenant's Flow 1/Flow 2 configuration.
+
           Installer SHA-256: $sha
           Portable ZIP SHA-256: $portableSha
           The portable ZIP includes fixed WebView2 $((Get-Content (Join-Path $env:WEBVIEW2_RUNTIME_DIR 'runtime-manifest.json') -Raw | ConvertFrom-Json).version)

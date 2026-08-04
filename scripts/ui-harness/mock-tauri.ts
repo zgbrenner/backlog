@@ -65,7 +65,11 @@ export async function listen<T>(
 }
 
 // --- plugin-dialog ---------------------------------------------------------
-export async function open(_opts?: unknown): Promise<string | null> {
+export async function open(opts?: unknown): Promise<string | null> {
+  // Folder selection is part of Settings behavior. Record the target/options
+  // beside IPC calls so harness assertions can prove each visible Browse
+  // control opens the directory picker rather than a file picker.
+  invocations.push({ cmd: "open_dialog", args: opts });
   return scenario.pickedPath ?? null;
 }
 

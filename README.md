@@ -2,9 +2,11 @@
 
 Local-first document naming and indexing pipeline. Watches a folder, converts
 anything (Word, PowerPoint, PDF, scans) to markdown, has a small local language
-model propose `YYYY-MM-DD Subject` plus a one-sentence description, validates
-every proposal with a deterministic checker, and hands Power Automate a JSON
-manifest to rename, archive, and index the file in SharePoint.
+model propose `YYYY-MM-DD Subject` plus a one-sentence description, and
+validates every proposal with a deterministic checker. Choose the default
+**Power Automate / SharePoint** handoff or **Local folder** delivery: the first
+writes a JSON handoff manifest for Flow 2; the second writes finished renamed
+documents directly to a local folder with a receipt per delivery.
 
 No cloud inference. Every model runs on-device. The only outbound requests the
 app ever makes are an optional model download and a startup update check; see
@@ -46,10 +48,10 @@ Intake (SharePoint) --Flow 1--> Processing folder (OneDrive-synced)
                                       |
                        deterministic checker (Rust)
                                       |
-                     manifests -> Outbox/_manifests (synced)
-                                      |
-              Flow 2: rename, copy to Archive, index list row
-              (flagged files -> local quarantine + NeedsReview list)
+                 Power Automate / SharePoint (default)       Local folder
+                 manifests -> Outbox/_manifests (synced)     renamed document -> Local Output
+                 Flow 2: rename, archive, index list row    receipt -> Local Output/.backlog/receipts
+                 (flagged files wait in local Quarantine)
 ```
 
 ## Prerequisites (build machine)
@@ -173,17 +175,44 @@ takes the target-triple suffix Tauri expects, e.g.
 
 ### 4. In-app configuration (Settings tab)
 
-- Processing folder: the OneDrive-synced folder Flow 1 fills
-- Outbox folder: OneDrive-synced; manifests land in `<outbox>/_manifests`
+- Output mode: **Power Automate / SharePoint** is the visible default and
+  writes a Flow 2 handoff manifest; **Local folder** writes the completed,
+  renamed document itself and a receipt at
+  `<local-output>/.backlog/receipts/<manifest_id>.json`.
+- Processing folder: the watched intake folder; it can be OneDrive-synced when
+  Flow 1 fills it, or any local intake folder in Local mode.
+- Outbox folder: required only in Power Automate mode; it is OneDrive-synced
+  and manifests land in `<outbox>/_manifests`.
+- Local Output folder: required only in Local mode; it is where completed,
+  renamed documents and their receipts land. Local mode never writes an Outbox
+  manifest or SharePoint index.
 - Quarantine folder: local, not synced
 - GGUF paths for the bundled primary and optional escalation tier (advanced;
   the defaults are set by the installer)
 - Ettin model dir: leave blank — the shipped sidecar ignores it. See
   `training/README.md`.
 
-All three folders must be distinct and none may be nested inside another;
-preflight refuses otherwise, because an Outbox under the recursively-watched
-Processing folder feeds the app's own manifests back through the pipeline.
+The three folders required by the selected mode — Processing, Quarantine, and
+Outbox or Local Output — must be distinct and none may be nested inside
+another. Preflight refuses otherwise, because an output below the
+recursively-watched Processing folder would feed BackLog's own output back
+through the pipeline.
+
+### Local Output quick start
+
+1. In **Settings**, choose **Local folder** under **Output mode**.
+2. Choose separate **Processing**, **Local Output**, and **Quarantine**
+   folders, then choose **Save and check this computer**.
+3. Press **Start**, then drop documents into Processing.
+4. Finished renamed documents appear in Local Output. Each delivery has a JSON
+   receipt at `.backlog/receipts/<manifest_id>.json` below that folder.
+
+BackLog never overwrites an existing output: it uses a deterministic suffix
+such as `(2)` when needed. In Local mode it removes the source only after the
+renamed output and its receipt are durably written. Restart/recovery replays
+unfinished work safely. Flagged files stay in Quarantine; approving a
+correction files it directly from Quarantine into Local Output, while a
+dismissal leaves it in Quarantine for manual handling.
 
 **What the watcher skips.** Files whose name begins with `~$` (Office lock
 files) or `.` (dotfiles). Nothing else. A leading underscore used to be on that
@@ -201,7 +230,7 @@ existing files, then processes new arrivals.
 BackLog runs as a system-tray appliance: closing the window hides it and the
 pipeline keeps running in the background — quit from the tray menu.
 
-### 5. Power Automate
+### 5. Power Automate / SharePoint handoff
 
 These are **automated cloud flows** built in the Power Automate web portal,
 not desktop flows. Power Automate for desktop is not required for the BackLog
@@ -233,9 +262,11 @@ you can point at, and by a test.
 - **Needs Review means a person must decide.** BackLog does not silently file a
   document without a trustworthy date; it keeps the document visible for
   review.
-- **Done is a handoff, not a SharePoint receipt.** It means BackLog wrote the
-  manifest for Power Automate. The downstream flow owns the later SharePoint
-  copy, rename, and index completion.
+- **Delivery is mode-aware.** In Power Automate mode, Done means BackLog wrote
+  the manifest handoff; Flow 2 owns the later SharePoint copy, rename, and
+  index completion. In Local mode, Done means BackLog durably wrote the
+  renamed document and its `.backlog/receipts/<manifest_id>.json` receipt; it
+  does not write a Power Automate manifest, SharePoint index, or cloud archive.
 - **No model-proposed date ships unless it appears verbatim in the document
   text or in the document's own embedded metadata.** This is `checker.rs`'s
   `DateNotInEvidence` rule and it is the product's central promise. A human
@@ -254,20 +285,20 @@ you can point at, and by a test.
 - **Undated documents fall back to the file modified date** with
   `date_source: metadata` and a `DATE_FROM_FILE_MTIME` note — honestly labeled
   in the index, never presented as if it came from the page.
-- **Duplicate content is archived and indexed once per physical copy.** Three
-  byte-identical files at three paths produce one content SHA-256, three
-  `manifest_id`s, three index rows and three names (`base`, `(2)`, `(3)`), with
-  `duplicate_of` pointing at the shared hash. This is deliberate and
-  `FLOW2-commit.md` §7 tests for it — **do not** add a SHA-256 idempotency gate
-  to Flow 2; it would silently drop every second copy of a duplicated document.
-  Flow 2's replay key is `manifest_id`, never `sha256`.
+- **Duplicate content keeps physical deliveries distinct.** Three byte-identical
+  files at three paths produce one content SHA-256 and three stable delivery
+  IDs. Names use deterministic collision suffixes (`base`, `(2)`, `(3)`) and
+  no destination is overwritten. In Power Automate mode Flow 2 must use
+  `manifest_id`, never `sha256`, as its replay key; in Local mode each delivery
+  receives its own local receipt.
 - **Restart is safe.** Files still present in Processing are re-swept from their
   last durable ledger state on the next start. A file that stops at the same
   stage across five restarts is quarantined as `CRASH_LOOP` rather than taking
   the batch down with it.
-- **Idempotent end-to-end.** Replaying any manifest cannot double-index:
-  `manifest_id` is `SHA256(content_sha || 0 || normalized_relpath)`, stable
-  across replays and distinct across deliveries.
+- **Idempotent recovery.** `manifest_id` is
+  `SHA256(content_sha || 0 || normalized_relpath)`, stable across replay and
+  distinct across deliveries. Power Automate replays the same handoff; Local
+  mode reconciles the output and receipt without overwriting a file.
 
 ## Repo map
 

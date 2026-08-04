@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::dbkey;
@@ -146,6 +147,14 @@ fn transition_allowed(from: JobState, to: JobState) -> bool {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Job {
+    /// Immutable content hash. For ordinary jobs this is the same as `sha256`;
+    /// physical duplicate rows are keyed by their manifest id and therefore
+    /// require the original content hash separately for delivery validation.
+    pub content_sha256: String,
+    /// Immutable manifest/receipt id. It is derived from the content hash and
+    /// intake-relative path, and differs from a legacy ordinary row's ledger
+    /// key while matching a physical duplicate row's key.
+    pub delivery_id: String,
     pub sha256: String,
     pub original_path: String,
     pub original_name: String,
@@ -155,6 +164,9 @@ pub struct Job {
     /// Processing folder cannot silently re-key or reclassify old jobs.
     /// Normalization (case, separators) belongs at the comparison, not here.
     pub original_relpath: Option<String>,
+    /// The Processing root at intake. Local delivery intents bind this exact
+    /// root, so restart recovery never trusts a subsequently edited setting.
+    pub source_root: String,
     pub ext: String,
     pub detected_type: String,
     pub route: String,
@@ -180,11 +192,31 @@ pub struct Job {
     /// reconstruct this from the leaf name — two flagged `scan.pdf` files land
     /// under different quarantine names on purpose.
     pub quarantine_path: Option<String>,
+    /// Local-mode durable intent to move this exact source into quarantine.
+    /// Retained through the review lifetime so startup can finish a move that
+    /// died before the receipt or state CAS.
+    pub quarantine_planned_path: Option<String>,
+    pub quarantine_root: Option<String>,
+    /// Immutable delivery contract selected when this physical file was first
+    /// ingested. It prevents a Settings switch from redirecting recovery.
+    pub delivery_mode: String,
+    pub delivery_root: String,
+    /// Durable exclusive owner of an in-flight human review decision.
+    /// `correct` and `dismiss` are the only values; startup releases an
+    /// abandoned owner only when no terminal artifact exists.
+    pub review_operation: Option<String>,
+    #[serde(skip_serializing)]
+    #[allow(dead_code)]
+    pub review_owner: Option<String>,
     pub proposed_date: Option<String>,
     pub date_source: Option<String>,
     pub proposed_subject: Option<String>,
     pub description: Option<String>,
     pub final_filename: Option<String>,
+    /// The immediately prior Local recovery reservation. It exists only over
+    /// the ledger-before-intent crash boundary, so a restart can distinguish a
+    /// genuine stale intent from an arbitrary filename edit.
+    pub recovery_previous_filename: Option<String>,
     pub doc_type: Option<String>,
     pub language: Option<String>,
     pub duplicate_of: Option<String>,
@@ -212,8 +244,11 @@ pub struct Ledger {
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS jobs (
     sha256          TEXT PRIMARY KEY,
+    content_sha256  TEXT NOT NULL DEFAULT '',
+    delivery_id     TEXT NOT NULL DEFAULT '',
     original_path   TEXT NOT NULL,
     original_name   TEXT NOT NULL,
+    source_root     TEXT NOT NULL DEFAULT '',
     ext             TEXT NOT NULL,
     detected_type   TEXT NOT NULL DEFAULT '',
     route           TEXT NOT NULL DEFAULT '',
@@ -225,11 +260,18 @@ CREATE TABLE IF NOT EXISTS jobs (
     proposed_subject TEXT,
     description     TEXT,
     final_filename  TEXT,
+    recovery_previous_filename TEXT,
     doc_type        TEXT,
     language        TEXT,
     duplicate_of    TEXT,
     soft_flags      TEXT,
     model_versions  TEXT,
+    delivery_mode   TEXT NOT NULL DEFAULT 'power_automate',
+    delivery_root   TEXT NOT NULL DEFAULT '',
+    review_operation TEXT,
+    review_owner     TEXT,
+    quarantine_planned_path TEXT,
+    quarantine_root TEXT,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -252,13 +294,25 @@ CREATE INDEX IF NOT EXISTS idx_events_at ON events(at);
 /// would otherwise be missing every column the claim, crash-loop and
 /// quarantine bookkeeping below depend on.
 const ADDED_COLUMNS: &[(&str, &str)] = &[
+    ("content_sha256", "TEXT NOT NULL DEFAULT ''"),
+    ("delivery_id", "TEXT NOT NULL DEFAULT ''"),
     ("original_relpath", "TEXT"),
+    ("source_root", "TEXT NOT NULL DEFAULT ''"),
     ("claimed_at", "TEXT"),
     ("last_stage", "TEXT"),
     ("active_stage", "TEXT"),
     ("stage_started_at", "TEXT"),
     ("quarantine_path", "TEXT"),
+    ("delivery_mode", "TEXT NOT NULL DEFAULT 'power_automate'"),
+    ("delivery_root", "TEXT NOT NULL DEFAULT ''"),
+    ("review_operation", "TEXT"),
+    ("review_owner", "TEXT"),
+    ("quarantine_planned_path", "TEXT"),
+    ("quarantine_root", "TEXT"),
+    ("recovery_previous_filename", "TEXT"),
 ];
+
+static REVIEW_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 impl Ledger {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -388,6 +442,7 @@ impl Ledger {
     /// Row creation is atomic, but it is NOT a claim: two workers that both
     /// see `Ok(Some(existing))` for a mid-flight job must still fight over
     /// `try_claim` before either of them does any work.
+    #[allow(dead_code)] // retained for legacy callers and focused ledger tests
     pub fn ingest(
         &self,
         sha256: &str,
@@ -396,14 +451,49 @@ impl Ledger {
         original_relpath: &str,
         ext: &str,
     ) -> anyhow::Result<Option<Job>> {
+        self.ingest_with_delivery(
+            sha256,
+            original_path,
+            original_name,
+            original_relpath,
+            ext,
+            "power_automate",
+            "",
+            "",
+            sha256,
+        )
+    }
+
+    /// Insert a physical delivery with its immutable output contract. Existing
+    /// rows are deliberately returned untouched: an old PA job must stay PA
+    /// after the operator changes Settings, while a duplicate gets its own row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_with_delivery(
+        &self,
+        sha256: &str,
+        original_path: &str,
+        original_name: &str,
+        original_relpath: &str,
+        ext: &str,
+        delivery_mode: &str,
+        delivery_root: &str,
+        source_root: &str,
+        content_sha256: &str,
+    ) -> anyhow::Result<Option<Job>> {
+        anyhow::ensure!(
+            matches!(delivery_mode, "power_automate" | "local"),
+            "invalid immutable delivery mode"
+        );
+        anyhow::ensure!(!content_sha256.is_empty(), "missing immutable content hash");
+        let delivery_id = crate::identity::instance_id(content_sha256, original_relpath);
         let conn = self.conn.lock().unwrap();
         if let Some(job) = Self::get_inner(&conn, sha256)? {
             return Ok(Some(job));
         }
         conn.execute(
-            "INSERT INTO jobs (sha256, original_path, original_name, original_relpath, ext, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'ingested')",
-            params![sha256, original_path, original_name, original_relpath, ext],
+            "INSERT INTO jobs (sha256, content_sha256, delivery_id, original_path, original_name, original_relpath, source_root, ext, state, delivery_mode, delivery_root)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ingested', ?9, ?10)",
+            params![sha256, content_sha256, delivery_id, original_path, original_name, original_relpath, source_root, ext, delivery_mode, delivery_root],
         )?;
         Ok(None)
     }
@@ -442,6 +532,64 @@ impl Ledger {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// One-way migration for pre-contract Power Automate rows. Earlier builds
+    /// stored the mode but not its destination; atomically filling only a
+    /// blank PA root prevents a later Settings edit from redirecting an
+    /// unresolved review or recovery write. Nonempty roots never change.
+    pub fn pin_legacy_power_automate_root(
+        &self,
+        sha256: &str,
+        outbox_root: &Path,
+    ) -> anyhow::Result<Option<Job>> {
+        anyhow::ensure!(
+            !outbox_root.as_os_str().is_empty(),
+            "cannot pin legacy Power Automate row to an empty Outbox"
+        );
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET delivery_root=?2, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE sha256=?1 AND delivery_mode='power_automate' AND delivery_root=''",
+            params![sha256, outbox_root.to_string_lossy()],
+        )?;
+        Self::get_inner(&conn, sha256)
+    }
+
+    /// One-way pin for a pre-contract PA review row. Such rows predate both
+    /// intake-root and quarantine-root persistence; startup verifies the exact
+    /// quarantined bytes before recording these roots, so a later Settings
+    /// switch cannot redirect correction restoration.
+    pub fn pin_legacy_power_automate_review_roots(
+        &self,
+        sha256: &str,
+        processing_root: &Path,
+        quarantine_root: &Path,
+        quarantine_path: &Path,
+    ) -> anyhow::Result<Option<Job>> {
+        anyhow::ensure!(
+            !processing_root.as_os_str().is_empty()
+                && !quarantine_root.as_os_str().is_empty()
+                && !quarantine_path.as_os_str().is_empty(),
+            "cannot pin legacy PA review row to empty roots"
+        );
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET
+                 source_root=CASE WHEN source_root='' THEN ?2 ELSE source_root END,
+                 quarantine_planned_path=CASE WHEN quarantine_planned_path IS NULL THEN ?3 ELSE quarantine_planned_path END,
+                 quarantine_root=CASE WHEN quarantine_root IS NULL THEN ?4 ELSE quarantine_root END,
+                 updated_at=?5
+             WHERE sha256=?1 AND state='flagged' AND delivery_mode='power_automate'",
+            params![
+                sha256,
+                processing_root.to_string_lossy(),
+                quarantine_path.to_string_lossy(),
+                quarantine_root.to_string_lossy(),
+                now_iso(),
+            ],
+        )?;
+        Self::get_inner(&conn, sha256)
+    }
+
     fn get_inner(conn: &Connection, sha256: &str) -> anyhow::Result<Option<Job>> {
         let job = conn
             .query_row(
@@ -454,11 +602,35 @@ impl Ledger {
     }
 
     fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
+        let sha256: String = row.get("sha256")?;
+        let content_sha256 = {
+            let content: String = row.get("content_sha256")?;
+            if content.is_empty() {
+                sha256.clone()
+            } else {
+                content
+            }
+        };
+        let original_relpath: Option<String> = row.get("original_relpath")?;
+        let delivery_id = {
+            let id: String = row.get("delivery_id")?;
+            if id.is_empty() {
+                crate::identity::instance_id(
+                    &content_sha256,
+                    original_relpath.as_deref().unwrap_or(""),
+                )
+            } else {
+                id
+            }
+        };
         Ok(Job {
-            sha256: row.get("sha256")?,
+            sha256,
+            content_sha256,
+            delivery_id,
             original_path: row.get("original_path")?,
             original_name: row.get("original_name")?,
-            original_relpath: row.get("original_relpath")?,
+            original_relpath,
+            source_root: row.get("source_root")?,
             ext: row.get("ext")?,
             detected_type: row.get("detected_type")?,
             route: row.get("route")?,
@@ -470,11 +642,18 @@ impl Ledger {
             claimed_at: row.get("claimed_at")?,
             flag_reason: row.get("flag_reason")?,
             quarantine_path: row.get("quarantine_path")?,
+            quarantine_planned_path: row.get("quarantine_planned_path")?,
+            quarantine_root: row.get("quarantine_root")?,
+            delivery_mode: row.get("delivery_mode")?,
+            delivery_root: row.get("delivery_root")?,
+            review_operation: row.get("review_operation")?,
+            review_owner: row.get("review_owner")?,
             proposed_date: row.get("proposed_date")?,
             date_source: row.get("date_source")?,
             proposed_subject: row.get("proposed_subject")?,
             description: row.get("description")?,
             final_filename: row.get("final_filename")?,
+            recovery_previous_filename: row.get("recovery_previous_filename")?,
             doc_type: row.get("doc_type")?,
             language: row.get("language")?,
             duplicate_of: row.get("duplicate_of")?,
@@ -623,6 +802,8 @@ impl Ledger {
     /// the operator saw (for example, correcting a flagged job): the general
     /// state transition table intentionally permits replay from any in-flight
     /// rung, so it is not a sufficient ownership check for those commands.
+    #[allow(dead_code)] // retained for legacy callers and focused CAS tests
+    #[allow(dead_code)] // retained for callers outside the shared review-operation gate
     pub fn set_state_if_current(
         &self,
         sha256: &str,
@@ -643,6 +824,278 @@ impl Ledger {
         Ok(changed == 1)
     }
 
+    pub fn begin_review_operation(
+        &self,
+        sha256: &str,
+        operation: &str,
+    ) -> anyhow::Result<Option<String>> {
+        anyhow::ensure!(
+            matches!(operation, "correct" | "dismiss"),
+            "invalid review operation"
+        );
+        let owner = format!(
+            "{}-{}",
+            std::process::id(),
+            REVIEW_OWNER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE jobs SET review_operation=?2, review_owner=?3, updated_at=?4
+             WHERE sha256=?1 AND state='flagged' AND review_operation IS NULL",
+            params![sha256, operation, owner, now_iso()],
+        )?;
+        Ok((changed == 1).then_some(owner))
+    }
+
+    pub fn release_review_operation(
+        &self,
+        sha256: &str,
+        operation: &str,
+        owner: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE jobs SET review_operation=NULL, review_owner=NULL, updated_at=?4
+             WHERE sha256=?1 AND state='flagged' AND review_operation=?2 AND review_owner=?3",
+            params![sha256, operation, owner, now_iso()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn release_abandoned_review_operation(
+        &self,
+        sha256: &str,
+        operation: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE jobs SET review_operation=NULL, review_owner=NULL, updated_at=?3
+             WHERE sha256=?1 AND state='flagged' AND review_operation=?2",
+            params![sha256, operation, now_iso()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn commit_review_operation(
+        &self,
+        sha256: &str,
+        operation: &str,
+        owner: &str,
+        state: JobState,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            matches!(
+                (operation, state),
+                ("correct", JobState::Emitted) | ("dismiss", JobState::Dismissed)
+            ),
+            "review operation does not match terminal state"
+        );
+        let conn = self.conn.lock().unwrap();
+        let now = now_iso();
+        let changed = conn.execute(
+            "UPDATE jobs SET state=?4, last_stage=?4, stage_started_at=?5,
+                 attempts=0, review_operation=NULL, review_owner=NULL, updated_at=?5
+             WHERE sha256=?1 AND state='flagged' AND review_operation=?2 AND review_owner=?3",
+            params![sha256, operation, owner, state.as_str(), now],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Commit a live human correction in one statement. The receipt/manifest
+    /// is deliberately written first, then this exact owner-token CAS makes
+    /// all terminal fields, state, quarantine cleanup and lease release appear
+    /// together. A lost CAS leaves the durable artifact recoverable and the
+    /// ledger row wholly flagged rather than half-emitted.
+    pub fn commit_live_correction(
+        &self,
+        sha256: &str,
+        owner: &str,
+        kv: &[(&str, Option<String>)],
+    ) -> anyhow::Result<bool> {
+        const ALLOWED: &[&str] = &[
+            "flag_reason",
+            "quarantine_path",
+            "quarantine_planned_path",
+            "quarantine_root",
+            "proposed_date",
+            "date_source",
+            "proposed_subject",
+            "description",
+            "final_filename",
+            "recovery_previous_filename",
+            "doc_type",
+            "language",
+            "soft_flags",
+            "model_versions",
+        ];
+        anyhow::ensure!(!kv.is_empty(), "live correction requires terminal fields");
+        let mut seen = HashSet::new();
+        for (column, _) in kv {
+            if !ALLOWED.contains(column) {
+                anyhow::bail!("disallowed live correction column: {column}");
+            }
+            if !seen.insert(*column) {
+                anyhow::bail!("live correction column {column} assigned twice");
+            }
+        }
+        let assignments = kv
+            .iter()
+            .map(|(column, _)| format!("{column}=?"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE jobs SET {assignments}, state='emitted', last_stage='emitted',
+                 stage_started_at=?, attempts=0, review_operation=NULL,
+                 review_owner=NULL, updated_at=?
+             WHERE sha256=? AND state='flagged' AND review_operation='correct'
+               AND review_owner=?"
+        );
+        let now = now_iso();
+        let mut values: Vec<Option<String>> = Vec::with_capacity(kv.len() + 4);
+        values.extend(kv.iter().map(|(_, value)| value.clone()));
+        values.extend([
+            Some(now.clone()),
+            Some(now),
+            Some(sha256.to_string()),
+            Some(owner.to_string()),
+        ]);
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare_cached(&sql)?;
+        Ok(statement.execute(params_from_iter(values))? == 1)
+    }
+
+    #[allow(dead_code)] // superseded by the atomic terminal-field recovery CAS
+    pub fn recover_review_operation(
+        &self,
+        sha256: &str,
+        operation: &str,
+        state: JobState,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            matches!(
+                (operation, state),
+                ("correct", JobState::Emitted) | ("dismiss", JobState::Dismissed)
+            ),
+            "review recovery does not match terminal state"
+        );
+        let conn = self.conn.lock().unwrap();
+        let now = now_iso();
+        let changed = conn.execute(
+            "UPDATE jobs SET state=?3, last_stage=?3, stage_started_at=?4,
+                 attempts=0, review_operation=NULL, review_owner=NULL, updated_at=?4
+             WHERE sha256=?1 AND state='flagged' AND review_operation=?2",
+            params![sha256, operation, state.as_str(), now],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Atomically apply recovery-derived terminal fields and commit the exact
+    /// state/review-lease snapshot that produced them. A durable manifest or
+    /// receipt may finish an abandoned compatible review operation, but it
+    /// must never partially update a row before discovering that another
+    /// operation owns the review card.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_recovered_terminal(
+        &self,
+        sha256: &str,
+        expected_state: JobState,
+        expected_review_operation: Option<&str>,
+        state: JobState,
+        kv: &[(&str, Option<String>)],
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            matches!(
+                state,
+                JobState::Emitted | JobState::Flagged | JobState::Dismissed
+            ),
+            "recovery target must be terminal"
+        );
+        match (expected_review_operation, state) {
+            (None, _) => {}
+            (Some("correct"), JobState::Emitted) | (Some("dismiss"), JobState::Dismissed) => {
+                anyhow::ensure!(
+                    expected_state == JobState::Flagged,
+                    "review recovery must begin from a flagged job"
+                );
+            }
+            (Some(operation), _) => {
+                anyhow::bail!("review recovery does not match terminal state: {operation}");
+            }
+        }
+        if !transition_allowed(expected_state, state) {
+            return Ok(false);
+        }
+        const ALLOWED: &[&str] = &[
+            "detected_type",
+            "route",
+            "flag_reason",
+            "quarantine_path",
+            "quarantine_planned_path",
+            "quarantine_root",
+            "proposed_date",
+            "date_source",
+            "proposed_subject",
+            "description",
+            "final_filename",
+            "recovery_previous_filename",
+            "doc_type",
+            "language",
+            "duplicate_of",
+            "soft_flags",
+            "model_versions",
+        ];
+        let mut seen = HashSet::new();
+        for (column, _) in kv {
+            if !ALLOWED.contains(column) {
+                anyhow::bail!("disallowed ledger column: {column}");
+            }
+            if !seen.insert(*column) {
+                anyhow::bail!("column {column} assigned twice in one update");
+            }
+        }
+
+        let assignments = kv
+            .iter()
+            .map(|(column, _)| format!("{column}=?"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let assignments = if assignments.is_empty() {
+            String::new()
+        } else {
+            format!("{assignments}, ")
+        };
+        let review_predicate = if expected_review_operation.is_some() {
+            "review_operation=?"
+        } else {
+            "review_operation IS NULL AND review_owner IS NULL"
+        };
+        let sql = format!(
+            "UPDATE jobs SET {assignments}state=?, last_stage=?, stage_started_at=?,
+                 attempts=0, review_operation=NULL, review_owner=NULL, updated_at=?
+             WHERE sha256=? AND state=? AND {review_predicate}"
+        );
+        let now = now_iso();
+        let mut values: Vec<Option<String>> = Vec::with_capacity(kv.len() + 7);
+        values.extend(kv.iter().map(|(_, value)| value.clone()));
+        values.extend([
+            Some(state.as_str().to_string()),
+            Some(state.as_str().to_string()),
+            Some(now.clone()),
+            Some(now),
+            Some(sha256.to_string()),
+            Some(expected_state.as_str().to_string()),
+        ]);
+        if let Some(operation) = expected_review_operation {
+            values.push(Some(operation.to_string()));
+        }
+
+        // A single SQLite UPDATE is an implicit transaction: a review
+        // conflict or unique/constraint failure leaves every field intact.
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare_cached(&sql)?;
+        Ok(statement.execute(params_from_iter(values))? == 1)
+    }
+
     /// Whole-slice write in one statement (and therefore one implicit
     /// transaction). The previous column-per-transaction form cost ~20 commits
     /// per file, each taken while holding the global connection mutex — the
@@ -658,11 +1111,14 @@ impl Ledger {
             "route",
             "flag_reason",
             "quarantine_path",
+            "quarantine_planned_path",
+            "quarantine_root",
             "proposed_date",
             "date_source",
             "proposed_subject",
             "description",
             "final_filename",
+            "recovery_previous_filename",
             "doc_type",
             "language",
             "duplicate_of",
@@ -758,10 +1214,28 @@ impl Ledger {
     /// own prior `final_filename` is excluded so a resumed job doesn't collide
     /// with itself and drift to " (2)".
     pub fn reserve_name(&self, base: &str, ext: &str, self_key: &str) -> anyhow::Result<String> {
+        self.reserve_name_from(base, ext, self_key, 1)
+    }
+
+    /// As `reserve_name`, but begins at a deterministic suffix after an
+    /// unrelated native filesystem collision. The database alone cannot see a
+    /// file a user placed in Local Output, so this is the second half of that
+    /// no-overwrite contract.
+    pub fn reserve_name_from(
+        &self,
+        base: &str,
+        ext: &str,
+        self_key: &str,
+        start: u32,
+    ) -> anyhow::Result<String> {
         let mut guard = self.conn.lock().unwrap();
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut candidate = base.to_string();
-        let mut n = 1u32;
+        let mut n = start.max(1);
+        let mut candidate = if n == 1 {
+            base.to_string()
+        } else {
+            format!("{base} ({n})")
+        };
         loop {
             let full = format!("{candidate}.{ext}");
             let taken: bool = tx.query_row(
@@ -771,7 +1245,7 @@ impl Ledger {
             )?;
             if !taken {
                 match tx.execute(
-                    "UPDATE jobs SET final_filename=?2, updated_at=?3 WHERE sha256=?1",
+                    "UPDATE jobs SET final_filename=?2, recovery_previous_filename=NULL, updated_at=?3 WHERE sha256=?1",
                     params![self_key, full, now_iso()],
                 ) {
                     Ok(1) => {
@@ -801,6 +1275,98 @@ impl Ledger {
         }
     }
 
+    /// Advance a Local delivery after an on-disk output collision. The ledger
+    /// moves first and records exactly the former reservation; recovery then
+    /// rewrites its durable intent. That ordering makes both crash boundaries
+    /// unambiguous without accepting a user-edited suffix.
+    pub fn advance_local_recovery_filename(
+        &self,
+        sha256: &str,
+        expected_current: &str,
+        candidate: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(!candidate.is_empty(), "empty local recovery filename");
+        let mut guard = self.conn.lock().unwrap();
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT final_filename FROM jobs WHERE sha256=?1",
+                params![sha256],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(expected_current) {
+            return Ok(false);
+        }
+        let taken: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE final_filename=?1 AND sha256<>?2)",
+            params![candidate, sha256],
+            |row| row.get(0),
+        )?;
+        if taken {
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE jobs SET final_filename=?2, recovery_previous_filename=?3, updated_at=?4
+             WHERE sha256=?1 AND final_filename=?3",
+            params![sha256, candidate, expected_current, now_iso()],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Pick and reserve the next bounded Local collision name while preserving
+    /// the exact prior reservation for the ledger-before-intent crash window.
+    /// Unlike `reserve_name_from`, this refuses a changed current reservation:
+    /// the caller can therefore never overwrite another worker's recovery
+    /// progression after it has written an intent.
+    pub fn advance_local_recovery_name_from(
+        &self,
+        base: &str,
+        ext: &str,
+        sha256: &str,
+        expected_current: &str,
+        start: u32,
+    ) -> anyhow::Result<Option<String>> {
+        let mut guard = self.conn.lock().unwrap();
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT final_filename FROM jobs WHERE sha256=?1",
+                params![sha256],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(expected_current) {
+            return Ok(None);
+        }
+        for suffix in start.max(2)..=(crate::checker::MAX_NAME_COLLISIONS + 1) {
+            let candidate = format!("{base} ({suffix}).{ext}");
+            let taken: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE final_filename=?1 AND sha256<>?2)",
+                params![candidate, sha256],
+                |row| row.get(0),
+            )?;
+            if taken {
+                continue;
+            }
+            let changed = transaction.execute(
+                "UPDATE jobs SET final_filename=?2, recovery_previous_filename=?3, updated_at=?4
+                 WHERE sha256=?1 AND final_filename=?3",
+                params![sha256, candidate, expected_current, now_iso()],
+            )?;
+            if changed != 1 {
+                return Ok(None);
+            }
+            transaction.commit()?;
+            return Ok(Some(candidate));
+        }
+        anyhow::bail!("local output collision resolution exceeded configured safety limit")
+    }
+
     /// Clear every derived field and put the job back at the head of the
     /// ladder so the operator can retry a file after fixing what broke it.
     /// One statement, so a half-reset row can never be observed.
@@ -809,8 +1375,9 @@ impl Ledger {
         let changed = conn.execute(
             "UPDATE jobs SET state='ingested', attempts=0, claimed_at=NULL, last_stage=NULL,
                  active_stage=NULL,
-                 stage_started_at=NULL, flag_reason=NULL, quarantine_path=NULL, soft_flags=NULL,
+                 stage_started_at=NULL, flag_reason=NULL, quarantine_path=NULL, quarantine_planned_path=NULL, quarantine_root=NULL, review_operation=NULL, review_owner=NULL, soft_flags=NULL,
                  final_filename=NULL, proposed_date=NULL, date_source=NULL,
+                 recovery_previous_filename=NULL,
                  proposed_subject=NULL, description=NULL, updated_at=?2
              WHERE sha256=?1 AND state='flagged'",
             params![sha256, now_iso()],
@@ -1606,5 +2173,158 @@ mod tests {
             .update_fields("kv", &[("doc_type", None), ("doc_type", None)])
             .is_err());
         ledger.update_fields("kv", &[]).unwrap();
+    }
+
+    #[test]
+    fn delivery_mode_and_root_are_pinned_at_ingest() {
+        let (_dir, ledger) = ledger();
+        ledger
+            .ingest_with_delivery(
+                "local-row",
+                "P:/processing/a.pdf",
+                "a.pdf",
+                "a.pdf",
+                "pdf",
+                "local",
+                "D:/output",
+                "P:/processing",
+                "local-row",
+            )
+            .unwrap();
+        // A later Settings mode cannot rewrite an existing physical delivery.
+        let existing = ledger
+            .ingest_with_delivery(
+                "local-row",
+                "P:/processing/a.pdf",
+                "a.pdf",
+                "a.pdf",
+                "pdf",
+                "power_automate",
+                "P:/outbox",
+                "P:/processing",
+                "local-row",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(existing.delivery_mode, "local");
+        assert_eq!(existing.delivery_root, "D:/output");
+    }
+
+    #[test]
+    fn legacy_pa_root_pin_is_one_way_and_never_overwrites_a_destination() {
+        let (_dir, ledger) = ledger();
+        ledger
+            .ingest("legacy", "P:/processing/a.pdf", "a.pdf", "a.pdf", "pdf")
+            .unwrap();
+        let first = ledger
+            .pin_legacy_power_automate_root("legacy", Path::new("P:/outbox-a"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.delivery_mode, "power_automate");
+        assert_eq!(first.delivery_root, "P:/outbox-a");
+        let second = ledger
+            .pin_legacy_power_automate_root("legacy", Path::new("P:/outbox-b"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.delivery_root, "P:/outbox-a");
+    }
+
+    #[test]
+    fn review_owner_token_excludes_same_and_opposite_operations() {
+        let (_dir, ledger) = ledger();
+        seed(&ledger, "correct-owner");
+        ledger
+            .set_state("correct-owner", JobState::Flagged)
+            .unwrap();
+        let owner = ledger
+            .begin_review_operation("correct-owner", "correct")
+            .unwrap()
+            .unwrap();
+        assert!(ledger
+            .begin_review_operation("correct-owner", "correct")
+            .unwrap()
+            .is_none());
+        assert!(ledger
+            .begin_review_operation("correct-owner", "dismiss")
+            .unwrap()
+            .is_none());
+        assert!(!ledger
+            .release_review_operation("correct-owner", "correct", "not-the-owner")
+            .unwrap());
+        assert!(ledger
+            .commit_review_operation("correct-owner", "correct", &owner, JobState::Emitted)
+            .unwrap());
+
+        seed(&ledger, "dismiss-owner");
+        ledger
+            .set_state("dismiss-owner", JobState::Flagged)
+            .unwrap();
+        let owner = ledger
+            .begin_review_operation("dismiss-owner", "dismiss")
+            .unwrap()
+            .unwrap();
+        assert!(ledger
+            .begin_review_operation("dismiss-owner", "correct")
+            .unwrap()
+            .is_none());
+        assert!(ledger
+            .commit_review_operation("dismiss-owner", "dismiss", &owner, JobState::Dismissed)
+            .unwrap());
+    }
+
+    #[test]
+    fn live_correction_cas_is_all_or_nothing_and_owner_bound() {
+        let (_dir, ledger) = ledger();
+        seed(&ledger, "atomic-correction");
+        ledger
+            .update_fields(
+                "atomic-correction",
+                &[
+                    ("flag_reason", Some("SLM_FAIL:needs review".into())),
+                    ("quarantine_path", Some("Q:/review.pdf".into())),
+                    ("quarantine_planned_path", Some("Q:/review.pdf".into())),
+                    ("quarantine_root", Some("Q:".into())),
+                    ("description", Some("old flagged value".into())),
+                ],
+            )
+            .unwrap();
+        ledger
+            .set_state("atomic-correction", JobState::Flagged)
+            .unwrap();
+        let owner = ledger
+            .begin_review_operation("atomic-correction", "correct")
+            .unwrap()
+            .unwrap();
+        let before =
+            serde_json::to_value(ledger.get("atomic-correction").unwrap().unwrap()).unwrap();
+        let fields = [
+            ("final_filename", Some("2026-08-04 Corrected.pdf".into())),
+            ("description", Some("new terminal value".into())),
+            ("flag_reason", None),
+            ("quarantine_path", None),
+            ("quarantine_planned_path", None),
+            ("quarantine_root", None),
+            ("soft_flags", Some("HUMAN_CORRECTED".into())),
+        ];
+        assert!(!ledger
+            .commit_live_correction("atomic-correction", "wrong-owner", &fields)
+            .unwrap());
+        assert_eq!(
+            serde_json::to_value(ledger.get("atomic-correction").unwrap().unwrap()).unwrap(),
+            before,
+            "a lost owner CAS must not emit a half-cleared review row"
+        );
+        assert!(ledger
+            .commit_live_correction("atomic-correction", &owner, &fields)
+            .unwrap());
+        let committed = ledger.get("atomic-correction").unwrap().unwrap();
+        assert_eq!(committed.state, JobState::Emitted);
+        assert!(committed.review_operation.is_none());
+        assert!(committed.review_owner.is_none());
+        assert!(committed.flag_reason.is_none());
+        assert!(committed.quarantine_path.is_none());
+        assert!(committed.quarantine_planned_path.is_none());
+        assert!(committed.quarantine_root.is_none());
+        assert_eq!(committed.description.as_deref(), Some("new terminal value"));
     }
 }

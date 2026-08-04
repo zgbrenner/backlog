@@ -6,6 +6,7 @@ use crate::checker::{fs_metadata_dates, CheckError, Checker};
 use crate::config::Config;
 use crate::filter::{self, Evidence};
 use crate::ledger::{Job, JobState, Ledger};
+use crate::local_output::{self, DeliverResult};
 use crate::manifest::{write_manifest, Manifest, Pacer, MANIFEST_SCHEMA_VERSION};
 use crate::routing::{self, Route};
 use crate::sidecar::{ConvertResult, Sidecar};
@@ -47,6 +48,33 @@ pub struct Pipeline {
 const PDF_TEXT_MEDIAN_CHARS: u64 = 200;
 const OCR_CONF_FLOOR: f64 = 0.55;
 
+/// Physical duplicate rows are keyed by their per-path delivery id rather
+/// than by the shared content hash. Manifests still describe the bytes, so a
+/// duplicate's parent is always the immutable content hash, never the ledger
+/// lookup key (or the previously reserved filename stored for display).
+fn manifest_duplicate_of(job: &Job) -> Option<String> {
+    (job.sha256 != job.content_sha256).then(|| job.content_sha256.clone())
+}
+
+/// A durable terminal artifact can complete the review operation that created
+/// it after a crash, but cannot override a competing human decision. Check
+/// this before Local recovery publishes/deletes files and again in the ledger
+/// CAS that commits its fields.
+fn ensure_recovery_operation_compatible(
+    job: &Job,
+    target: JobState,
+    delivery: &str,
+) -> anyhow::Result<()> {
+    match (job.review_operation.as_deref(), target) {
+        (None, _)
+        | (Some("correct"), JobState::Emitted)
+        | (Some("dismiss"), JobState::Dismissed) => Ok(()),
+        (Some(operation), _) => anyhow::bail!(
+            "{delivery} terminal artifact conflicts with review operation {operation}"
+        ),
+    }
+}
+
 /// A job may be claimed for this many multiples of the per-file wall-clock cap
 /// before the claim is treated as abandoned. Anything shorter risks two live
 /// workers on one file; anything longer strands a file whose owner crashed.
@@ -77,6 +105,32 @@ fn wall_clock_cap(cfg: &Config) -> u64 {
     let naming = cfg.per_file_wall_clock_secs.saturating_mul(attempts + 1);
     sidecar.saturating_add(naming).max(1)
 }
+
+/// A second physical copy is not allowed to claim the content-key row while
+/// its original delivery is still live. Its one watcher event must therefore
+/// stay alive for the operator-configured terminal window of that delivery.
+/// Tests compress seconds into milliseconds so the same boundary is exercised
+/// without making the suite wait a minute and a half.
+fn deferred_duplicate_retry_window(cfg: &Config) -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_millis(cfg.per_file_wall_clock_secs.saturating_mul(10))
+    } else {
+        std::time::Duration::from_secs(cfg.per_file_wall_clock_secs)
+    }
+}
+
+fn deferred_duplicate_retry_interval() -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_millis(10)
+    } else {
+        std::time::Duration::from_secs(2)
+    }
+}
+
+/// `stop_pipeline_inner` closes this semaphore before sidecars are torn down.
+/// Polling it makes a deferred duplicate exit promptly during shutdown without
+/// adding a second runtime-wide cancellation primitive.
+const DEFERRED_DUPLICATE_SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Queue time already served, plus the wait in progress.
 #[derive(Default)]
@@ -158,6 +212,13 @@ impl Drop for InFlightPath {
 }
 
 impl Pipeline {
+    fn configured_delivery(&self) -> (&'static str, String) {
+        (
+            self.cfg.output_mode.as_str(),
+            self.cfg.active_output_dir().to_string_lossy().into_owned(),
+        )
+    }
+
     pub fn new(
         cfg: Config,
         ledger: Arc<Ledger>,
@@ -366,31 +427,88 @@ impl Pipeline {
             .to_string();
         let ext = routing::extension_of(&path);
         let original_relpath = relpath(&self.cfg.processing_dir, &path);
+        let incoming_delivery_id = manifest_id(&sha, &original_relpath);
 
-        let resume_state = match self.ledger.ingest(
+        let (delivery_mode, delivery_root) = self.configured_delivery();
+        let resume_state = match self.ledger.ingest_with_delivery(
             &sha,
             &path.to_string_lossy(),
             &name,
             &original_relpath,
             &ext,
+            delivery_mode,
+            &delivery_root,
+            &self.cfg.processing_dir.to_string_lossy(),
+            &sha,
         ) {
             Ok(None) => JobState::Ingested, // new
             Ok(Some(existing)) => {
-                if existing.state.is_resolved() || existing.state == JobState::Flagged {
+                let same_delivery = existing.delivery_id == incoming_delivery_id
+                    && crate::identity::normalize_relpath(&existing.original_path)
+                        == crate::identity::normalize_relpath(&path.to_string_lossy())
+                    && !existing.source_root.is_empty()
+                    && crate::identity::normalize_relpath(&existing.source_root)
+                        == crate::identity::normalize_relpath(
+                            &self.cfg.processing_dir.to_string_lossy(),
+                        );
+                if !same_delivery {
                     // Same content seen again under a *different* file: emit a
                     // duplicate manifest so PA can index " (2)". Compare the
                     // normalized Processing-relative paths, which is what
                     // identity means here — the old raw-absolute-string test
                     // reclassified every job the moment the Processing folder
                     // moved, and fired on P4's restore path every time.
-                    let known = existing.original_relpath.clone().unwrap_or_else(|| {
-                        relpath(&self.cfg.processing_dir, Path::new(&existing.original_path))
-                    });
-                    if crate::identity::normalize_relpath(&known)
-                        != crate::identity::normalize_relpath(&original_relpath)
-                    {
+                    if existing.state.is_resolved() || existing.state == JobState::Flagged {
                         self.handle_duplicate(&sha, &path, &name, &ext, &existing, &clock)
                             .await;
+                    } else {
+                        // A watcher may report the second physical copy only
+                        // once. Keep a bounded in-process retry alive until
+                        // the original resolves, then emit its own duplicate
+                        // row; never let it claim or delete under the first
+                        // content-key row.
+                        let deadline = tokio::time::Instant::now()
+                            + deferred_duplicate_retry_window(&self.cfg);
+                        let retry_interval = deferred_duplicate_retry_interval();
+                        let mut next_retry = tokio::time::Instant::now();
+                        loop {
+                            if self.ingest_slots.is_closed() {
+                                log::debug!(
+                                    "stopping deferred same-content duplicate retry during shutdown"
+                                );
+                                return;
+                            }
+                            let now = tokio::time::Instant::now();
+                            if now >= deadline {
+                                break;
+                            }
+                            if now >= next_retry {
+                                let Ok(Some(current)) = self.ledger.get(&sha) else {
+                                    return;
+                                };
+                                if current.delivery_id != existing.delivery_id {
+                                    return;
+                                }
+                                if current.state.is_resolved() || current.state == JobState::Flagged
+                                {
+                                    self.handle_duplicate(
+                                        &sha, &path, &name, &ext, &current, &clock,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                next_retry = now + retry_interval;
+                            }
+                            // This wait is exclusively for another delivery's
+                            // terminal transition. Do not spend this copy's
+                            // own wall-clock work budget on it.
+                            let wait = (next_retry.min(deadline) - now)
+                                .min(DEFERRED_DUPLICATE_SHUTDOWN_POLL);
+                            clock.parked(tokio::time::sleep(wait)).await;
+                        }
+                        log::warn!(
+                            "deferred same-content physical copy did not resolve within its configured terminal window"
+                        );
                     }
                     return;
                 }
@@ -773,7 +891,7 @@ impl Pipeline {
         // `manifest_emit_per_min` exists to park emissions on purpose during a
         // backfill; a paced file must not be quarantined for obeying the pace.
         clock.parked(self.pacer.permit()).await;
-        let m = Manifest {
+        let mut m = Manifest {
             schema: MANIFEST_SCHEMA_VERSION,
             manifest_id: manifest_id(&sha, &original_relpath),
             sha256: sha.clone(),
@@ -792,14 +910,52 @@ impl Pipeline {
             model_versions: self.model_versions.clone(),
             processed_at: chrono::Utc::now().to_rfc3339(),
         };
-        match write_manifest(&self.cfg.manifests_dir(), &m) {
-            Ok(_) => {
+        let emitted = match self.delivery_for_job(&sha) {
+            Ok((mode, root)) if mode == "power_automate" => {
+                write_manifest(&root.join("_manifests"), &m).map(|_| ())
+            }
+            Ok((mode, root)) if mode == "local" => {
+                self.source_root_for_job(&sha).and_then(|source_root| {
+                    self.deliver_local_with_collisions(
+                        &sha,
+                        &path,
+                        &source_root,
+                        &validated.base_name,
+                        &ext,
+                        &mut m,
+                        &root,
+                    )
+                })
+            }
+            Ok((other, _)) => Err(anyhow::anyhow!(
+                "unsupported immutable delivery mode {other}"
+            )),
+            Err(error) => Err(error),
+        };
+        match emitted {
+            Ok(()) => {
+                let _ = self
+                    .ledger
+                    .update_fields(&sha, &[("recovery_previous_filename", None)]);
                 let _ = self.advance(&sha, JobState::Emitted);
-                let _ = self.ledger.log_event(&sha, "emit", "manifest written");
-                // File is done; drop its raw document text from the cache.
+                let _ = self.ledger.log_event(&sha, "emit", "delivery committed");
                 self.purge_cache(&sha);
             }
             Err(e) => {
+                // Local delivery failures deliberately leave source, intent and
+                // staging in place for receipt-driven recovery; flagging would
+                // move that source and destroy the transaction's authority.
+                if self
+                    .delivery_for_job(&sha)
+                    .ok()
+                    .is_some_and(|(mode, _)| mode == "local")
+                {
+                    log::error!("local delivery pending for {sha}: {e}");
+                    let _ = self
+                        .ledger
+                        .log_event(&sha, "emit", "local delivery pending");
+                    return;
+                }
                 self.flag(&sha, &path, format!("RUNTIME_FAIL:manifest {e}"), &clock)
                     .await;
                 return;
@@ -1098,7 +1254,8 @@ impl Pipeline {
                 // past it (otherwise every distinct copy resolves to " (2)"
                 // and collides in Flow 2's Archive copy). The row has to exist
                 // before the name can be reserved onto it.
-                match self.record_duplicate(&dup_key, path, name, &rel, ext, stem, &orig_final) {
+                match self.record_duplicate(&dup_key, sha, path, name, &rel, ext, stem, &orig_final)
+                {
                     Ok(fname) => fname,
                     Err(e) => {
                         log::error!("duplicate ledger record failed for {sha}: {e}");
@@ -1109,7 +1266,11 @@ impl Pipeline {
         };
 
         clock.parked(self.pacer.permit()).await;
-        let m = Manifest {
+        let collision_base = final_filename
+            .rsplit_once('.')
+            .map(|(stem, _)| stem.to_string())
+            .unwrap_or_else(|| final_filename.clone());
+        let mut m = Manifest {
             schema: MANIFEST_SCHEMA_VERSION,
             manifest_id: dup_key.clone(),
             sha256: sha.to_string(),
@@ -1128,20 +1289,76 @@ impl Pipeline {
             model_versions: self.model_versions.clone(),
             processed_at: chrono::Utc::now().to_rfc3339(),
         };
-        match write_manifest(&self.cfg.manifests_dir(), &m) {
-            Ok(_) => {
-                let _ = self
-                    .ledger
-                    .log_event(sha, "emit", "duplicate manifest written");
+        let source_root = match self.source_root_for_job(&dup_key) {
+            Ok(root) => root,
+            Err(error) => {
+                log::error!("duplicate delivery source lookup failed for {dup_key}: {error}");
+                return;
             }
-            Err(e) => {
-                log::error!("duplicate manifest write failed for {dup_key}: {e}");
-                let _ = self.ledger.log_event(
-                    sha,
-                    "emit",
-                    &format!("duplicate manifest write FAILED: {e}"),
-                );
+        };
+        // The duplicate does not run naming/classification again, but its
+        // Local intent still needs an authoritative ledger snapshot to bind on
+        // restart. Persist exactly the inherited proposal before delivery, so
+        // intent JSON cannot rewrite any of these values after a crash.
+        if let Err(error) = self.ledger.update_fields(
+            &dup_key,
+            &[
+                ("proposed_date", existing.proposed_date.clone()),
+                ("date_source", existing.date_source.clone()),
+                ("description", existing.description.clone()),
+                ("doc_type", existing.doc_type.clone()),
+                ("language", existing.language.clone()),
+                ("model_versions", Some(self.model_versions.to_string())),
+                ("soft_flags", Some("DUPLICATE_CONTENT".into())),
+            ],
+        ) {
+            log::error!("duplicate metadata contract failed for {dup_key}: {error}");
+            return;
+        }
+        match self.delivery_for_job(&dup_key) {
+            Ok((mode, root)) if mode == "power_automate" => {
+                match write_manifest(&root.join("_manifests"), &m) {
+                    Ok(_) => {
+                        let _ = self.ledger.set_state(&dup_key, JobState::Emitted);
+                        let _ = self
+                            .ledger
+                            .log_event(sha, "emit", "duplicate manifest written");
+                    }
+                    Err(e) => {
+                        log::error!("duplicate manifest write failed for {dup_key}: {e}");
+                        let _ =
+                            self.ledger
+                                .log_event(sha, "emit", "duplicate manifest write FAILED");
+                    }
+                }
             }
+            Ok((mode, root)) if mode == "local" => match self.deliver_local_with_collisions(
+                &dup_key,
+                path,
+                &source_root,
+                &collision_base,
+                ext,
+                &mut m,
+                &root,
+            ) {
+                Ok(()) => {
+                    let _ = self
+                        .ledger
+                        .update_fields(&dup_key, &[("recovery_previous_filename", None)]);
+                    let _ = self.ledger.set_state(&dup_key, JobState::Emitted);
+                    let _ = self
+                        .ledger
+                        .log_event(sha, "emit", "duplicate local receipt written");
+                }
+                Err(error) => {
+                    log::error!("duplicate local delivery pending for {dup_key}: {error}");
+                    let _ = self
+                        .ledger
+                        .log_event(sha, "emit", "duplicate local delivery pending");
+                }
+            },
+            Ok((mode, _)) => log::error!("unsupported duplicate delivery mode {mode}"),
+            Err(e) => log::error!("duplicate delivery lookup failed for {dup_key}: {e}"),
         }
     }
 
@@ -1153,6 +1370,7 @@ impl Pipeline {
     fn record_duplicate(
         &self,
         dup_key: &str,
+        content_sha: &str,
         path: &Path,
         name: &str,
         rel: &str,
@@ -1160,8 +1378,20 @@ impl Pipeline {
         stem: &str,
         orig_final: &str,
     ) -> anyhow::Result<String> {
-        self.ledger
-            .ingest(dup_key, &path.to_string_lossy(), name, rel, ext)?;
+        let (mode, root) = self.configured_delivery();
+        self.ledger.ingest_with_delivery(
+            dup_key,
+            &path.to_string_lossy(),
+            name,
+            rel,
+            ext,
+            mode,
+            &root,
+            &self.cfg.processing_dir.to_string_lossy(),
+            // The physical duplicate id is the ledger key, not its content
+            // hash. Pin both so receipt recovery can validate the artifact.
+            content_sha,
+        )?;
         let final_filename = self.ledger.reserve_name(stem, ext, dup_key)?;
         self.ledger.update_fields(
             dup_key,
@@ -1170,10 +1400,6 @@ impl Pipeline {
                 ("soft_flags", Some("DUPLICATE_CONTENT".into())),
             ],
         )?;
-        anyhow::ensure!(
-            self.ledger.set_state(dup_key, JobState::Emitted)?,
-            "duplicate row {dup_key} could not be marked emitted"
-        );
         Ok(final_filename)
     }
 
@@ -1188,6 +1414,106 @@ impl Pipeline {
             .flatten()
             .and_then(|j| j.original_relpath)
             .unwrap_or_else(|| relpath(&self.cfg.processing_dir, path))
+    }
+
+    fn delivery_for_job(&self, sha: &str) -> anyhow::Result<(String, PathBuf)> {
+        let mut job = self
+            .ledger
+            .get(sha)?
+            .ok_or_else(|| anyhow::anyhow!("unknown delivery"))?;
+        if job.delivery_root.is_empty() && job.delivery_mode == "power_automate" {
+            job = self
+                .ledger
+                .pin_legacy_power_automate_root(sha, &self.cfg.outbox_dir)?
+                .ok_or_else(|| anyhow::anyhow!("legacy delivery disappeared while pinning"))?;
+        }
+        let root = PathBuf::from(&job.delivery_root);
+        self.cfg
+            .validate_pinned_delivery_root(&job.delivery_mode, &root)
+            .map_err(anyhow::Error::msg)?;
+        Ok((job.delivery_mode, root))
+    }
+
+    /// New rows pin this at intake. The fallback is exclusively for ledgers
+    /// written before the column existed.
+    fn source_root_for_job(&self, sha: &str) -> anyhow::Result<PathBuf> {
+        let job = self
+            .ledger
+            .get(sha)?
+            .ok_or_else(|| anyhow::anyhow!("unknown delivery source"))?;
+        Ok(if job.source_root.is_empty() {
+            self.cfg.processing_dir.clone()
+        } else {
+            PathBuf::from(job.source_root)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // transaction inputs are deliberately explicit
+    fn deliver_local_with_collisions(
+        &self,
+        sha: &str,
+        source: &Path,
+        source_root: &Path,
+        base: &str,
+        ext: &str,
+        manifest: &mut Manifest,
+        root: &Path,
+    ) -> anyhow::Result<()> {
+        let mut remove_source = |path: &Path| std::fs::remove_file(path);
+        self.deliver_local_with_collisions_and_remove(
+            sha,
+            source,
+            source_root,
+            base,
+            ext,
+            manifest,
+            root,
+            &mut remove_source,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_local_with_collisions_and_remove(
+        &self,
+        sha: &str,
+        source: &Path,
+        source_root: &Path,
+        base: &str,
+        ext: &str,
+        manifest: &mut Manifest,
+        root: &Path,
+        remove_source: &mut impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> anyhow::Result<()> {
+        let collision_base = if ext.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}.{ext}")
+        };
+        for suffix in 1..=crate::checker::MAX_NAME_COLLISIONS {
+            match local_output::deliver_with_remove(
+                root,
+                source_root,
+                source,
+                &collision_base,
+                manifest,
+                &mut *remove_source,
+            )? {
+                DeliverResult::Delivered => return Ok(()),
+                DeliverResult::NameCollision => {
+                    let next = suffix.saturating_add(1);
+                    let current = manifest
+                        .new_filename
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("local collision has no reserved name"))?;
+                    let name = self
+                        .ledger
+                        .advance_local_recovery_name_from(base, ext, sha, current, next)?
+                        .ok_or_else(|| anyhow::anyhow!("local collision reservation changed"))?;
+                    manifest.new_filename = Some(name.clone());
+                }
+            }
+        }
+        anyhow::bail!("local output collision resolution exceeded configured safety limit")
     }
 
     /// Reconcile the ledger from an already-durable manifest.
@@ -1205,12 +1531,48 @@ impl Pipeline {
                 return false;
             }
         };
-        match reconcile_terminal_manifest(
-            &self.cfg.manifests_dir(),
-            &self.ledger,
-            &job,
-            original_relpath,
-        ) {
+        let job = if job.delivery_mode == "power_automate" && job.delivery_root.is_empty() {
+            match self
+                .ledger
+                .pin_legacy_power_automate_root(sha, &self.cfg.outbox_dir)
+            {
+                Ok(Some(job)) => job,
+                Ok(None) => return false,
+                Err(error) => {
+                    log::warn!("could not pin legacy delivery {sha}: {error}");
+                    return false;
+                }
+            }
+        } else {
+            job
+        };
+        let recovery = match job.delivery_mode.as_str() {
+            "power_automate" => {
+                let root = if job.delivery_root.is_empty() {
+                    self.cfg.outbox_dir.clone()
+                } else {
+                    PathBuf::from(&job.delivery_root)
+                };
+                match self
+                    .cfg
+                    .validate_pinned_delivery_root("power_automate", &root)
+                {
+                    Ok(()) => reconcile_terminal_manifest(
+                        &self.cfg,
+                        &root.join("_manifests"),
+                        &self.ledger,
+                        &job,
+                        original_relpath,
+                    ),
+                    Err(error) => Err(anyhow::Error::msg(error)),
+                }
+            }
+            "local" => reconcile_local_receipt(&self.cfg, &self.ledger, &job, original_relpath),
+            other => Err(anyhow::anyhow!(
+                "unsupported immutable delivery mode {other}"
+            )),
+        };
+        match recovery {
             Ok(Some(target)) => {
                 if target == JobState::Emitted {
                     self.purge_cache(sha);
@@ -1275,7 +1637,15 @@ impl Pipeline {
         }
 
         let original_relpath = self.identity_relpath(sha, path);
-        let mid = manifest_id(sha, &original_relpath);
+        let mid = existing.delivery_id.clone();
+
+        // Local review has a durable move plan before the source changes. PA
+        // deliberately keeps its established quarantine/manifest sequence.
+        if existing.delivery_mode == "local" {
+            self.flag_local(sha, path, reason, clock, &existing, &original_relpath, &mid)
+                .await;
+            return;
+        }
 
         // Move to local quarantine. Never lose the file: move, or copy then
         // remove the source (cross-volume rename fails). Surface a hard failure
@@ -1319,7 +1689,12 @@ impl Pipeline {
             sha,
             &[
                 ("flag_reason", Some(reason.clone())),
-                ("quarantine_path", Some(quarantined)),
+                ("quarantine_path", Some(quarantined.clone())),
+                ("quarantine_planned_path", Some(quarantined)),
+                (
+                    "quarantine_root",
+                    Some(self.cfg.quarantine_dir.to_string_lossy().into_owned()),
+                ),
             ],
         ) {
             log::error!("could not record quarantine before flagging {sha}: {error}");
@@ -1331,7 +1706,7 @@ impl Pipeline {
         let m = Manifest {
             schema: MANIFEST_SCHEMA_VERSION,
             manifest_id: mid,
-            sha256: sha.to_string(),
+            sha256: existing.content_sha256.clone(),
             status: "flagged".into(),
             original_name: path
                 .file_name()
@@ -1345,16 +1720,35 @@ impl Pipeline {
             date_source: None,
             doc_type: None,
             language: None,
-            duplicate_of: None,
+            duplicate_of: manifest_duplicate_of(&existing),
             soft_flags: vec![],
             flag_reason: Some(reason.clone()),
             model_versions: self.model_versions.clone(),
             processed_at: chrono::Utc::now().to_rfc3339(),
         };
-        if let Err(error) = write_manifest(&self.cfg.manifests_dir(), &m) {
+        let review_written = match self.delivery_for_job(sha) {
+            Ok((mode, root)) if mode == "power_automate" => {
+                write_manifest(&root.join("_manifests"), &m).map(|_| ())
+            }
+            Ok((mode, root)) if mode == "local" => {
+                local_output::record_review(&root, &self.cfg.quarantine_dir, &quarantined_path, &m)
+            }
+            Ok((mode, _)) => Err(anyhow::anyhow!(
+                "unsupported immutable delivery mode {mode}"
+            )),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = review_written {
             log::error!("flagged manifest write failed for {sha}: {error}");
             if restore_quarantined(&quarantined_path, path) {
-                let _ = self.ledger.update_fields(sha, &[("quarantine_path", None)]);
+                let _ = self.ledger.update_fields(
+                    sha,
+                    &[
+                        ("quarantine_path", None),
+                        ("quarantine_planned_path", None),
+                        ("quarantine_root", None),
+                    ],
+                );
             } else {
                 log::error!("the review file could not be restored after manifest failure");
             }
@@ -1382,6 +1776,135 @@ impl Pipeline {
         self.emit_update(sha);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn flag_local(
+        &self,
+        sha: &str,
+        path: &Path,
+        reason: String,
+        _clock: &WorkClock,
+        job: &Job,
+        original_relpath: &str,
+        mid: &str,
+    ) {
+        let quarantine_root = job
+            .quarantine_root
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.cfg.quarantine_dir.clone());
+        let planned = job
+            .quarantine_planned_path
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| job.quarantine_path.as_deref().map(PathBuf::from))
+            .unwrap_or_else(|| self.quarantine_dest(mid, path));
+        if job.quarantine_planned_path.is_none() {
+            if let Err(error) = self.ledger.update_fields(
+                sha,
+                &[
+                    ("flag_reason", Some(reason.clone())),
+                    (
+                        "quarantine_planned_path",
+                        Some(planned.to_string_lossy().into_owned()),
+                    ),
+                    (
+                        "quarantine_root",
+                        Some(quarantine_root.to_string_lossy().into_owned()),
+                    ),
+                ],
+            ) {
+                log::error!("could not persist local quarantine plan for {sha}: {error}");
+                return;
+            }
+        }
+
+        let quarantined_ready = crate::watcher::is_safe_path_under_root(&quarantine_root, &planned)
+            && planned.is_file()
+            && hash_file(&planned).ok().as_deref() == Some(job.content_sha256.as_str());
+        if !quarantined_ready {
+            if !crate::watcher::is_safe_path_under_root(&self.cfg.processing_dir, path)
+                || hash_file(path).ok().as_deref() != Some(job.content_sha256.as_str())
+            {
+                log::error!("local quarantine plan for {sha} has no safe matching source");
+                return;
+            }
+            let _ = std::fs::create_dir_all(&quarantine_root);
+            if std::fs::rename(path, &planned).is_err() {
+                if let Err(error) = copy_then_remove(path, &planned) {
+                    log::error!("failed to execute local quarantine plan for {sha}: {error}");
+                    return;
+                }
+            }
+        }
+        if !crate::watcher::is_safe_path_under_root(&quarantine_root, &planned)
+            || hash_file(&planned).ok().as_deref() != Some(job.content_sha256.as_str())
+        {
+            log::error!("local quarantine plan did not preserve {sha}");
+            return;
+        }
+        if let Err(error) = self.ledger.update_fields(
+            sha,
+            &[
+                ("flag_reason", Some(reason.clone())),
+                (
+                    "quarantine_path",
+                    Some(planned.to_string_lossy().into_owned()),
+                ),
+            ],
+        ) {
+            log::error!("could not record local quarantine for {sha}: {error}");
+            return;
+        }
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: mid.into(),
+            sha256: job.content_sha256.clone(),
+            status: "flagged".into(),
+            original_name: job.original_name.clone(),
+            original_relpath: original_relpath.into(),
+            new_filename: None,
+            description: None,
+            date: None,
+            date_source: None,
+            doc_type: job.doc_type.clone(),
+            language: job.language.clone(),
+            duplicate_of: manifest_duplicate_of(job),
+            soft_flags: vec![],
+            flag_reason: Some(reason),
+            model_versions: job
+                .model_versions
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_else(|| serde_json::json!({})),
+            processed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let root = PathBuf::from(&job.delivery_root);
+        if let Err(error) = self.cfg.validate_pinned_delivery_root("local", &root) {
+            log::error!("refusing local flagged receipt for {sha}: {error}");
+            return;
+        }
+        if let Err(error) =
+            local_output::record_review(&root, &quarantine_root, &planned, &manifest)
+        {
+            log::error!("failed to record local flagged receipt for {sha}: {error}");
+            return;
+        }
+        match self.ledger.set_state(sha, JobState::Flagged) {
+            Ok(true) => {
+                let _ = self
+                    .ledger
+                    .log_event(sha, "flag", "local quarantine receipt written");
+                self.emit_update(sha);
+            }
+            Ok(false) => {
+                log::warn!("local flagged receipt is durable but ledger CAS lost for {sha}")
+            }
+            Err(error) => {
+                log::error!("local flagged receipt is durable but ledger failed for {sha}: {error}")
+            }
+        }
+    }
+
     /// Human correction from the review pane: re-validate and re-emit.
     pub async fn resubmit(
         &self,
@@ -1390,10 +1913,49 @@ impl Pipeline {
         subject: String,
         description: String,
     ) -> anyhow::Result<()> {
+        self.resubmit_with_owner(sha, date, subject, description, None)
+            .await
+    }
+
+    async fn resubmit_with_owner(
+        &self,
+        sha: &str,
+        date: String,
+        subject: String,
+        description: String,
+        existing_review_owner: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.resubmit_with_owner_and_remove(
+            sha,
+            date,
+            subject,
+            description,
+            existing_review_owner,
+            |path| std::fs::remove_file(path),
+        )
+        .await
+    }
+
+    async fn resubmit_with_owner_and_remove(
+        &self,
+        sha: &str,
+        date: String,
+        subject: String,
+        description: String,
+        existing_review_owner: Option<String>,
+        mut remove_source: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> anyhow::Result<()> {
         let job = self
             .ledger
             .get(sha)?
             .ok_or_else(|| anyhow::anyhow!("unknown job"))?;
+        let job = if job.delivery_mode == "power_automate" && job.delivery_root.is_empty() {
+            self.ledger
+                .pin_legacy_power_automate_root(sha, &self.cfg.outbox_dir)?
+                .ok_or_else(|| anyhow::anyhow!("legacy job disappeared while pinning"))?
+        } else {
+            job
+        };
         if job.state != JobState::Flagged {
             anyhow::bail!("Only Flagged jobs in Needs Review may be resubmitted");
         }
@@ -1434,18 +1996,43 @@ impl Pipeline {
             .original_relpath
             .clone()
             .unwrap_or_else(|| relpath(&self.cfg.processing_dir, Path::new(&job.original_path)));
-        let mid = manifest_id(sha, &original_relpath);
+        let mid = job.delivery_id.clone();
+        anyhow::ensure!(
+            matches!(job.delivery_mode.as_str(), "local" | "power_automate"),
+            "unsupported immutable delivery mode"
+        );
+
+        let review_owner = match existing_review_owner {
+            Some(owner) => owner,
+            None => self
+                .ledger
+                .begin_review_operation(sha, "correct")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "That review item is already being decided; refresh and try again"
+                    )
+                })?,
+        };
 
         // The reservation is a ledger write, so it is the one mutation that
         // must precede the manifest; it is rolled back below if the write
         // fails, leaving the job exactly as the operator found it.
         let previous_final = job.final_filename.clone();
-        let final_filename = self.ledger.reserve_name(&v.base_name, &job.ext, sha)?;
+        let final_filename = match self.ledger.reserve_name(&v.base_name, &job.ext, sha) {
+            Ok(name) => name,
+            Err(error) => {
+                let _ = self
+                    .ledger
+                    .release_review_operation(sha, "correct", &review_owner);
+                return Err(error);
+            }
+        };
 
+        let duplicate_of = manifest_duplicate_of(&job);
         let m = Manifest {
             schema: MANIFEST_SCHEMA_VERSION,
             manifest_id: mid,
-            sha256: sha.to_string(),
+            sha256: job.content_sha256.clone(),
             status: "ok".into(),
             original_name: job.original_name.clone(),
             original_relpath: original_relpath.clone(),
@@ -1453,20 +2040,138 @@ impl Pipeline {
             description: Some(v.description.clone()),
             date: Some(v.date_iso.clone()),
             date_source: Some("human".into()),
-            doc_type: job.doc_type,
-            language: job.language,
-            duplicate_of: None,
+            doc_type: job.doc_type.clone(),
+            language: job.language.clone(),
+            duplicate_of,
             soft_flags: vec!["HUMAN_CORRECTED".into()],
             flag_reason: None,
             model_versions: self.model_versions.clone(),
             processed_at: chrono::Utc::now().to_rfc3339(),
         };
+        if job.delivery_mode == "local" {
+            let source = match job.quarantine_path.as_deref().map(PathBuf::from) {
+                Some(source) => source,
+                None => {
+                    let _ = self
+                        .ledger
+                        .release_review_operation(sha, "correct", &review_owner);
+                    anyhow::bail!("local review item has no recorded quarantine path");
+                }
+            };
+            let root = PathBuf::from(&job.delivery_root);
+            let quarantine_root = job
+                .quarantine_root
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.cfg.quarantine_dir.clone());
+            if root.as_os_str().is_empty() {
+                let _ = self
+                    .ledger
+                    .release_review_operation(sha, "correct", &review_owner);
+                anyhow::bail!("local review item has no recorded output root");
+            }
+            if let Err(error) = self.cfg.validate_pinned_delivery_root("local", &root) {
+                let _ = self
+                    .ledger
+                    .release_review_operation(sha, "correct", &review_owner);
+                return Err(anyhow::Error::msg(error));
+            }
+            let mut local_manifest = m.clone();
+            if let Err(error) = self.deliver_local_with_collisions_and_remove(
+                sha,
+                &source,
+                &quarantine_root,
+                &v.base_name,
+                &job.ext,
+                &mut local_manifest,
+                &root,
+                &mut remove_source,
+            ) {
+                let collision_base = if job.ext.is_empty() {
+                    v.base_name.clone()
+                } else {
+                    format!("{}.{}", v.base_name, job.ext)
+                };
+                let durable = match local_output::durable_transaction_exists(
+                    &root,
+                    &quarantine_root,
+                    &source,
+                    &collision_base,
+                    &local_manifest,
+                ) {
+                    Ok(durable) => durable,
+                    Err(inspect_error) => {
+                        log::warn!(
+                            "could not inspect failed Local correction transaction; preserving it for recovery: {inspect_error}"
+                        );
+                        true
+                    }
+                };
+                if !durable {
+                    let _ = self.ledger.update_fields(
+                        sha,
+                        &[
+                            ("final_filename", previous_final),
+                            ("recovery_previous_filename", None),
+                        ],
+                    );
+                    let _ = self
+                        .ledger
+                        .release_review_operation(sha, "correct", &review_owner);
+                }
+                return Err(error);
+            }
+            if !self.ledger.commit_live_correction(
+                sha,
+                &review_owner,
+                &[
+                    ("final_filename", local_manifest.new_filename.clone()),
+                    ("recovery_previous_filename", None),
+                    ("proposed_date", Some(v.date_iso)),
+                    ("date_source", Some("human".into())),
+                    ("proposed_subject", Some(v.subject)),
+                    ("description", Some(v.description)),
+                    ("doc_type", local_manifest.doc_type.clone()),
+                    ("language", local_manifest.language.clone()),
+                    (
+                        "model_versions",
+                        Some(local_manifest.model_versions.to_string()),
+                    ),
+                    ("flag_reason", None),
+                    ("quarantine_path", None),
+                    ("quarantine_planned_path", None),
+                    ("quarantine_root", None),
+                    ("soft_flags", Some("HUMAN_CORRECTED".into())),
+                ],
+            )? {
+                anyhow::bail!("job {sha} is no longer flagged; local delivery remains recoverable");
+            }
+            self.ledger
+                .log_event(sha, "resubmit", "local human correction accepted")?;
+            self.purge_cache(sha);
+            self.emit_update(sha);
+            return Ok(());
+        }
         // Nothing else commits until the manifest is on disk. The old order
         // cleared flag_reason, logged the correction and un-quarantined the
         // document first, so a failed write left a flagged row with no reason,
         // a pending flagged manifest, and the file back in Processing where
         // the watcher re-ingested it as a spurious duplicate.
-        if let Err(e) = write_manifest(&self.cfg.manifests_dir(), &m) {
+        let pa_root = if job.delivery_root.is_empty() {
+            self.cfg.outbox_dir.clone()
+        } else {
+            PathBuf::from(&job.delivery_root)
+        };
+        if let Err(error) = self
+            .cfg
+            .validate_pinned_delivery_root("power_automate", &pa_root)
+        {
+            let _ = self
+                .ledger
+                .release_review_operation(sha, "correct", &review_owner);
+            return Err(anyhow::Error::msg(error));
+        }
+        if let Err(e) = write_manifest(&pa_root.join("_manifests"), &m) {
             let _ = self
                 .ledger
                 .update_fields(sha, &[("final_filename", previous_final)]);
@@ -1475,6 +2180,9 @@ impl Pipeline {
                 "resubmit",
                 "correction rejected: manifest write failed",
             );
+            let _ = self
+                .ledger
+                .release_review_operation(sha, "correct", &review_owner);
             return Err(e);
         }
 
@@ -1487,55 +2195,58 @@ impl Pipeline {
         // symptom this ordering exists to prevent. Roll the reservation back the
         // same way the write-failure branch does, so the only two outcomes stay
         // "fully corrected" and "untouched, still flagged with its reason".
-        let owned = self
-            .ledger
-            .set_state_if_current(sha, JobState::Flagged, JobState::Emitted);
-        if !matches!(owned, Ok(true)) {
-            let _ = self
-                .ledger
-                .update_fields(sha, &[("final_filename", previous_final)]);
+        // Keep the exact quarantine locator until the source is back under its
+        // intake-time Processing root. The manifest must precede the restore
+        // for durable recovery, but success is never returned until Flow 2 can
+        // see both that manifest and the restored source.
+        if let Err(error) = restore_power_automate_correction(&self.cfg, &job, &original_relpath) {
+            let _ = self.ledger.log_event(
+                sha,
+                "resubmit",
+                "RESTORE_FAILED: correction manifest remains recoverable",
+            );
+            return Err(error);
+        }
+
+        // The exact owner-token CAS is deliberately after restoration: a
+        // crash after the move leaves a flagged row plus an `ok` manifest,
+        // which startup can verify and terminalize idempotently. It is the
+        // only operation that clears the restoration locator.
+        if !self.ledger.commit_live_correction(
+            sha,
+            &review_owner,
+            &[
+                ("final_filename", m.new_filename.clone()),
+                ("recovery_previous_filename", None),
+                ("proposed_date", Some(v.date_iso)),
+                ("date_source", Some("human".into())),
+                ("proposed_subject", Some(v.subject)),
+                ("description", Some(v.description)),
+                ("doc_type", m.doc_type.clone()),
+                ("language", m.language.clone()),
+                ("model_versions", Some(m.model_versions.to_string())),
+                ("flag_reason", None),
+                ("quarantine_path", None),
+                ("quarantine_planned_path", None),
+                ("quarantine_root", None),
+                ("soft_flags", Some("HUMAN_CORRECTED".into())),
+            ],
+        )? {
             let _ = self.ledger.log_event(
                 sha,
                 "resubmit",
                 "correction abandoned: the job is no longer flagged",
             );
-            owned?;
-            anyhow::bail!("job {sha} is no longer flagged; nothing to correct");
+            anyhow::bail!(
+                "job {sha} is no longer flagged; correction manifest remains recoverable"
+            );
         }
-        self.ledger.update_fields(
-            sha,
-            &[
-                ("proposed_date", Some(v.date_iso)),
-                ("date_source", Some("human".into())),
-                ("proposed_subject", Some(v.subject)),
-                ("description", Some(v.description)),
-                ("flag_reason", None),
-                ("soft_flags", Some("HUMAN_CORRECTED".into())),
-            ],
-        )?;
         self.ledger
             .log_event(sha, "resubmit", "human correction accepted")?;
 
         // Quarantined original moves back into scope for Flow 2's rename — to
         // the relative location its identity was computed from, not to the
         // Processing root under its leaf name.
-        let quarantined = job
-            .quarantine_path
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.cfg.quarantine_dir.join(&job.original_name));
-        if quarantined.exists() {
-            let back = self.cfg.processing_dir.join(&original_relpath);
-            if let Some(parent) = back.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(e) = std::fs::rename(&quarantined, &back) {
-                log::error!("corrected file could not leave quarantine: {e}");
-                let _ = self.ledger.log_event(sha, "resubmit", "RESTORE_FAILED");
-            } else {
-                let _ = self.ledger.update_fields(sha, &[("quarantine_path", None)]);
-            }
-        }
-
         self.purge_cache(sha);
         self.emit_update(sha);
         Ok(())
@@ -1684,21 +2395,130 @@ fn relpath(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+fn same_path_identity(left: &Path, right: &Path) -> bool {
+    crate::identity::normalize_relpath(&left.to_string_lossy())
+        == crate::identity::normalize_relpath(&right.to_string_lossy())
+}
+
+fn validate_local_receipt_identity(
+    receipt: &local_output::Receipt,
+    job: &Job,
+    original_relpath: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        receipt.receipt_schema == 1
+            && receipt.delivery_mode == "local"
+            && receipt.manifest.validate().is_ok()
+            && receipt.manifest.manifest_id == job.delivery_id
+            && receipt.manifest.sha256 == job.content_sha256
+            && receipt.manifest.duplicate_of == manifest_duplicate_of(job)
+            && crate::identity::normalize_relpath(&receipt.manifest.original_relpath)
+                == crate::identity::normalize_relpath(original_relpath),
+        "local receipt does not match its ledger delivery"
+    );
+    Ok(())
+}
+
+fn validate_local_review_receipt(
+    receipt: &local_output::Receipt,
+    job: &Job,
+    quarantine_root: &Path,
+    planned: Option<&Path>,
+) -> anyhow::Result<()> {
+    if !matches!(receipt.manifest.status.as_str(), "flagged" | "dismissed") {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        receipt.output_relpath.is_none() && receipt.manifest.new_filename.is_none(),
+        "local review receipt cannot name an output"
+    );
+    let quarantined =
+        planned.ok_or_else(|| anyhow::anyhow!("local review receipt has no pinned source"))?;
+    let receipt_source_root = PathBuf::from(&receipt.source_root);
+    let receipt_source = PathBuf::from(&receipt.source_path);
+    anyhow::ensure!(
+        same_path_identity(&receipt_source_root, quarantine_root)
+            && same_path_identity(&receipt_source, quarantined),
+        "local review receipt source provenance does not match pinned quarantine"
+    );
+    anyhow::ensure!(
+        crate::watcher::is_safe_path_under_root(quarantine_root, &receipt_source)
+            && receipt_source.is_file(),
+        "local review receipt source is missing or outside pinned quarantine"
+    );
+    anyhow::ensure!(
+        hash_file(&receipt_source)? == job.content_sha256,
+        "local review receipt source content does not match ledger"
+    );
+    Ok(())
+}
+
 /// Reconcile every unresolved row whose exact terminal manifest is already
 /// durable. This runs before the watcher starts, so a source moved to
 /// quarantine immediately before a crash does not need to reappear in
 /// Processing to finish its ledger transition.
 pub fn reconcile_terminal_manifests(cfg: &Config, ledger: &Ledger) -> anyhow::Result<usize> {
-    let manifests_dir = cfg.manifests_dir();
     let mut recovered = 0usize;
     for job in ledger.unresolved_jobs()? {
-        let original_relpath = job
-            .original_relpath
-            .clone()
-            .unwrap_or_else(|| relpath(&cfg.processing_dir, Path::new(job.original_path.as_str())));
-        if let Some(target) =
-            reconcile_terminal_manifest(&manifests_dir, ledger, &job, &original_relpath)?
-        {
+        let attempted_delivery_id = job.delivery_id.clone();
+        // A poisoned receipt, an unavailable old root, or one row's SQLite/IO
+        // fault must never prevent later rows from reconciling. Keep every
+        // potentially-mutating action inside the row transaction, and only
+        // release an abandoned review lease after that transaction succeeded
+        // with no terminal artifact. On an error we leave the row untouched.
+        let outcome = (|| -> anyhow::Result<(Job, Option<JobState>)> {
+            let job = if job.delivery_mode == "power_automate" && job.delivery_root.is_empty() {
+                ledger
+                    .pin_legacy_power_automate_root(&job.sha256, &cfg.outbox_dir)?
+                    .ok_or_else(|| anyhow::anyhow!("legacy delivery disappeared while pinning"))?
+            } else {
+                job
+            };
+            let job = pin_legacy_pa_review_roots(cfg, ledger, job)?;
+            let original_relpath = job.original_relpath.clone().unwrap_or_else(|| {
+                relpath(&cfg.processing_dir, Path::new(job.original_path.as_str()))
+            });
+            let target = match job.delivery_mode.as_str() {
+                "power_automate" => {
+                    let root = if job.delivery_root.is_empty() {
+                        cfg.outbox_dir.clone()
+                    } else {
+                        PathBuf::from(&job.delivery_root)
+                    };
+                    cfg.validate_pinned_delivery_root("power_automate", &root)
+                        .map_err(anyhow::Error::msg)?;
+                    reconcile_terminal_manifest(
+                        cfg,
+                        &root.join("_manifests"),
+                        ledger,
+                        &job,
+                        &original_relpath,
+                    )?
+                }
+                "local" => reconcile_local_receipt(cfg, ledger, &job, &original_relpath)?,
+                other => {
+                    anyhow::bail!("unsupported immutable delivery mode {other}");
+                }
+            };
+            Ok((job, target))
+        })();
+
+        let (job, target) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                log::warn!(
+                    "terminal reconciliation skipped delivery {} after a row-local error: {error}",
+                    attempted_delivery_id
+                );
+                continue;
+            }
+        };
+        if target.is_none() {
+            if let Some(operation) = job.review_operation.as_deref() {
+                let _ = ledger.release_abandoned_review_operation(&job.sha256, operation);
+            }
+        }
+        if let Some(target) = target {
             if target == JobState::Emitted && !cfg.retain_cache {
                 purge_cache_artifacts(&cfg.cache_dir, &job.sha256);
             }
@@ -1708,13 +2528,262 @@ pub fn reconcile_terminal_manifests(cfg: &Config, ledger: &Ledger) -> anyhow::Re
     Ok(recovered)
 }
 
+fn pin_legacy_pa_review_roots(cfg: &Config, ledger: &Ledger, job: Job) -> anyhow::Result<Job> {
+    if job.delivery_mode != "power_automate"
+        || job.state != JobState::Flagged
+        || (job.quarantine_root.is_some() && !job.source_root.is_empty())
+    {
+        return Ok(job);
+    }
+    let Some(quarantined) = job.quarantine_path.as_deref().map(PathBuf::from) else {
+        return Ok(job);
+    };
+    anyhow::ensure!(
+        crate::watcher::is_safe_path_under_root(&cfg.quarantine_dir, &quarantined)
+            && quarantined.is_file()
+            && hash_file(&quarantined)? == job.content_sha256,
+        "legacy PA review source cannot be safely pinned"
+    );
+    let original_relpath = job
+        .original_relpath
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("legacy PA review row has no original relpath"))?;
+    let expected_original = cfg.processing_dir.join(original_relpath);
+    anyhow::ensure!(
+        same_path_identity(&expected_original, Path::new(&job.original_path)),
+        "legacy PA review source root does not match the recorded intake path"
+    );
+    ledger
+        .pin_legacy_power_automate_review_roots(
+            &job.sha256,
+            &cfg.processing_dir,
+            &cfg.quarantine_dir,
+            &quarantined,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("legacy PA review row disappeared while pinning"))
+}
+
+fn reconcile_local_receipt(
+    cfg: &Config,
+    ledger: &Ledger,
+    job: &Job,
+    original_relpath: &str,
+) -> anyhow::Result<Option<JobState>> {
+    let root = PathBuf::from(&job.delivery_root);
+    anyhow::ensure!(
+        !root.as_os_str().is_empty(),
+        "local job has no pinned output root"
+    );
+    cfg.validate_pinned_delivery_root("local", &root)
+        .map_err(anyhow::Error::msg)?;
+    // This is deliberately not the ledger key: an ordinary legacy row is
+    // keyed by its content hash, while a physical duplicate row is keyed by
+    // this value. Both persist the exact receipt identity at ingest.
+    let mid = job.delivery_id.clone();
+    let quarantine_root = job
+        .quarantine_root
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cfg.quarantine_dir.clone());
+    let planned = job
+        .quarantine_path
+        .as_deref()
+        .or(job.quarantine_planned_path.as_deref())
+        .map(PathBuf::from);
+    // Validate persisted transaction provenance against ledger-owned paths
+    // before recovery reads or deletes anything. Intent JSON is durable but
+    // not an authority to redirect a job outside its pinned source contract.
+    let ordinary_root = if job.source_root.is_empty() {
+        cfg.processing_dir.clone()
+    } else {
+        PathBuf::from(&job.source_root)
+    };
+    let ordinary_source = PathBuf::from(&job.original_path);
+    let (expected_root, expected_source) = match planned.as_ref() {
+        Some(quarantined) => (&quarantine_root, quarantined),
+        None => (&ordinary_root, &ordinary_source),
+    };
+    // A pending correction intent may coexist with its pre-review flagged
+    // receipt. Validate that receipt completely before intent recovery can
+    // publish or delete anything; corrupt review metadata is never authority
+    // to touch the pinned source or release its active decision lease.
+    if let Some(persisted_receipt) = local_output::read_receipt(&root, &mid)? {
+        validate_local_receipt_identity(&persisted_receipt, job, original_relpath)?;
+        validate_local_review_receipt(
+            &persisted_receipt,
+            job,
+            &quarantine_root,
+            planned.as_deref(),
+        )?;
+    }
+    if local_output::validate_intent_for_recovery(
+        &root,
+        job,
+        original_relpath,
+        expected_root,
+        expected_source,
+    )? {
+        ensure_recovery_operation_compatible(job, JobState::Emitted, "local intent")?;
+        let current_name = job
+            .final_filename
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("local intent has no pinned output name"))?;
+        let _ = local_output::recover_intent_with_name_sync(
+            &root,
+            &job.delivery_id,
+            current_name,
+            |expected, candidate| {
+                ledger.advance_local_recovery_filename(&job.sha256, expected, candidate)
+            },
+        )?;
+    }
+    let receipt = match local_output::read_receipt(&root, &mid)? {
+        Some(receipt) => receipt,
+        None => {
+            // Planned move survived a crash before the receipt. It is safe to
+            // complete only when the exact pinned quarantine file exists and
+            // still hashes to this delivery.
+            let Some(quarantined) = planned.as_ref() else {
+                return Ok(None);
+            };
+            if !crate::watcher::is_safe_path_under_root(&quarantine_root, quarantined)
+                || hash_file(quarantined).ok().as_deref() != Some(job.content_sha256.as_str())
+            {
+                return Ok(None);
+            }
+            let manifest = Manifest {
+                schema: MANIFEST_SCHEMA_VERSION,
+                manifest_id: mid.clone(),
+                sha256: job.content_sha256.clone(),
+                status: "flagged".into(),
+                original_name: job.original_name.clone(),
+                original_relpath: original_relpath.into(),
+                new_filename: None,
+                description: None,
+                date: None,
+                date_source: None,
+                doc_type: job.doc_type.clone(),
+                language: job.language.clone(),
+                duplicate_of: manifest_duplicate_of(job),
+                soft_flags: vec![],
+                flag_reason: job
+                    .flag_reason
+                    .clone()
+                    .or_else(|| Some("RECOVERED:planned quarantine".into())),
+                model_versions: job
+                    .model_versions
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or_else(|| serde_json::json!({})),
+                processed_at: chrono::Utc::now().to_rfc3339(),
+            };
+            local_output::record_review(&root, &quarantine_root, quarantined, &manifest)?;
+            local_output::read_receipt(&root, &mid)?.ok_or_else(|| {
+                anyhow::anyhow!("local flagged receipt disappeared during recovery")
+            })?
+        }
+    };
+    let receipt_source_root = PathBuf::from(&receipt.source_root);
+    let receipt_source = PathBuf::from(&receipt.source_path);
+    validate_local_receipt_identity(&receipt, job, original_relpath)?;
+    validate_local_review_receipt(&receipt, job, &quarantine_root, planned.as_deref())?;
+    let manifest = receipt.manifest;
+    let target = match manifest.status.as_str() {
+        "ok" => {
+            if !local_output::receipt_is_complete(&root, &manifest)? {
+                return Ok(None);
+            }
+            let expected_correction = planned
+                .as_ref()
+                .map(|source| *source == receipt_source && quarantine_root == receipt_source_root);
+            let original_root = if job.source_root.is_empty() {
+                cfg.processing_dir.clone()
+            } else {
+                PathBuf::from(&job.source_root)
+            };
+            let expected_ordinary = receipt_source == Path::new(&job.original_path)
+                && receipt_source_root == original_root;
+            anyhow::ensure!(
+                expected_correction == Some(true) || (planned.is_none() && expected_ordinary),
+                "local receipt source provenance does not match its pinned ledger source"
+            );
+            JobState::Emitted
+        }
+        "flagged" | "dismissed" => {
+            if manifest.status == "flagged" {
+                JobState::Flagged
+            } else {
+                JobState::Dismissed
+            }
+        }
+        _ => return Ok(None),
+    };
+    if job.state == target {
+        // A flagged receipt is the pre-review artifact, not a competing
+        // terminal decision. With no state/field transition to perform, its
+        // only safe startup action is releasing an owner abandoned before a
+        // correction or dismissal became durable.
+        if target == JobState::Flagged {
+            if let Some(operation) = job.review_operation.as_deref() {
+                let _ = ledger.release_abandoned_review_operation(&job.sha256, operation);
+            }
+        }
+        return Ok(None);
+    }
+    ensure_recovery_operation_compatible(job, target, "local receipt")?;
+    if target == JobState::Emitted && receipt_source.exists() {
+        // Resume the exact Processing or quarantine transaction that produced
+        // this receipt only after the terminal artifact is proven compatible
+        // with the active review lease.
+        local_output::deliver(&root, &receipt_source_root, &receipt_source, &manifest)?;
+    }
+    let fields: Vec<(&str, Option<String>)> = match target {
+        JobState::Emitted => vec![
+            ("final_filename", manifest.new_filename.clone()),
+            ("recovery_previous_filename", None),
+            ("proposed_date", manifest.date.clone()),
+            ("date_source", manifest.date_source.clone()),
+            ("description", manifest.description.clone()),
+            ("doc_type", manifest.doc_type.clone()),
+            ("language", manifest.language.clone()),
+            ("soft_flags", Some(manifest.soft_flags.join(","))),
+            ("model_versions", Some(manifest.model_versions.to_string())),
+            ("quarantine_path", None),
+            ("quarantine_planned_path", None),
+            ("quarantine_root", None),
+        ],
+        JobState::Flagged | JobState::Dismissed => vec![
+            ("flag_reason", manifest.flag_reason.clone()),
+            (
+                "quarantine_path",
+                planned.map(|path| path.to_string_lossy().into_owned()),
+            ),
+            ("model_versions", Some(manifest.model_versions.to_string())),
+        ],
+        _ => unreachable!(),
+    };
+    let committed = ledger.commit_recovered_terminal(
+        &job.sha256,
+        job.state,
+        job.review_operation.as_deref(),
+        target,
+        &fields,
+    )?;
+    if !committed {
+        return Ok(None);
+    }
+    let _ = ledger.log_event(&job.sha256, "recover", "reconciled durable local receipt");
+    Ok(Some(target))
+}
+
 fn reconcile_terminal_manifest(
+    cfg: &Config,
     manifests_dir: &Path,
     ledger: &Ledger,
     job: &Job,
     original_relpath: &str,
 ) -> anyhow::Result<Option<JobState>> {
-    let mid = manifest_id(&job.sha256, original_relpath);
+    let mid = job.delivery_id.clone();
     let path = manifests_dir.join(format!("{mid}.json"));
     let manifest: Manifest = match std::fs::read(&path)
         .ok()
@@ -1725,7 +2794,8 @@ fn reconcile_terminal_manifest(
     };
     if manifest.validate().is_err()
         || manifest.manifest_id != mid
-        || manifest.sha256 != job.sha256
+        || manifest.sha256 != job.content_sha256
+        || manifest.duplicate_of != manifest_duplicate_of(job)
         || crate::identity::normalize_relpath(&manifest.original_relpath)
             != crate::identity::normalize_relpath(original_relpath)
     {
@@ -1740,7 +2810,19 @@ fn reconcile_terminal_manifest(
         _ => return Ok(None),
     };
     if job.state == target {
+        if target == JobState::Flagged {
+            if let Some(operation) = job.review_operation.as_deref() {
+                let _ = ledger.release_abandoned_review_operation(&job.sha256, operation);
+            }
+        }
         return Ok(None);
+    }
+    ensure_recovery_operation_compatible(job, target, "Power Automate manifest")?;
+    if target == JobState::Emitted
+        && job.state == JobState::Flagged
+        && job.review_operation.as_deref() == Some("correct")
+    {
+        restore_power_automate_correction(cfg, job, original_relpath)?;
     }
     let fields: Vec<(&str, Option<String>)> = match target {
         JobState::Emitted => vec![
@@ -1752,6 +2834,10 @@ fn reconcile_terminal_manifest(
             ("language", manifest.language.clone()),
             ("soft_flags", Some(manifest.soft_flags.join(","))),
             ("model_versions", Some(manifest.model_versions.to_string())),
+            ("flag_reason", None),
+            ("quarantine_path", None),
+            ("quarantine_planned_path", None),
+            ("quarantine_root", None),
         ],
         JobState::Flagged | JobState::Dismissed => vec![
             ("flag_reason", manifest.flag_reason.clone()),
@@ -1759,8 +2845,14 @@ fn reconcile_terminal_manifest(
         ],
         _ => unreachable!("a manifest always maps to a terminal state"),
     };
-    ledger.update_fields(&job.sha256, &fields)?;
-    if !ledger.set_state(&job.sha256, target)? {
+    let committed = ledger.commit_recovered_terminal(
+        &job.sha256,
+        job.state,
+        job.review_operation.as_deref(),
+        target,
+        &fields,
+    )?;
+    if !committed {
         return Ok(None);
     }
     let _ = ledger.log_event(&job.sha256, "recover", "reconciled durable manifest");
@@ -1848,6 +2940,130 @@ fn error_code(e: &anyhow::Error) -> &'static str {
     }
 }
 
+/// Move a PA correction's review copy back to the immutable Processing path.
+///
+/// The manifest is already durable when this runs, so it treats both a source
+/// still in Quarantine and a matching destination with no source as valid
+/// restart states. A destination that appeared while the source remains is
+/// never adopted or replaced, even if its bytes happen to match.
+fn restore_power_automate_correction(
+    cfg: &Config,
+    job: &Job,
+    original_relpath: &str,
+) -> anyhow::Result<()> {
+    restore_power_automate_correction_with(cfg, job, original_relpath, |source, destination| {
+        match std::fs::rename(source, destination) {
+            Ok(()) => Ok(()),
+            Err(rename_error) => copy_then_remove(source, destination).map_err(|copy_error| {
+                std::io::Error::new(
+                    copy_error.kind(),
+                    format!("rename failed: {rename_error}; no-replace copy fallback failed: {copy_error}"),
+                )
+            }),
+        }
+    })
+}
+
+fn restore_power_automate_correction_with(
+    cfg: &Config,
+    job: &Job,
+    original_relpath: &str,
+    move_source: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        job.delivery_mode == "power_automate" && job.state == JobState::Flagged,
+        "PA restoration is only valid for a flagged correction"
+    );
+    let processing_root = if job.source_root.is_empty() {
+        cfg.processing_dir.clone()
+    } else {
+        PathBuf::from(&job.source_root)
+    };
+    anyhow::ensure!(
+        !processing_root.as_os_str().is_empty(),
+        "PA correction has no pinned Processing root"
+    );
+    anyhow::ensure!(
+        crate::identity::normalize_relpath(original_relpath)
+            == crate::identity::normalize_relpath(
+                job.original_relpath.as_deref().unwrap_or(original_relpath)
+            ),
+        "PA correction restoration relpath does not match its ledger identity"
+    );
+    anyhow::ensure!(
+        crate::watcher::is_safe_path_under_root(&processing_root, &processing_root)
+            && Path::new(original_relpath)
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "PA correction pinned Processing root or relative destination is unsafe"
+    );
+    let destination = processing_root.join(original_relpath);
+    if !job.source_root.is_empty() {
+        anyhow::ensure!(
+            same_path_identity(&destination, Path::new(&job.original_path)),
+            "PA correction destination does not match the intake-time source path"
+        );
+    }
+    let quarantine_root = job
+        .quarantine_root
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("PA correction has no pinned quarantine root"))?;
+    let source = job
+        .quarantine_path
+        .as_deref()
+        .or(job.quarantine_planned_path.as_deref())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("PA correction has no pinned quarantine source"))?;
+    anyhow::ensure!(
+        crate::watcher::is_safe_path_under_root(&quarantine_root, &quarantine_root)
+            && source.strip_prefix(&quarantine_root).is_ok()
+            && (!source.exists()
+                || crate::watcher::is_safe_path_under_root(&quarantine_root, &source)),
+        "PA correction source is outside pinned Quarantine or unsafe"
+    );
+
+    if destination.exists() {
+        anyhow::ensure!(
+            crate::watcher::is_safe_path_under_root(&processing_root, &destination)
+                && destination.is_file()
+                && hash_file(&destination)? == job.content_sha256,
+            "PA correction destination is foreign or has different content"
+        );
+        anyhow::ensure!(
+            !source.exists(),
+            "PA correction destination already exists; preserving pinned quarantine source"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        source.is_file() && hash_file(&source)? == job.content_sha256,
+        "PA correction pinned quarantine source is missing or changed"
+    );
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    anyhow::ensure!(
+        destination
+            .parent()
+            .is_some_and(|parent| crate::watcher::is_safe_path_under_root(
+                &processing_root,
+                parent
+            ))
+            && !destination.exists(),
+        "PA correction destination became unsafe or occupied during restore"
+    );
+    move_source(&source, &destination)?;
+    anyhow::ensure!(
+        !source.exists()
+            && crate::watcher::is_safe_path_under_root(&processing_root, &destination)
+            && destination.is_file()
+            && hash_file(&destination)? == job.content_sha256,
+        "PA correction restore did not durably move the pinned source"
+    );
+    Ok(())
+}
+
 fn copy_then_remove(source: &Path, destination: &Path) -> std::io::Result<()> {
     copy_then_remove_with(source, destination, |path| std::fs::remove_file(path))
 }
@@ -1857,7 +3073,16 @@ fn copy_then_remove_with(
     destination: &Path,
     remove_source: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    std::fs::copy(source, destination)?;
+    // `std::fs::copy` truncates an existing destination. Quarantine names are
+    // collision-resistant but a race with another process is still possible,
+    // so the cross-volume fallback must retain create-new semantics too.
+    let mut input = std::fs::File::open(source)?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
     if let Err(error) = remove_source(source) {
         if let Err(cleanup_error) = std::fs::remove_file(destination) {
             log::error!(
@@ -2031,10 +3256,13 @@ mod tests {
             for d in [
                 &cfg.processing_dir,
                 &cfg.outbox_dir,
+                &cfg.local_output_dir,
                 &cfg.quarantine_dir,
                 &cfg.cache_dir,
             ] {
-                std::fs::create_dir_all(d).unwrap();
+                if !d.as_os_str().is_empty() {
+                    std::fs::create_dir_all(d).unwrap();
+                }
             }
             let ledger = Arc::new(Ledger::open(&root.join("ledger.db")).unwrap());
             let sidecar = Arc::new(Sidecar::new(root.join("no-such-convertd")));
@@ -2066,6 +3294,38 @@ mod tests {
             Self { dir, pipeline }
         }
 
+        /// Settings are applied only while stopped. Recreate the runtime over
+        /// the same ledger to model that restart without changing a job's
+        /// immutable delivery contract.
+        fn restarted_with(&self, cfg: Config) -> Arc<Pipeline> {
+            Arc::new(Pipeline {
+                convert_slots: self.pipeline.convert_slots.clone(),
+                slm_slots: self.pipeline.slm_slots.clone(),
+                ingest_slots: self.pipeline.ingest_slots.clone(),
+                inflight: self.pipeline.inflight.clone(),
+                pacer: self.pipeline.pacer.clone(),
+                cfg,
+                ledger: self.pipeline.ledger.clone(),
+                sidecar: self.pipeline.sidecar.clone(),
+                slm: self.pipeline.slm.clone(),
+                app: None,
+                paused: self.pipeline.paused.clone(),
+                model_versions: self.pipeline.model_versions.clone(),
+            })
+        }
+
+        fn app_state(&self) -> crate::AppState {
+            crate::AppState {
+                cfg_path: self.dir.path().join("backlog.config.json"),
+                cfg: std::sync::Mutex::new(self.pipeline.cfg.clone()),
+                default_cache_dir: self.pipeline.cfg.cache_dir.clone(),
+                log_path: self.dir.path().join("backlog.log"),
+                ledger: self.pipeline.ledger.clone(),
+                pipeline: std::sync::Mutex::new(None),
+                last_preflight: std::sync::Mutex::new(None),
+            }
+        }
+
         /// Create a document at `rel` under Processing and give it an ingested
         /// ledger row, exactly as `process_inner` would have.
         fn seed(&self, rel: &str, body: &str) -> (String, PathBuf) {
@@ -2074,11 +3334,60 @@ mod tests {
             std::fs::write(&path, body).unwrap();
             let sha = hash_file(&path).unwrap();
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let (mode, root) = self.pipeline.configured_delivery();
             self.pipeline
                 .ledger
-                .ingest(&sha, &path.to_string_lossy(), &name, rel, "pdf")
+                .ingest_with_delivery(
+                    &sha,
+                    &path.to_string_lossy(),
+                    &name,
+                    rel,
+                    "pdf",
+                    mode,
+                    &root,
+                    &self.pipeline.cfg.processing_dir.to_string_lossy(),
+                    &sha,
+                )
                 .unwrap();
             (sha, path)
+        }
+
+        /// Create the ledger shape used for a physical/per-path duplicate:
+        /// the row key is its delivery id, while receipt identity and content
+        /// hash remain separate immutable fields.
+        fn seed_duplicate(&self, rel: &str, body: &str) -> (String, String, PathBuf) {
+            let path = self.pipeline.cfg.processing_dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            let content_sha = hash_file(&path).unwrap();
+            let delivery_id = manifest_id(&content_sha, rel);
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let (mode, root) = self.pipeline.configured_delivery();
+            self.pipeline
+                .ledger
+                .ingest_with_delivery(
+                    &delivery_id,
+                    &path.to_string_lossy(),
+                    &name,
+                    rel,
+                    "pdf",
+                    mode,
+                    &root,
+                    &self.pipeline.cfg.processing_dir.to_string_lossy(),
+                    &content_sha,
+                )
+                .unwrap();
+            // The ledger's display-oriented duplicate field historically
+            // stores the first reserved filename. Manifest duplicate_of must
+            // still use the true content hash rather than copying this value.
+            self.pipeline
+                .ledger
+                .update_fields(
+                    &delivery_id,
+                    &[("duplicate_of", Some("already-filed.pdf".into()))],
+                )
+                .unwrap();
+            (delivery_id, content_sha, path)
         }
 
         fn manifest(&self, sha: &str, rel: &str) -> Option<Manifest> {
@@ -2101,6 +3410,1465 @@ mod tests {
             names.sort();
             names
         }
+    }
+
+    #[test]
+    fn local_planned_quarantine_recovers_after_settings_switch_without_pa_manifest() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let source = h.pipeline.cfg.processing_dir.join("nested/scan.pdf");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"planned quarantine").unwrap();
+        let sha = hash_file(&source).unwrap();
+        let rel = "nested/scan.pdf";
+        let name = "scan.pdf";
+        h.pipeline
+            .ledger
+            .ingest_with_delivery(
+                &sha,
+                &source.to_string_lossy(),
+                name,
+                rel,
+                "pdf",
+                "local",
+                &h.pipeline.cfg.local_output_dir.to_string_lossy(),
+                &h.pipeline.cfg.processing_dir.to_string_lossy(),
+                &sha,
+            )
+            .unwrap();
+        let mid = manifest_id(&sha, rel);
+        let planned = h.pipeline.quarantine_dest(&mid, &source);
+        std::fs::rename(&source, &planned).unwrap();
+        h.pipeline
+            .ledger
+            .update_fields(
+                &sha,
+                &[
+                    ("flag_reason", Some("TEST:planned".into())),
+                    (
+                        "quarantine_planned_path",
+                        Some(planned.to_string_lossy().into_owned()),
+                    ),
+                    (
+                        "quarantine_root",
+                        Some(h.pipeline.cfg.quarantine_dir.to_string_lossy().into_owned()),
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let mut switched = h.pipeline.cfg.clone();
+        switched.output_mode = crate::config::OutputMode::PowerAutomate;
+        switched.outbox_dir = h.dir.path().join("different-pa-outbox");
+        assert_eq!(
+            reconcile_terminal_manifests(&switched, &h.pipeline.ledger).unwrap(),
+            1
+        );
+        let job = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(job.state, JobState::Flagged);
+        assert_eq!(job.quarantine_path.as_deref(), planned.to_str());
+        assert!(
+            local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &mid)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!switched
+            .manifests_dir()
+            .join(format!("{mid}.json"))
+            .exists());
+    }
+
+    #[test]
+    fn corrupt_first_local_intent_does_not_block_later_quarantine_recovery() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+
+        // This row sorts first. Its durable intent is poisoned, so recovery
+        // must fail closed for this row alone without preventing the later
+        // planned-quarantine transaction from becoming reviewable.
+        let poison_source = h.pipeline.cfg.processing_dir.join("a/poison.pdf");
+        std::fs::create_dir_all(poison_source.parent().unwrap()).unwrap();
+        std::fs::write(&poison_source, b"poisoned intent bytes").unwrap();
+        let poison_sha = hash_file(&poison_source).unwrap();
+        h.pipeline
+            .ledger
+            .ingest_with_delivery(
+                &poison_sha,
+                &poison_source.to_string_lossy(),
+                "poison.pdf",
+                "a/poison.pdf",
+                "pdf",
+                "local",
+                &h.pipeline.cfg.local_output_dir.to_string_lossy(),
+                &h.pipeline.cfg.processing_dir.to_string_lossy(),
+                &poison_sha,
+            )
+            .unwrap();
+        let poison_job = h.pipeline.ledger.get(&poison_sha).unwrap().unwrap();
+        let poison_delivery = poison_job.delivery_id.clone();
+        let intents = h.pipeline.cfg.local_output_dir.join(".backlog/intents");
+        std::fs::create_dir_all(&intents).unwrap();
+        let poisoned_manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: poison_delivery.clone(),
+            sha256: poison_sha.clone(),
+            status: "ok".into(),
+            original_name: poison_job.original_name.clone(),
+            // Structurally valid JSON and Manifest, but not this delivery's
+            // ledger-owned path. Recovery must reject it before publication.
+            original_relpath: "other/poison.pdf".into(),
+            new_filename: Some("2026-08-04 Poison.pdf".into()),
+            description: Some("Tampered but otherwise valid intent.".into()),
+            date: Some("2026-08-04".into()),
+            date_source: Some("document".into()),
+            doc_type: Some("document".into()),
+            language: Some("en".into()),
+            duplicate_of: None,
+            soft_flags: vec![],
+            flag_reason: None,
+            model_versions: json!({"convertd": "test"}),
+            processed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let poisoned_receipt = local_output::Receipt {
+            receipt_schema: 1,
+            delivery_mode: "local".into(),
+            output_relpath: poisoned_manifest.new_filename.clone(),
+            source_root: h.pipeline.cfg.processing_dir.to_string_lossy().into_owned(),
+            source_path: poison_source.to_string_lossy().into_owned(),
+            manifest: poisoned_manifest,
+        };
+        let mut poisoned_intent = serde_json::to_value(poisoned_receipt).unwrap();
+        let object = poisoned_intent.as_object_mut().unwrap();
+        object.insert("intent_schema".into(), json!(1));
+        object.insert("output_base_name".into(), json!("2026-08-04 Poison.pdf"));
+        let poisoned_intent = serde_json::to_vec(&poisoned_intent).unwrap();
+        let poisoned_intent_path = intents.join(format!("{poison_delivery}.json"));
+        std::fs::write(&poisoned_intent_path, &poisoned_intent).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let valid_source = h.pipeline.cfg.processing_dir.join("z/valid.pdf");
+        std::fs::create_dir_all(valid_source.parent().unwrap()).unwrap();
+        std::fs::write(&valid_source, b"later planned quarantine bytes").unwrap();
+        let valid_sha = hash_file(&valid_source).unwrap();
+        h.pipeline
+            .ledger
+            .ingest_with_delivery(
+                &valid_sha,
+                &valid_source.to_string_lossy(),
+                "valid.pdf",
+                "z/valid.pdf",
+                "pdf",
+                "local",
+                &h.pipeline.cfg.local_output_dir.to_string_lossy(),
+                &h.pipeline.cfg.processing_dir.to_string_lossy(),
+                &valid_sha,
+            )
+            .unwrap();
+        let valid_delivery = h
+            .pipeline
+            .ledger
+            .get(&valid_sha)
+            .unwrap()
+            .unwrap()
+            .delivery_id;
+        let planned = h.pipeline.quarantine_dest(&valid_delivery, &valid_source);
+        std::fs::rename(&valid_source, &planned).unwrap();
+        h.pipeline
+            .ledger
+            .update_fields(
+                &valid_sha,
+                &[
+                    ("flag_reason", Some("TEST:planned quarantine".into())),
+                    (
+                        "quarantine_planned_path",
+                        Some(planned.to_string_lossy().into_owned()),
+                    ),
+                    (
+                        "quarantine_root",
+                        Some(h.pipeline.cfg.quarantine_dir.to_string_lossy().into_owned()),
+                    ),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            1
+        );
+        assert_eq!(
+            h.pipeline.ledger.get(&poison_sha).unwrap().unwrap().state,
+            JobState::Ingested,
+            "the poisoned row remains untouched for a safe later retry"
+        );
+        assert!(
+            poison_source.exists(),
+            "invalid intent must not delete its source"
+        );
+        assert!(
+            !h.pipeline
+                .cfg
+                .local_output_dir
+                .join("2026-08-04 Poison.pdf")
+                .exists(),
+            "invalid intent must not publish an output"
+        );
+        assert!(
+            local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &poison_delivery)
+                .unwrap()
+                .is_none(),
+            "invalid intent must not create a receipt"
+        );
+        assert_eq!(
+            std::fs::read(&poisoned_intent_path).unwrap(),
+            poisoned_intent,
+            "invalid intent is retained byte-for-byte for a later safe diagnosis"
+        );
+        let recovered = h.pipeline.ledger.get(&valid_sha).unwrap().unwrap();
+        assert_eq!(recovered.state, JobState::Flagged);
+        assert_eq!(recovered.quarantine_path.as_deref(), planned.to_str());
+        assert!(planned.exists());
+    }
+
+    #[test]
+    fn local_intent_cannot_change_the_reserved_output_filename() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "ordinary/pinned-name.pdf";
+        let source = h.pipeline.cfg.processing_dir.join(rel);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"pinned output intent bytes").unwrap();
+        let sha = hash_file(&source).unwrap();
+        h.pipeline
+            .ledger
+            .ingest_with_delivery(
+                &sha,
+                &source.to_string_lossy(),
+                "pinned-name.pdf",
+                rel,
+                "pdf",
+                "local",
+                &h.pipeline.cfg.local_output_dir.to_string_lossy(),
+                &h.pipeline.cfg.processing_dir.to_string_lossy(),
+                &sha,
+            )
+            .unwrap();
+        h.pipeline
+            .ledger
+            .update_fields(
+                &sha,
+                &[
+                    ("final_filename", Some("2026-08-04 Pinned Name.pdf".into())),
+                    ("proposed_date", Some("2026-08-04".into())),
+                    ("date_source", Some("document".into())),
+                    (
+                        "description",
+                        Some("A document with a ledger-pinned output name.".into()),
+                    ),
+                    ("doc_type", Some("document".into())),
+                    ("language", Some("en".into())),
+                    ("soft_flags", Some("SOURCE_CONFIRMED".into())),
+                    (
+                        "model_versions",
+                        Some(json!({"convertd": "test"}).to_string()),
+                    ),
+                ],
+            )
+            .unwrap();
+        let before = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: before.delivery_id.clone(),
+            sha256: before.content_sha256.clone(),
+            status: "ok".into(),
+            original_name: before.original_name.clone(),
+            original_relpath: rel.into(),
+            // Every other field is the exact persisted contract. Only this
+            // filename (and the matching receipt/base pair below) is tampered.
+            new_filename: Some("2026-08-04 Pinned Name (2).pdf".into()),
+            description: before.description.clone(),
+            date: before.proposed_date.clone(),
+            date_source: before.date_source.clone(),
+            doc_type: before.doc_type.clone(),
+            language: before.language.clone(),
+            duplicate_of: None,
+            soft_flags: vec!["SOURCE_CONFIRMED".into()],
+            flag_reason: None,
+            model_versions: serde_json::from_str(before.model_versions.as_deref().unwrap())
+                .unwrap(),
+            processed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let receipt = local_output::Receipt {
+            receipt_schema: 1,
+            delivery_mode: "local".into(),
+            output_relpath: manifest.new_filename.clone(),
+            source_root: h.pipeline.cfg.processing_dir.to_string_lossy().into_owned(),
+            source_path: source.to_string_lossy().into_owned(),
+            manifest,
+        };
+        let mut intent = serde_json::to_value(receipt).unwrap();
+        let object = intent.as_object_mut().unwrap();
+        object.insert("intent_schema".into(), json!(1));
+        object.insert(
+            "output_base_name".into(),
+            json!("2026-08-04 Pinned Name.pdf"),
+        );
+        let intent = serde_json::to_vec(&intent).unwrap();
+        let intent_path = h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join(".backlog/intents")
+            .join(format!("{}.json", before.delivery_id));
+        std::fs::create_dir_all(intent_path.parent().unwrap()).unwrap();
+        std::fs::write(&intent_path, &intent).unwrap();
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            0
+        );
+        let after = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert!(source.exists());
+        assert!(!h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join("2026-08-04 Pinned Name (2).pdf")
+            .exists());
+        assert!(
+            local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &before.delivery_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(intent_path).unwrap(), intent);
+    }
+
+    #[test]
+    fn local_collision_recovery_resumes_after_ledger_then_intent_crash() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "ordinary/collision-restart.pdf";
+        let source = h.pipeline.cfg.processing_dir.join(rel);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"ledger-bound local collision recovery").unwrap();
+        let sha = hash_file(&source).unwrap();
+        let initial = "2026-08-04 Collision Restart.pdf";
+        h.pipeline
+            .ledger
+            .ingest_with_delivery(
+                &sha,
+                &source.to_string_lossy(),
+                "collision-restart.pdf",
+                rel,
+                "pdf",
+                "local",
+                &h.pipeline.cfg.local_output_dir.to_string_lossy(),
+                &h.pipeline.cfg.processing_dir.to_string_lossy(),
+                &sha,
+            )
+            .unwrap();
+        h.pipeline
+            .ledger
+            .update_fields(
+                &sha,
+                &[
+                    ("final_filename", Some(initial.into())),
+                    ("proposed_date", Some("2026-08-04".into())),
+                    ("date_source", Some("document".into())),
+                    (
+                        "description",
+                        Some("A document that must resume its collision recovery.".into()),
+                    ),
+                    ("doc_type", Some("document".into())),
+                    ("language", Some("en".into())),
+                    ("soft_flags", Some("SOURCE_CONFIRMED".into())),
+                    (
+                        "model_versions",
+                        Some(json!({"convertd": "test"}).to_string()),
+                    ),
+                ],
+            )
+            .unwrap();
+        let job = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: job.delivery_id.clone(),
+            sha256: job.content_sha256.clone(),
+            status: "ok".into(),
+            original_name: job.original_name.clone(),
+            original_relpath: rel.into(),
+            new_filename: Some(initial.into()),
+            description: job.description.clone(),
+            date: job.proposed_date.clone(),
+            date_source: job.date_source.clone(),
+            doc_type: job.doc_type.clone(),
+            language: job.language.clone(),
+            duplicate_of: None,
+            soft_flags: vec!["SOURCE_CONFIRMED".into()],
+            flag_reason: None,
+            model_versions: serde_json::from_str(job.model_versions.as_deref().unwrap()).unwrap(),
+            processed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let receipt = local_output::Receipt {
+            receipt_schema: 1,
+            delivery_mode: "local".into(),
+            output_relpath: manifest.new_filename.clone(),
+            source_root: h.pipeline.cfg.processing_dir.to_string_lossy().into_owned(),
+            source_path: source.to_string_lossy().into_owned(),
+            manifest,
+        };
+        let mut intent = serde_json::to_value(receipt).unwrap();
+        let object = intent.as_object_mut().unwrap();
+        object.insert("intent_schema".into(), json!(1));
+        object.insert("output_base_name".into(), json!(initial));
+        let intent_path = h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join(".backlog/intents")
+            .join(format!("{}.json", job.delivery_id));
+        std::fs::create_dir_all(intent_path.parent().unwrap()).unwrap();
+        std::fs::write(&intent_path, serde_json::to_vec(&intent).unwrap()).unwrap();
+        std::fs::write(
+            h.pipeline.cfg.local_output_dir.join(initial),
+            b"someone else's file",
+        )
+        .unwrap();
+
+        let injected = local_output::recover_intent_with_name_sync_for_test(
+            &h.pipeline.cfg.local_output_dir,
+            &job.delivery_id,
+            initial,
+            |expected, candidate| {
+                h.pipeline
+                    .ledger
+                    .advance_local_recovery_filename(&sha, expected, candidate)
+            },
+            || {
+                Err(anyhow::anyhow!(
+                    "injected crash after durable intent rewrite"
+                ))
+            },
+        );
+        assert!(injected.is_err());
+        let after_crash = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let recovered_name = "2026-08-04 Collision Restart (2).pdf";
+        assert_eq!(after_crash.final_filename.as_deref(), Some(recovered_name));
+        assert_eq!(
+            after_crash.recovery_previous_filename.as_deref(),
+            Some(initial)
+        );
+        assert!(source.exists());
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            1
+        );
+        let complete = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(complete.state, JobState::Emitted);
+        assert_eq!(complete.final_filename.as_deref(), Some(recovered_name));
+        assert!(complete.recovery_previous_filename.is_none());
+        assert!(!source.exists());
+        assert_eq!(
+            hash_file(&h.pipeline.cfg.local_output_dir.join(recovered_name)).unwrap(),
+            sha
+        );
+    }
+
+    #[test]
+    fn live_local_collision_recovers_when_ledger_advances_before_intent_for_ordinary_and_duplicate()
+    {
+        for duplicate in [false, true] {
+            let h = Harness::with(|cfg| {
+                cfg.output_mode = crate::config::OutputMode::Local;
+                cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+            });
+            let kind = if duplicate { "duplicate" } else { "ordinary" };
+            let rel = format!("live-boundary/{kind}.pdf");
+            let source = h.pipeline.cfg.processing_dir.join(&rel);
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            let body = format!("live ledger-before-intent recovery for {kind}");
+            std::fs::write(&source, body.as_bytes()).unwrap();
+            let content_sha = hash_file(&source).unwrap();
+            let row_key = if duplicate {
+                manifest_id(&content_sha, &rel)
+            } else {
+                content_sha.clone()
+            };
+            let base = format!("2026-08-04 Live {kind}");
+            let initial = format!("{base}.pdf");
+            let recovered_name = format!("{base} (2).pdf");
+            let soft_flags = if duplicate {
+                vec!["DUPLICATE_CONTENT".to_string()]
+            } else {
+                vec!["SOURCE_CONFIRMED".to_string()]
+            };
+
+            h.pipeline
+                .ledger
+                .ingest_with_delivery(
+                    &row_key,
+                    &source.to_string_lossy(),
+                    &format!("{kind}.pdf"),
+                    &rel,
+                    "pdf",
+                    "local",
+                    &h.pipeline.cfg.local_output_dir.to_string_lossy(),
+                    &h.pipeline.cfg.processing_dir.to_string_lossy(),
+                    &content_sha,
+                )
+                .unwrap();
+            h.pipeline
+                .ledger
+                .update_fields(
+                    &row_key,
+                    &[
+                        ("final_filename", Some(initial.clone())),
+                        ("proposed_date", Some("2026-08-04".into())),
+                        ("date_source", Some("document".into())),
+                        (
+                            "description",
+                            Some(format!(
+                                "A {kind} document crossing the live collision gap."
+                            )),
+                        ),
+                        ("doc_type", Some("document".into())),
+                        ("language", Some("en".into())),
+                        ("soft_flags", Some(soft_flags.join(","))),
+                        (
+                            "model_versions",
+                            Some(json!({"convertd": "test"}).to_string()),
+                        ),
+                    ],
+                )
+                .unwrap();
+            let job = h.pipeline.ledger.get(&row_key).unwrap().unwrap();
+            let manifest = Manifest {
+                schema: MANIFEST_SCHEMA_VERSION,
+                manifest_id: job.delivery_id.clone(),
+                sha256: content_sha.clone(),
+                status: "ok".into(),
+                original_name: job.original_name.clone(),
+                original_relpath: rel.clone(),
+                new_filename: Some(initial.clone()),
+                description: job.description.clone(),
+                date: job.proposed_date.clone(),
+                date_source: job.date_source.clone(),
+                doc_type: job.doc_type.clone(),
+                language: job.language.clone(),
+                duplicate_of: duplicate.then_some(content_sha.clone()),
+                soft_flags,
+                flag_reason: None,
+                model_versions: serde_json::from_str(job.model_versions.as_deref().unwrap())
+                    .unwrap(),
+                processed_at: chrono::Utc::now().to_rfc3339(),
+            };
+            std::fs::create_dir_all(&h.pipeline.cfg.local_output_dir).unwrap();
+            std::fs::write(
+                h.pipeline.cfg.local_output_dir.join(&initial),
+                b"unrelated operator file",
+            )
+            .unwrap();
+
+            assert_eq!(
+                local_output::deliver_with_collision_base(
+                    &h.pipeline.cfg.local_output_dir,
+                    &h.pipeline.cfg.processing_dir,
+                    &source,
+                    &initial,
+                    &manifest,
+                )
+                .unwrap(),
+                DeliverResult::NameCollision
+            );
+            assert_eq!(
+                h.pipeline
+                    .ledger
+                    .advance_local_recovery_name_from(&base, "pdf", &row_key, &initial, 2)
+                    .unwrap()
+                    .as_deref(),
+                Some(recovered_name.as_str())
+            );
+
+            // This is the exact live crash gap: the ledger moved, while the
+            // already-durable intent still names the collided predecessor.
+            let intent_path = h
+                .pipeline
+                .cfg
+                .local_output_dir
+                .join(".backlog/intents")
+                .join(format!("{}.json", job.delivery_id));
+            let intent: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&intent_path).unwrap()).unwrap();
+            assert_eq!(intent["new_filename"].as_str(), Some(initial.as_str()));
+            let after_advance = h.pipeline.ledger.get(&row_key).unwrap().unwrap();
+            assert_eq!(
+                after_advance.final_filename.as_deref(),
+                Some(recovered_name.as_str())
+            );
+            assert_eq!(
+                after_advance.recovery_previous_filename.as_deref(),
+                Some(initial.as_str())
+            );
+
+            assert_eq!(
+                reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+                1
+            );
+            let recovered = h.pipeline.ledger.get(&row_key).unwrap().unwrap();
+            assert_eq!(recovered.state, JobState::Emitted);
+            assert_eq!(
+                recovered.final_filename.as_deref(),
+                Some(recovered_name.as_str())
+            );
+            assert!(recovered.recovery_previous_filename.is_none());
+            assert!(!source.exists());
+            assert_eq!(
+                std::fs::read(h.pipeline.cfg.local_output_dir.join(&initial)).unwrap(),
+                b"unrelated operator file"
+            );
+            assert_eq!(
+                std::fs::read(h.pipeline.cfg.local_output_dir.join(&recovered_name)).unwrap(),
+                body.as_bytes()
+            );
+            let receipt =
+                local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &job.delivery_id)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                receipt.manifest.duplicate_of,
+                duplicate.then_some(content_sha)
+            );
+        }
+    }
+
+    #[test]
+    fn local_duplicate_receipt_recovery_uses_pinned_content_and_processing_root() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let old_processing = h.pipeline.cfg.processing_dir.clone();
+        let source = old_processing.join("copy.pdf");
+        std::fs::write(&source, b"same physical duplicate").unwrap();
+        let content_sha = hash_file(&source).unwrap();
+        let rel = "copy.pdf";
+        let duplicate_id = manifest_id(&content_sha, rel);
+        h.pipeline
+            .ledger
+            .ingest_with_delivery(
+                &duplicate_id,
+                &source.to_string_lossy(),
+                "copy.pdf",
+                rel,
+                "pdf",
+                "local",
+                &h.pipeline.cfg.local_output_dir.to_string_lossy(),
+                &old_processing.to_string_lossy(),
+                &content_sha,
+            )
+            .unwrap();
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: duplicate_id.clone(),
+            sha256: content_sha.clone(),
+            status: "ok".into(),
+            original_name: "copy.pdf".into(),
+            original_relpath: rel.into(),
+            new_filename: Some("copy (2).pdf".into()),
+            description: Some("duplicate receipt interruption".into()),
+            date: Some("2026-08-04".into()),
+            date_source: Some("document".into()),
+            doc_type: Some("document".into()),
+            language: Some("en".into()),
+            duplicate_of: Some(content_sha.clone()),
+            soft_flags: vec!["DUPLICATE_CONTENT".into()],
+            flag_reason: None,
+            model_versions: json!({ "convertd": "test" }),
+            processed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        // Simulate death after durable receipt/output but before the final
+        // source deletion and ledger state transition.
+        local_output::deliver(
+            &h.pipeline.cfg.local_output_dir,
+            &old_processing,
+            &source,
+            &manifest,
+        )
+        .unwrap();
+        std::fs::write(&source, b"same physical duplicate").unwrap();
+        assert_eq!(
+            h.pipeline.ledger.get(&duplicate_id).unwrap().unwrap().state,
+            JobState::Ingested
+        );
+
+        let mut switched = h.pipeline.cfg.clone();
+        switched.processing_dir = h.dir.path().join("different-processing");
+        std::fs::create_dir_all(&switched.processing_dir).unwrap();
+        assert_eq!(
+            reconcile_terminal_manifests(&switched, &h.pipeline.ledger).unwrap(),
+            1
+        );
+        let job = h.pipeline.ledger.get(&duplicate_id).unwrap().unwrap();
+        assert_eq!(job.content_sha256, content_sha);
+        assert_eq!(job.state, JobState::Emitted);
+        assert!(!source.exists());
+        assert!(h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join("copy (2).pdf")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn tampered_flagged_review_output_pair_preserves_row_source_and_lease() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "review/tampered-output.pdf";
+        let body = b"flagged review output pair bytes";
+        let (sha, source) = h.seed(rel, std::str::from_utf8(body).unwrap());
+        h.pipeline
+            .flag(&sha, &source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let owner = h
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "correct")
+            .unwrap()
+            .unwrap();
+        let before = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let quarantined = PathBuf::from(before.quarantine_path.as_ref().unwrap());
+        let receipt_path = h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join(".backlog/receipts")
+            .join(format!("{}.json", before.delivery_id));
+        let mut receipt =
+            local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &before.delivery_id)
+                .unwrap()
+                .unwrap();
+
+        receipt.output_relpath = Some("must-not-exist.pdf".into());
+        std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let output_relpath_tamper = std::fs::read(&receipt_path).unwrap();
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), output_relpath_tamper);
+        assert_eq!(std::fs::read(&quarantined).unwrap(), body);
+        assert!(!source.exists());
+        assert!(!h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join("must-not-exist.pdf")
+            .exists());
+        let after_output_tamper = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after_output_tamper).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(
+            after_output_tamper.review_owner.as_deref(),
+            Some(owner.as_str())
+        );
+
+        receipt.output_relpath = None;
+        receipt.manifest.new_filename = Some("also-must-not-exist.pdf".into());
+        std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let manifest_name_tamper = std::fs::read(&receipt_path).unwrap();
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), manifest_name_tamper);
+        assert_eq!(std::fs::read(&quarantined).unwrap(), body);
+        assert!(!h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join("also-must-not-exist.pdf")
+            .exists());
+        let after_manifest_tamper = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after_manifest_tamper).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(
+            after_manifest_tamper.review_owner.as_deref(),
+            Some(owner.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_dismissed_review_source_preserves_row_files_and_competing_lease() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "review/tampered-dismissal-source.pdf";
+        let body = b"dismissed review source provenance bytes";
+        let (sha, source) = h.seed(rel, std::str::from_utf8(body).unwrap());
+        h.pipeline
+            .flag(&sha, &source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let flagged = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let quarantine_root = PathBuf::from(flagged.quarantine_root.as_ref().unwrap());
+        let quarantined = PathBuf::from(flagged.quarantine_path.as_ref().unwrap());
+        let mut dismissal =
+            local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &flagged.delivery_id)
+                .unwrap()
+                .unwrap()
+                .manifest;
+        dismissal.status = "dismissed".into();
+        dismissal.flag_reason = Some("DISMISSED:reviewed".into());
+        local_output::record_review(
+            &h.pipeline.cfg.local_output_dir,
+            &quarantine_root,
+            &quarantined,
+            &dismissal,
+        )
+        .unwrap();
+        let owner = h
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "correct")
+            .unwrap()
+            .unwrap();
+        let before = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let receipt_path = h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join(".backlog/receipts")
+            .join(format!("{}.json", before.delivery_id));
+        let mut receipt =
+            local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &before.delivery_id)
+                .unwrap()
+                .unwrap();
+
+        let other_root = h.dir.path().join("other-quarantine");
+        std::fs::create_dir_all(&other_root).unwrap();
+        receipt.source_root = other_root.to_string_lossy().into_owned();
+        std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let root_tamper = std::fs::read(&receipt_path).unwrap();
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), root_tamper);
+        assert_eq!(std::fs::read(&quarantined).unwrap(), body);
+        let after_root_tamper = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after_root_tamper).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(
+            after_root_tamper.review_owner.as_deref(),
+            Some(owner.as_str())
+        );
+
+        let alternate = quarantine_root.join("alternate-same-content.pdf");
+        std::fs::write(&alternate, body).unwrap();
+        receipt.source_root = quarantine_root.to_string_lossy().into_owned();
+        receipt.source_path = alternate.to_string_lossy().into_owned();
+        std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let path_tamper = std::fs::read(&receipt_path).unwrap();
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), path_tamper);
+        assert_eq!(std::fs::read(&quarantined).unwrap(), body);
+        assert_eq!(std::fs::read(&alternate).unwrap(), body);
+        assert!(!source.exists());
+        let after_path_tamper = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after_path_tamper).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(
+            after_path_tamper.review_owner.as_deref(),
+            Some(owner.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn correction_delete_failure_preserves_durable_collision_for_startup_recovery() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "review/delete-failure-collision.pdf";
+        let body = b"corrected delivery survives delete failure";
+        let (sha, processing_source) = h.seed(rel, std::str::from_utf8(body).unwrap());
+        h.pipeline
+            .flag(&sha, &processing_source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let flagged = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert!(
+            flagged.final_filename.is_none(),
+            "the regression must begin without a masked reservation"
+        );
+        let quarantined = PathBuf::from(flagged.quarantine_path.as_ref().unwrap());
+        let base_name = "2024-03-05 Acme Corporation Invoice March.pdf";
+        std::fs::write(
+            h.pipeline.cfg.local_output_dir.join(base_name),
+            b"unrelated operator file",
+        )
+        .unwrap();
+
+        let (date, subject, description) = correction();
+        let error = h
+            .pipeline
+            .resubmit_with_owner_and_remove(&sha, date, subject, description, None, |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected correction source-delete failure",
+                ))
+            })
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected correction source-delete failure"));
+
+        let pending = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let corrected_name = "2024-03-05 Acme Corporation Invoice March (2).pdf";
+        assert_eq!(pending.state, JobState::Flagged);
+        assert_eq!(pending.final_filename.as_deref(), Some(corrected_name));
+        assert_eq!(
+            pending.recovery_previous_filename.as_deref(),
+            Some(base_name)
+        );
+        assert_eq!(pending.review_operation.as_deref(), Some("correct"));
+        assert!(pending.review_owner.is_some());
+        assert!(quarantined.exists());
+        let receipt =
+            local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &pending.delivery_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(receipt.manifest.status, "ok");
+        assert_eq!(
+            receipt.manifest.new_filename.as_deref(),
+            Some(corrected_name)
+        );
+        assert_eq!(
+            std::fs::read(h.pipeline.cfg.local_output_dir.join(base_name)).unwrap(),
+            b"unrelated operator file"
+        );
+        assert_eq!(
+            std::fs::read(h.pipeline.cfg.local_output_dir.join(corrected_name)).unwrap(),
+            body
+        );
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            1
+        );
+        let recovered = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(recovered.state, JobState::Emitted);
+        assert_eq!(recovered.final_filename.as_deref(), Some(corrected_name));
+        assert!(recovered.recovery_previous_filename.is_none());
+        assert!(recovered.review_operation.is_none());
+        assert!(recovered.review_owner.is_none());
+        assert!(recovered.quarantine_path.is_none());
+        assert!(!quarantined.exists());
+        assert!(!processing_source.exists());
+        assert_eq!(
+            std::fs::read(h.pipeline.cfg.local_output_dir.join(base_name)).unwrap(),
+            b"unrelated operator file"
+        );
+        assert_eq!(
+            std::fs::read(h.pipeline.cfg.local_output_dir.join(corrected_name)).unwrap(),
+            body
+        );
+        assert_eq!(
+            std::fs::read_dir(h.pipeline.cfg.local_output_dir.join(".backlog/receipts"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(&h.pipeline.cfg.local_output_dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().is_file())
+                .count(),
+            2,
+            "one unrelated file plus exactly one corrected output"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_correction_without_durable_artifact_rolls_back_name_and_lease() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "review/no-durable-artifact.pdf";
+        let (sha, source) = h.seed(rel, "original review bytes");
+        h.pipeline
+            .flag(&sha, &source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let flagged = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let quarantined = PathBuf::from(flagged.quarantine_path.as_ref().unwrap());
+        std::fs::write(&quarantined, b"changed before correction").unwrap();
+
+        let (date, subject, description) = correction();
+        assert!(h
+            .pipeline
+            .resubmit(&sha, date, subject, description)
+            .await
+            .is_err());
+
+        let after = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(after.state, JobState::Flagged);
+        assert!(after.final_filename.is_none());
+        assert!(after.recovery_previous_filename.is_none());
+        assert!(after.review_operation.is_none());
+        assert!(after.review_owner.is_none());
+        assert_eq!(after.quarantine_path.as_deref(), quarantined.to_str());
+        assert!(quarantined.exists());
+        let receipt =
+            local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &after.delivery_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(receipt.manifest.status, "flagged");
+        assert!(!h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join(".backlog/intents")
+            .join(format!("{}.json", after.delivery_id))
+            .is_file());
+        assert_eq!(
+            std::fs::read_dir(&h.pipeline.cfg.local_output_dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().is_file())
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_local_correction_recovery_deletes_only_pinned_quarantine_source() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "review/scan.pdf";
+        let (sha, processing_source) = h.seed(rel, "corrected quarantine bytes");
+        h.pipeline
+            .flag(&sha, &processing_source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        h.pipeline
+            .ledger
+            .update_fields(
+                &sha,
+                &[(
+                    "final_filename",
+                    Some("2024-03-05 Corrected Scan.pdf".into()),
+                )],
+            )
+            .unwrap();
+        let job = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let quarantine_source = PathBuf::from(job.quarantine_path.as_ref().unwrap());
+        let quarantine_root = PathBuf::from(job.quarantine_root.as_ref().unwrap());
+        let _owner = h
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "correct")
+            .unwrap()
+            .unwrap();
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: job.delivery_id.clone(),
+            sha256: job.content_sha256.clone(),
+            status: "ok".into(),
+            original_name: job.original_name.clone(),
+            original_relpath: rel.into(),
+            new_filename: Some("2024-03-05 Corrected Scan.pdf".into()),
+            description: Some("Corrected reviewed scan document.".into()),
+            date: Some("2024-03-05".into()),
+            date_source: Some("human".into()),
+            doc_type: Some("document".into()),
+            language: Some("en".into()),
+            duplicate_of: None,
+            soft_flags: vec!["HUMAN_CORRECTED".into()],
+            flag_reason: None,
+            model_versions: json!({"convertd": "test"}),
+            processed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let error = local_output::deliver_with_remove_for_test(
+            &h.pipeline.cfg.local_output_dir,
+            &quarantine_root,
+            &quarantine_source,
+            &manifest,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected quarantine delete failure",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected quarantine delete failure"));
+        assert!(quarantine_source.exists());
+        assert!(!processing_source.exists());
+        assert_eq!(
+            h.pipeline.ledger.get(&sha).unwrap().unwrap().state,
+            JobState::Flagged
+        );
+        assert!(
+            local_output::receipt_is_complete(&h.pipeline.cfg.local_output_dir, &manifest).unwrap()
+        );
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            1
+        );
+        let recovered = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(recovered.state, JobState::Emitted);
+        assert!(recovered.review_operation.is_none());
+        assert!(recovered.quarantine_path.is_none());
+        assert!(recovered.quarantine_planned_path.is_none());
+        assert!(recovered.quarantine_root.is_none());
+        assert!(!quarantine_source.exists());
+        assert!(!processing_source.exists());
+        assert_eq!(
+            std::fs::read_dir(h.pipeline.cfg.local_output_dir.join(".backlog/receipts"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(&h.pipeline.cfg.local_output_dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().is_file())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn local_conflicting_review_lease_leaves_intent_row_and_files_unchanged() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "review/lease-conflict.pdf";
+        let (sha, source) = h.seed(rel, "local review lease conflict bytes");
+        h.pipeline
+            .flag(&sha, &source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        h.pipeline
+            .ledger
+            .update_fields(
+                &sha,
+                &[
+                    (
+                        "final_filename",
+                        Some("2026-08-04 Lease Conflict.pdf".into()),
+                    ),
+                    ("proposed_date", Some("2026-08-04".into())),
+                    ("date_source", Some("human".into())),
+                    (
+                        "description",
+                        Some("A correction interrupted by a competing dismissal.".into()),
+                    ),
+                    ("doc_type", Some("document".into())),
+                    ("language", Some("en".into())),
+                    ("soft_flags", Some("HUMAN_CORRECTED".into())),
+                    (
+                        "model_versions",
+                        Some(json!({"convertd": "test"}).to_string()),
+                    ),
+                ],
+            )
+            .unwrap();
+        let job = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let quarantined = PathBuf::from(job.quarantine_path.as_ref().unwrap());
+        let quarantine_root = PathBuf::from(job.quarantine_root.as_ref().unwrap());
+        let owner = h
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "dismiss")
+            .unwrap()
+            .unwrap();
+        let before = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: before.delivery_id.clone(),
+            sha256: before.content_sha256.clone(),
+            status: "ok".into(),
+            original_name: before.original_name.clone(),
+            original_relpath: rel.into(),
+            new_filename: Some("2026-08-04 Lease Conflict.pdf".into()),
+            description: Some("A correction interrupted by a competing dismissal.".into()),
+            date: Some("2026-08-04".into()),
+            date_source: Some("human".into()),
+            doc_type: Some("document".into()),
+            language: Some("en".into()),
+            duplicate_of: None,
+            soft_flags: vec!["HUMAN_CORRECTED".into()],
+            flag_reason: None,
+            model_versions: json!({"convertd": "test"}),
+            processed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let receipt = local_output::Receipt {
+            receipt_schema: 1,
+            delivery_mode: "local".into(),
+            output_relpath: manifest.new_filename.clone(),
+            source_root: quarantine_root.to_string_lossy().into_owned(),
+            source_path: quarantined.to_string_lossy().into_owned(),
+            manifest,
+        };
+        let mut intent = serde_json::to_value(receipt).unwrap();
+        let object = intent.as_object_mut().unwrap();
+        object.insert("intent_schema".into(), json!(1));
+        object.insert(
+            "output_base_name".into(),
+            json!("2026-08-04 Lease Conflict.pdf"),
+        );
+        let intent = serde_json::to_vec(&intent).unwrap();
+        let intent_path = h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join(".backlog/intents")
+            .join(format!("{}.json", before.delivery_id));
+        std::fs::create_dir_all(intent_path.parent().unwrap()).unwrap();
+        std::fs::write(&intent_path, &intent).unwrap();
+        let flagged_receipt = std::fs::read(
+            h.pipeline
+                .cfg
+                .local_output_dir
+                .join(".backlog/receipts")
+                .join(format!("{}.json", before.delivery_id)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            0
+        );
+        let after = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(after.review_owner.as_deref(), Some(owner.as_str()));
+        assert!(quarantined.exists());
+        assert!(!source.exists());
+        assert!(!h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join("2026-08-04 Lease Conflict.pdf")
+            .exists());
+        assert_eq!(std::fs::read(&intent_path).unwrap(), intent);
+        assert_eq!(
+            std::fs::read(
+                h.pipeline
+                    .cfg
+                    .local_output_dir
+                    .join(".backlog/receipts")
+                    .join(format!("{}.json", before.delivery_id)),
+            )
+            .unwrap(),
+            flagged_receipt
+        );
+    }
+
+    #[tokio::test]
+    async fn pa_conflicting_review_lease_leaves_manifest_and_row_unchanged() {
+        let h = Harness::new();
+        let rel = "review/pa-lease-conflict.pdf";
+        let (sha, source) = h.seed(rel, "PA review lease conflict bytes");
+        h.pipeline
+            .flag(&sha, &source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let owner = h
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "dismiss")
+            .unwrap()
+            .unwrap();
+        let before = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let quarantined = PathBuf::from(before.quarantine_path.as_ref().unwrap());
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: before.delivery_id.clone(),
+            sha256: before.content_sha256.clone(),
+            status: "ok".into(),
+            original_name: before.original_name.clone(),
+            original_relpath: rel.into(),
+            new_filename: Some("2026-08-04 PA Lease Conflict.pdf".into()),
+            description: Some("A PA correction interrupted by a competing dismissal.".into()),
+            date: Some("2026-08-04".into()),
+            date_source: Some("human".into()),
+            doc_type: Some("document".into()),
+            language: Some("en".into()),
+            duplicate_of: None,
+            soft_flags: vec!["HUMAN_CORRECTED".into()],
+            flag_reason: None,
+            model_versions: json!({"convertd": "test"}),
+            processed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        write_manifest(&h.pipeline.cfg.manifests_dir(), &manifest).unwrap();
+        let manifest_path = h
+            .pipeline
+            .cfg
+            .manifests_dir()
+            .join(format!("{}.json", before.delivery_id));
+        let manifest_bytes = std::fs::read(&manifest_path).unwrap();
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            0
+        );
+        let after = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(after.review_owner.as_deref(), Some(owner.as_str()));
+        assert!(quarantined.exists());
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(manifest_path).unwrap(), manifest_bytes);
+    }
+
+    #[test]
+    fn pa_duplicate_manifest_recovers_by_pinned_delivery_id_after_source_is_gone() {
+        let h = Harness::new();
+        let rel = "copies/invoice.pdf";
+        let source = h.pipeline.cfg.processing_dir.join(rel);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"duplicate crash recovery bytes").unwrap();
+        let content_sha = hash_file(&source).unwrap();
+        let duplicate_id = manifest_id(&content_sha, rel);
+        h.pipeline
+            .ledger
+            .ingest_with_delivery(
+                &duplicate_id,
+                &source.to_string_lossy(),
+                "invoice.pdf",
+                rel,
+                "pdf",
+                "power_automate",
+                &h.pipeline.cfg.outbox_dir.to_string_lossy(),
+                &h.pipeline.cfg.processing_dir.to_string_lossy(),
+                &content_sha,
+            )
+            .unwrap();
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: duplicate_id.clone(),
+            sha256: content_sha.clone(),
+            status: "ok".into(),
+            original_name: "invoice.pdf".into(),
+            original_relpath: rel.into(),
+            new_filename: Some("2026-08-04 Invoice (2).pdf".into()),
+            description: Some("A duplicate committed before the ledger CAS.".into()),
+            date: Some("2026-08-04".into()),
+            date_source: Some("document".into()),
+            doc_type: Some("invoice".into()),
+            language: Some("en".into()),
+            duplicate_of: Some(content_sha.clone()),
+            soft_flags: vec!["DUPLICATE_CONTENT".into()],
+            flag_reason: None,
+            model_versions: json!({ "convertd": "test" }),
+            processed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        write_manifest(&h.pipeline.cfg.manifests_dir(), &manifest).unwrap();
+        std::fs::remove_file(&source).unwrap(); // Flow 2 consumed it before restart.
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            1
+        );
+        let job = h.pipeline.ledger.get(&duplicate_id).unwrap().unwrap();
+        assert_eq!(job.state, JobState::Emitted);
+        assert_eq!(job.delivery_id, duplicate_id);
+        assert_eq!(job.content_sha256, content_sha);
+    }
+
+    #[tokio::test]
+    async fn unresolved_same_content_copy_is_deferred_then_gets_its_own_duplicate_delivery() {
+        let h = Harness::new();
+        let (sha, original) = h.seed("a/original.pdf", "same content in two paths");
+        let copy = h.pipeline.cfg.processing_dir.join("b/copy.pdf");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::copy(&original, &copy).unwrap();
+        let copy_rel = "b/copy.pdf";
+        let duplicate_id = manifest_id(&sha, copy_rel);
+
+        let deferred = tokio::spawn(h.pipeline.clone().process_file(copy.clone()));
+        // Test retry timing maps one configured second to 10 ms. Resolve only
+        // after the former fixed 30 x 10 ms (300 ms) window has elapsed: the
+        // single enqueue must still create this copy's own delivery.
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        assert!(
+            copy.exists(),
+            "an unresolved original must not consume its copy"
+        );
+        assert!(h.pipeline.ledger.get(&duplicate_id).unwrap().is_none());
+        assert_eq!(
+            h.pipeline.ledger.get(&sha).unwrap().unwrap().state,
+            JobState::Ingested
+        );
+
+        h.pipeline
+            .ledger
+            .update_fields(
+                &sha,
+                &[
+                    ("final_filename", Some("original.pdf".into())),
+                    (
+                        "description",
+                        Some("Original duplicate fixture document.".into()),
+                    ),
+                    ("proposed_date", Some("2026-08-04".into())),
+                    ("date_source", Some("document".into())),
+                    ("doc_type", Some("document".into())),
+                    ("language", Some("en".into())),
+                ],
+            )
+            .unwrap();
+        h.pipeline
+            .ledger
+            .set_state(&sha, JobState::Emitted)
+            .unwrap();
+        deferred.await.unwrap();
+        let duplicate = h.pipeline.ledger.get(&duplicate_id).unwrap().unwrap();
+        assert_eq!(duplicate.state, JobState::Emitted);
+        assert_eq!(duplicate.delivery_id, duplicate_id);
+        assert_eq!(duplicate.content_sha256, sha);
+        assert!(
+            copy.exists(),
+            "PA duplicate delivery never deletes the physical copy"
+        );
     }
 
     /// What the model actually proposes, and what the checker says about it.
@@ -3062,6 +5830,264 @@ server.serve_forever()
         )
     }
 
+    fn durable_pa_correction(h: &Harness, sha: &str, rel: &str) -> Job {
+        let job = h.pipeline.ledger.get(sha).unwrap().unwrap();
+        let (date, subject, description) = correction();
+        let filename = h
+            .pipeline
+            .ledger
+            .reserve_name(&format!("{date} {subject}"), &job.ext, sha)
+            .unwrap();
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: job.delivery_id.clone(),
+            sha256: job.content_sha256.clone(),
+            status: "ok".into(),
+            original_name: job.original_name.clone(),
+            original_relpath: rel.into(),
+            new_filename: Some(filename),
+            description: Some(description),
+            date: Some(date),
+            date_source: Some("human".into()),
+            doc_type: job.doc_type.clone(),
+            language: job.language.clone(),
+            duplicate_of: manifest_duplicate_of(&job),
+            soft_flags: vec!["HUMAN_CORRECTED".into()],
+            flag_reason: None,
+            model_versions: json!({"convertd": "test"}),
+            processed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        write_manifest(&h.pipeline.cfg.manifests_dir(), &manifest).unwrap();
+        h.pipeline
+            .ledger
+            .begin_review_operation(sha, "correct")
+            .unwrap()
+            .expect("flagged correction must acquire its owner");
+        h.pipeline.ledger.get(sha).unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn pa_correction_restore_failure_stays_flagged_then_restart_converges() {
+        let h = Harness::new();
+        let rel = "restore/retry.pdf";
+        let (sha, processing) = h.seed(rel, "PA restore retry bytes");
+        h.pipeline
+            .flag(&sha, &processing, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let pending = durable_pa_correction(&h, &sha, rel);
+        let quarantined = PathBuf::from(pending.quarantine_path.as_ref().unwrap());
+        let before = serde_json::to_value(&pending).unwrap();
+
+        assert!(restore_power_automate_correction_with(
+            &h.pipeline.cfg,
+            &pending,
+            rel,
+            |_, _| Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected rename failure"
+            )),
+        )
+        .is_err());
+        assert_eq!(
+            serde_json::to_value(h.pipeline.ledger.get(&sha).unwrap().unwrap()).unwrap(),
+            before,
+            "rename failure must retain the exact flagged restoration record"
+        );
+        assert!(quarantined.exists());
+        assert!(!processing.exists());
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            1,
+            "restart must restore then terminalize the durable correction"
+        );
+        let complete = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(complete.state, JobState::Emitted);
+        assert!(complete.quarantine_path.is_none());
+        assert!(complete.quarantine_planned_path.is_none());
+        assert!(complete.quarantine_root.is_none());
+        assert!(processing.exists());
+        assert!(!quarantined.exists());
+    }
+
+    #[tokio::test]
+    async fn pa_correction_restart_after_move_before_terminal_cas_is_idempotent() {
+        let h = Harness::new();
+        let rel = "restore/after-move.pdf";
+        let (sha, processing) = h.seed(rel, "PA restore crash boundary bytes");
+        h.pipeline
+            .flag(&sha, &processing, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let pending = durable_pa_correction(&h, &sha, rel);
+        let quarantined = PathBuf::from(pending.quarantine_path.as_ref().unwrap());
+        restore_power_automate_correction(&h.pipeline.cfg, &pending, rel).unwrap();
+        assert!(processing.exists());
+        assert!(!quarantined.exists());
+        assert_eq!(
+            h.pipeline.ledger.get(&sha).unwrap().unwrap().state,
+            JobState::Flagged,
+            "models crash after the move and before the terminal CAS"
+        );
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            1
+        );
+        assert_eq!(
+            h.pipeline.ledger.get(&sha).unwrap().unwrap().state,
+            JobState::Emitted
+        );
+    }
+
+    #[tokio::test]
+    async fn pa_correction_restore_never_replaces_a_foreign_processing_file() {
+        let h = Harness::new();
+        let rel = "restore/foreign.pdf";
+        let (sha, processing) = h.seed(rel, "quarantined authoritative bytes");
+        h.pipeline
+            .flag(&sha, &processing, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let pending = durable_pa_correction(&h, &sha, rel);
+        let quarantined = PathBuf::from(pending.quarantine_path.as_ref().unwrap());
+        std::fs::create_dir_all(processing.parent().unwrap()).unwrap();
+        std::fs::write(&processing, b"foreign replacement").unwrap();
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            0
+        );
+        let after = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(after.state, JobState::Flagged);
+        assert_eq!(
+            after.quarantine_path.as_deref(),
+            pending.quarantine_path.as_deref()
+        );
+        assert_eq!(std::fs::read(&processing).unwrap(), b"foreign replacement");
+        assert_eq!(
+            std::fs::read(&quarantined).unwrap(),
+            b"quarantined authoritative bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_flagged_duplicate_correction_preserves_delivery_and_content_identity() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "copies/local-scan.pdf";
+        let body = b"local physical duplicate correction bytes";
+        let (ledger_key, content_sha, source) =
+            h.seed_duplicate(rel, std::str::from_utf8(body).unwrap());
+        assert_ne!(ledger_key, content_sha);
+
+        h.pipeline
+            .flag(
+                &ledger_key,
+                &source,
+                "SLM_FAIL:duplicate review".into(),
+                &clock(),
+            )
+            .await;
+        let flagged_job = h.pipeline.ledger.get(&ledger_key).unwrap().unwrap();
+        assert_eq!(flagged_job.state, JobState::Flagged);
+        let quarantined = PathBuf::from(flagged_job.quarantine_path.as_ref().unwrap());
+        assert_eq!(std::fs::read(&quarantined).unwrap(), body);
+        let flagged =
+            local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &flagged_job.delivery_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(flagged.manifest.manifest_id, ledger_key);
+        assert_eq!(flagged.manifest.sha256, content_sha);
+        assert_eq!(
+            flagged.manifest.duplicate_of.as_deref(),
+            Some(content_sha.as_str())
+        );
+
+        let (date, subject, description) = correction();
+        h.pipeline
+            .resubmit(&ledger_key, date, subject, description)
+            .await
+            .unwrap();
+
+        let receipt = local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &ledger_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.manifest.status, "ok");
+        assert_eq!(receipt.manifest.manifest_id, ledger_key);
+        assert_eq!(receipt.manifest.sha256, content_sha);
+        assert_eq!(
+            receipt.manifest.duplicate_of.as_deref(),
+            Some(content_sha.as_str())
+        );
+        let output = h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join(receipt.manifest.new_filename.as_deref().unwrap());
+        assert_eq!(std::fs::read(output).unwrap(), body);
+        assert!(!source.exists());
+        assert!(!quarantined.exists());
+        let corrected_job = h.pipeline.ledger.get(&ledger_key).unwrap().unwrap();
+        assert_eq!(corrected_job.state, JobState::Emitted);
+        assert!(corrected_job.quarantine_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn pa_flagged_duplicate_correction_preserves_delivery_and_content_identity() {
+        let h = Harness::new();
+        let rel = "copies/pa-scan.pdf";
+        let body = b"pa physical duplicate correction bytes";
+        let (ledger_key, content_sha, source) =
+            h.seed_duplicate(rel, std::str::from_utf8(body).unwrap());
+        assert_ne!(ledger_key, content_sha);
+
+        h.pipeline
+            .flag(
+                &ledger_key,
+                &source,
+                "SLM_FAIL:duplicate review".into(),
+                &clock(),
+            )
+            .await;
+        let flagged_job = h.pipeline.ledger.get(&ledger_key).unwrap().unwrap();
+        assert_eq!(flagged_job.state, JobState::Flagged);
+        let quarantined = PathBuf::from(flagged_job.quarantine_path.as_ref().unwrap());
+        assert_eq!(std::fs::read(&quarantined).unwrap(), body);
+        let manifest_path = h
+            .pipeline
+            .cfg
+            .manifests_dir()
+            .join(format!("{ledger_key}.json"));
+        let flagged: Manifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(flagged.manifest_id, ledger_key);
+        assert_eq!(flagged.sha256, content_sha);
+        assert_eq!(flagged.duplicate_of.as_deref(), Some(content_sha.as_str()));
+
+        let (date, subject, description) = correction();
+        h.pipeline
+            .resubmit(&ledger_key, date, subject, description)
+            .await
+            .unwrap();
+
+        let corrected: Manifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(corrected.status, "ok");
+        assert_eq!(corrected.manifest_id, ledger_key);
+        assert_eq!(corrected.sha256, content_sha);
+        assert_eq!(
+            corrected.duplicate_of.as_deref(),
+            Some(content_sha.as_str())
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), body);
+        assert!(!quarantined.exists());
+        assert_eq!(
+            h.pipeline.ledger.get(&ledger_key).unwrap().unwrap().state,
+            JobState::Emitted
+        );
+    }
+
     /// P4: a file from a Processing subfolder is the case that failed every
     /// time — the restore used the leaf name while the manifest id was
     /// recomputed from the full original path, so the identity assertion in
@@ -3103,6 +6129,439 @@ server.serve_forever()
         );
         assert!(!h.pipeline.cfg.processing_dir.join("invoice.pdf").exists());
         assert!(h.quarantine_entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_resubmit_after_settings_switch_commits_only_to_the_pinned_local_root() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("pinned-local");
+        });
+        let rel = "clients/acme/invoice.pdf";
+        let (sha, path) = h.seed(rel, "local correction bytes");
+        h.pipeline
+            .flag(&sha, &path, "SLM_FAIL:needs review".into(), &clock())
+            .await;
+        let flagged = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let quarantined = PathBuf::from(flagged.quarantine_path.unwrap());
+        let expected_bytes = std::fs::read(&quarantined).unwrap();
+        let pinned_local = h.pipeline.cfg.local_output_dir.clone();
+        let mut switched_cfg = h.pipeline.cfg.clone();
+        switched_cfg.output_mode = crate::config::OutputMode::PowerAutomate;
+        switched_cfg.outbox_dir = h.dir.path().join("new-pa-outbox");
+        std::fs::create_dir_all(&switched_cfg.outbox_dir).unwrap();
+        let restarted = h.restarted_with(switched_cfg.clone());
+
+        let (date, subject, description) = correction();
+        restarted
+            .resubmit(&sha, date, subject, description)
+            .await
+            .unwrap();
+
+        let mid = manifest_id(&sha, rel);
+        let receipt = local_output::read_receipt(&pinned_local, &mid)
+            .unwrap()
+            .expect("pinned Local root receives the correction receipt");
+        assert_eq!(receipt.manifest.status, "ok");
+        let output = pinned_local.join(
+            receipt
+                .manifest
+                .new_filename
+                .as_deref()
+                .expect("ok local receipt names its output"),
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), expected_bytes);
+        assert!(
+            !switched_cfg
+                .manifests_dir()
+                .join(format!("{mid}.json"))
+                .exists(),
+            "a stopped Settings switch must not redirect correction to PA"
+        );
+        assert!(
+            !quarantined.exists(),
+            "quarantine is removed only after the local output and receipt commit"
+        );
+        assert_eq!(
+            restarted.ledger.get(&sha).unwrap().unwrap().state,
+            JobState::Emitted
+        );
+
+        let receipt_json = serde_json::to_vec(&receipt).unwrap();
+        assert!(
+            restarted
+                .resubmit(&sha, correction().0, correction().1, correction().2)
+                .await
+                .is_err(),
+            "a stale second correction must not create another delivery"
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &local_output::read_receipt(&pinned_local, &mid)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            receipt_json
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), expected_bytes);
+    }
+
+    #[tokio::test]
+    async fn local_review_correct_lease_blocks_dismiss_and_commits_one_output() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "review/correct-wins.pdf";
+        let (sha, source) = h.seed(rel, "correct winner bytes");
+        h.pipeline
+            .flag(&sha, &source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let owner = h
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "correct")
+            .unwrap()
+            .unwrap();
+        let state = h.app_state();
+        assert!(crate::dismiss_inner(&state, &sha, "losing dismissal").is_err());
+        let (date, subject, description) = correction();
+        h.pipeline
+            .resubmit_with_owner(&sha, date, subject, description, Some(owner))
+            .await
+            .unwrap();
+        let job = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(job.state, JobState::Emitted);
+        assert!(job.quarantine_path.is_none());
+        let receipt =
+            local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &job.delivery_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(receipt.manifest.status, "ok");
+        assert_eq!(
+            std::fs::read_dir(&h.pipeline.cfg.local_output_dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().is_file())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn local_review_dismiss_lease_blocks_correction_and_retains_quarantine() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "review/dismiss-wins.pdf";
+        let (sha, source) = h.seed(rel, "dismiss winner bytes");
+        h.pipeline
+            .flag(&sha, &source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let before = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let quarantined = PathBuf::from(before.quarantine_path.as_ref().unwrap());
+        let owner = h
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "dismiss")
+            .unwrap()
+            .unwrap();
+        let (date, subject, description) = correction();
+        assert!(h
+            .pipeline
+            .resubmit(&sha, date, subject, description)
+            .await
+            .is_err());
+        let state = h.app_state();
+        assert!(h
+            .pipeline
+            .ledger
+            .release_review_operation(&sha, "dismiss", &owner)
+            .unwrap());
+        crate::dismiss_inner(&state, &sha, "dismiss winner").unwrap();
+
+        let job = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(job.state, JobState::Dismissed);
+        assert!(quarantined.exists());
+        assert_eq!(job.quarantine_path.as_deref(), quarantined.to_str());
+        let receipt =
+            local_output::read_receipt(&h.pipeline.cfg.local_output_dir, &job.delivery_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(receipt.manifest.status, "dismissed");
+        assert_eq!(
+            std::fs::read_dir(&h.pipeline.cfg.local_output_dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().is_file())
+                .count(),
+            0,
+            "dismissal must not leave an orphan Local output"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_releases_review_lease_abandoned_before_terminal_artifact() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let (sha, source) = h.seed("review/abandoned.pdf", "abandoned lease bytes");
+        h.pipeline
+            .flag(&sha, &source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        assert!(h
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "correct")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            0
+        );
+        assert!(h
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "dismiss")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn pa_resubmit_after_settings_switch_replaces_only_the_pinned_pa_manifest() {
+        let h = Harness::new();
+        let rel = "clients/acme/invoice.pdf";
+        let (sha, path) = h.seed(rel, "pa correction bytes");
+        h.pipeline
+            .flag(&sha, &path, "SLM_FAIL:needs review".into(), &clock())
+            .await;
+        let flagged = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let quarantined = PathBuf::from(flagged.quarantine_path.unwrap());
+        let pinned_outbox = h.pipeline.cfg.outbox_dir.clone();
+        let mut switched_cfg = h.pipeline.cfg.clone();
+        switched_cfg.output_mode = crate::config::OutputMode::Local;
+        switched_cfg.local_output_dir = h.dir.path().join("new-local-output");
+        std::fs::create_dir_all(&switched_cfg.local_output_dir).unwrap();
+        let restarted = h.restarted_with(switched_cfg.clone());
+
+        let (date, subject, description) = correction();
+        restarted
+            .resubmit(&sha, date, subject, description)
+            .await
+            .unwrap();
+
+        let mid = manifest_id(&sha, rel);
+        let pinned_manifest = pinned_outbox.join("_manifests").join(format!("{mid}.json"));
+        let manifest: Manifest =
+            serde_json::from_slice(&std::fs::read(&pinned_manifest).unwrap()).unwrap();
+        assert_eq!(manifest.status, "ok");
+        assert!(
+            local_output::read_receipt(&switched_cfg.local_output_dir, &mid)
+                .unwrap()
+                .is_none(),
+            "a PA row must never create a Local receipt after Settings switch"
+        );
+        assert!(
+            std::fs::read_dir(&switched_cfg.local_output_dir)
+                .unwrap()
+                .next()
+                .is_none(),
+            "a PA correction must leave the new Local root empty"
+        );
+        assert!(!quarantined.exists());
+        assert!(
+            path.exists(),
+            "PA correction restores the review file for Flow 2"
+        );
+        assert_eq!(
+            restarted.ledger.get(&sha).unwrap().unwrap().state,
+            JobState::Emitted
+        );
+
+        let manifest_json = std::fs::read(&pinned_manifest).unwrap();
+        assert!(
+            restarted
+                .resubmit(&sha, correction().0, correction().1, correction().2)
+                .await
+                .is_err(),
+            "a stale PA correction must not replace the committed manifest"
+        );
+        assert_eq!(std::fs::read(&pinned_manifest).unwrap(), manifest_json);
+        assert!(
+            local_output::read_receipt(&switched_cfg.local_output_dir, &mid)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pa_review_lease_allows_exactly_one_correction_or_dismissal() {
+        let correction_wins = Harness::new();
+        let rel = "review/pa-correct.pdf";
+        let (sha, source) = correction_wins.seed(rel, "pa correct bytes");
+        correction_wins
+            .pipeline
+            .flag(&sha, &source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let owner = correction_wins
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "correct")
+            .unwrap()
+            .unwrap();
+        assert!(crate::dismiss_inner(&correction_wins.app_state(), &sha, "loser").is_err());
+        let (date, subject, description) = correction();
+        correction_wins
+            .pipeline
+            .resubmit_with_owner(&sha, date, subject, description, Some(owner))
+            .await
+            .unwrap();
+        assert_eq!(
+            correction_wins
+                .pipeline
+                .ledger
+                .get(&sha)
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Emitted
+        );
+        assert_eq!(correction_wins.manifest(&sha, rel).unwrap().status, "ok");
+        assert!(source.exists());
+
+        let dismissal_wins = Harness::new();
+        let rel = "review/pa-dismiss.pdf";
+        let (sha, source) = dismissal_wins.seed(rel, "pa dismiss bytes");
+        dismissal_wins
+            .pipeline
+            .flag(&sha, &source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let quarantined = PathBuf::from(
+            dismissal_wins
+                .pipeline
+                .ledger
+                .get(&sha)
+                .unwrap()
+                .unwrap()
+                .quarantine_path
+                .unwrap(),
+        );
+        let owner = dismissal_wins
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "dismiss")
+            .unwrap()
+            .unwrap();
+        let (date, subject, description) = correction();
+        assert!(dismissal_wins
+            .pipeline
+            .resubmit(&sha, date, subject, description)
+            .await
+            .is_err());
+        assert!(dismissal_wins
+            .pipeline
+            .ledger
+            .release_review_operation(&sha, "dismiss", &owner)
+            .unwrap());
+        crate::dismiss_inner(&dismissal_wins.app_state(), &sha, "winner").unwrap();
+        assert_eq!(
+            dismissal_wins
+                .pipeline
+                .ledger
+                .get(&sha)
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Dismissed
+        );
+        assert_eq!(
+            dismissal_wins.manifest(&sha, rel).unwrap().status,
+            "dismissed"
+        );
+        assert!(quarantined.exists());
+        assert!(!source.exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_pa_flagged_row_is_pinned_before_settings_switch_and_corrects_only_to_that_outbox(
+    ) {
+        let h = Harness::new();
+        let rel = "legacy/invoice.pdf";
+        let source = h.pipeline.cfg.processing_dir.join(rel);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"legacy flagged correction bytes").unwrap();
+        let sha = hash_file(&source).unwrap();
+        // `ingest` models a row opened from the pre-delivery-root schema:
+        // mode defaults to PA and root remains empty until this one-way pin.
+        h.pipeline
+            .ledger
+            .ingest(&sha, &source.to_string_lossy(), "invoice.pdf", rel, "pdf")
+            .unwrap();
+        let quarantined = h.pipeline.cfg.quarantine_dir.join("legacy-invoice.pdf");
+        std::fs::rename(&source, &quarantined).unwrap();
+        h.pipeline
+            .ledger
+            .update_fields(
+                &sha,
+                &[
+                    ("flag_reason", Some("SLM_FAIL:legacy review".into())),
+                    (
+                        "quarantine_path",
+                        Some(quarantined.to_string_lossy().into_owned()),
+                    ),
+                ],
+            )
+            .unwrap();
+        h.pipeline
+            .ledger
+            .set_state(&sha, JobState::Flagged)
+            .unwrap();
+
+        let pinned_outbox = h.pipeline.cfg.outbox_dir.clone();
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            0,
+            "startup pins an unresolved legacy row even without a newer manifest"
+        );
+        assert_eq!(
+            h.pipeline.ledger.get(&sha).unwrap().unwrap().delivery_root,
+            pinned_outbox.to_string_lossy()
+        );
+
+        let mut switched_cfg = h.pipeline.cfg.clone();
+        switched_cfg.output_mode = crate::config::OutputMode::Local;
+        switched_cfg.outbox_dir = h.dir.path().join("outbox-b");
+        switched_cfg.local_output_dir = h.dir.path().join("local-b");
+        std::fs::create_dir_all(&switched_cfg.outbox_dir).unwrap();
+        std::fs::create_dir_all(&switched_cfg.local_output_dir).unwrap();
+        let restarted = h.restarted_with(switched_cfg.clone());
+        let (date, subject, description) = correction();
+        restarted
+            .resubmit(&sha, date, subject, description)
+            .await
+            .unwrap();
+
+        let mid = manifest_id(&sha, rel);
+        let pinned_path = pinned_outbox.join("_manifests").join(format!("{mid}.json"));
+        let manifest: Manifest =
+            serde_json::from_slice(&std::fs::read(&pinned_path).unwrap()).unwrap();
+        assert_eq!(manifest.status, "ok");
+        assert!(!switched_cfg
+            .manifests_dir()
+            .join(format!("{mid}.json"))
+            .exists());
+        assert!(
+            local_output::read_receipt(&switched_cfg.local_output_dir, &mid)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            restarted.ledger.get(&sha).unwrap().unwrap().state,
+            JobState::Emitted
+        );
     }
 
     /// P4's other half: if the manifest write fails, nothing may be committed.

@@ -3,6 +3,7 @@ mod dbkey;
 mod filter;
 mod identity;
 mod ledger;
+mod local_output;
 mod logging;
 mod manifest;
 mod model_download;
@@ -351,6 +352,7 @@ fn register_sensitive_paths(cfg: &Config) {
     logging::add_sensitive_roots([
         cfg.processing_dir.clone(),
         cfg.outbox_dir.clone(),
+        cfg.local_output_dir.clone(),
         cfg.quarantine_dir.clone(),
         cfg.cache_dir.clone(),
     ]);
@@ -358,6 +360,23 @@ fn register_sensitive_paths(cfg: &Config) {
 
 #[tauri::command]
 fn set_config(state: tauri::State<AppState>, cfg: Config) -> Result<(), String> {
+    if runtime_flags(&state).0 {
+        return Err("Stop the pipeline before changing output folders or delivery mode.".into());
+    }
+    // A pre-contract PA row has an empty root. Pin every unresolved one to
+    // the *current* Outbox before accepting a Settings change, rather than
+    // letting a later recovery/correction reinterpret it through the new
+    // destination. The ledger UPDATE is conditional, so established roots
+    // remain immutable even if this command is retried.
+    let current = state.cfg.lock().unwrap().clone();
+    for job in state.ledger.unresolved_jobs().map_err(|e| e.to_string())? {
+        if job.delivery_mode == "power_automate" && job.delivery_root.is_empty() {
+            state
+                .ledger
+                .pin_legacy_power_automate_root(&job.sha256, &current.outbox_dir)
+                .map_err(|e| e.to_string())?;
+        }
+    }
     let saved = apply_config(&state.cfg_path, &state.default_cache_dir, cfg)?;
     register_sensitive_paths(&saved);
     *state.cfg.lock().unwrap() = saved;
@@ -426,6 +445,7 @@ fn create_missing_dir_inner(state: &AppState, field: &str) -> Result<(), String>
     let dir = match field {
         "processing_dir" => cfg.processing_dir,
         "outbox_dir" => cfg.outbox_dir,
+        "local_output_dir" => cfg.local_output_dir,
         "quarantine_dir" => cfg.quarantine_dir,
         _ => cfg.cache_dir,
     };
@@ -589,8 +609,8 @@ fn dismissed_manifest(job: &ledger::Job, note: &str) -> manifest::Manifest {
     };
     manifest::Manifest {
         schema: manifest::MANIFEST_SCHEMA_VERSION,
-        manifest_id: identity::instance_id(&job.sha256, &identity::normalize_relpath(&relpath)),
-        sha256: job.sha256.clone(),
+        manifest_id: job.delivery_id.clone(),
+        sha256: job.content_sha256.clone(),
         status: "dismissed".into(),
         original_name: job.original_name.clone(),
         original_relpath: relpath,
@@ -600,7 +620,7 @@ fn dismissed_manifest(job: &ledger::Job, note: &str) -> manifest::Manifest {
         date_source: None,
         doc_type: job.doc_type.clone(),
         language: job.language.clone(),
-        duplicate_of: None,
+        duplicate_of: (job.sha256 != job.content_sha256).then(|| job.content_sha256.clone()),
         soft_flags: vec![],
         flag_reason: Some(reason),
         // Reproducibility is per job, and the job already recorded what named
@@ -630,17 +650,52 @@ fn dismiss_inner(state: &AppState, sha256: &str, note: &str) -> Result<(), Strin
     if !is_ledger_key(sha256) {
         return Err("invalid id".into());
     }
+    let cfg = state.cfg.lock().unwrap().clone();
     let job = state
         .ledger
         .get(sha256)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "BackLog has no record of that file.".to_string())?;
+    let job = if job.delivery_mode == "power_automate" && job.delivery_root.is_empty() {
+        state
+            .ledger
+            .pin_legacy_power_automate_root(sha256, &cfg.outbox_dir)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "BackLog has no record of that file.".to_string())?
+    } else {
+        job
+    };
     // Dismissal is a decision about something sitting in the review queue.
     // The ledger's transition table lets any non-terminal state reach
     // Dismissed (a losing worker must always be able to retire a row), so
     // without this gate a stale UI row or a double-click could write a
     // dismissed manifest for a file a worker is actively converting — and
     // then delete the cached document text out from under it.
+    if job.state == ledger::JobState::Dismissed && job.delivery_mode == "local" {
+        let root = PathBuf::from(&job.delivery_root);
+        cfg.validate_pinned_delivery_root("local", &root)?;
+        if let Ok(Some(receipt)) = local_output::read_receipt(&root, &job.delivery_id) {
+            let quarantine_root = job
+                .quarantine_root
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| cfg.quarantine_dir.clone());
+            let quarantine_path = job.quarantine_path.as_deref().map(PathBuf::from);
+            if receipt.receipt_schema == 1
+                && receipt.delivery_mode == "local"
+                && receipt.output_relpath.is_none()
+                && receipt.manifest.status == "dismissed"
+                && receipt.manifest.manifest_id == job.delivery_id
+                && receipt.manifest.sha256 == job.content_sha256
+                && receipt.source_root == quarantine_root.to_string_lossy()
+                && quarantine_path
+                    .as_ref()
+                    .is_some_and(|path| receipt.source_path == path.to_string_lossy())
+            {
+                return Ok(());
+            }
+        }
+    }
     if job.state != ledger::JobState::Flagged {
         return Err(
             "Only files waiting in Needs Review can be dismissed. This one has already moved on; \
@@ -648,14 +703,63 @@ fn dismiss_inner(state: &AppState, sha256: &str, note: &str) -> Result<(), Strin
                 .into(),
         );
     }
-    let cfg = state.cfg.lock().unwrap().clone();
-
-    manifest::write_manifest(&cfg.manifests_dir(), &dismissed_manifest(&job, note))
-        .map_err(|e| format!("Could not record the dismissal for SharePoint: {e}"))?;
+    let Some(review_owner) = state
+        .ledger
+        .begin_review_operation(sha256, "dismiss")
+        .map_err(|e| e.to_string())?
+    else {
+        return Err("That review item is already being decided; refresh and try again.".into());
+    };
+    let dismissal = dismissed_manifest(&job, note);
+    let publish = (|| -> Result<(), String> {
+        match job.delivery_mode.as_str() {
+            "power_automate" => {
+                let outbox = if job.delivery_root.is_empty() {
+                    cfg.outbox_dir.clone()
+                } else {
+                    PathBuf::from(&job.delivery_root)
+                };
+                cfg.validate_pinned_delivery_root("power_automate", &outbox)?;
+                manifest::write_manifest(&outbox.join("_manifests"), &dismissal)
+                    .map(|_| ())
+                    .map_err(|e| format!("Could not record the dismissal for SharePoint: {e}"))
+            }
+            "local" => {
+                let root = PathBuf::from(&job.delivery_root);
+                cfg.validate_pinned_delivery_root("local", &root)?;
+                let quarantine_root = job
+                    .quarantine_root
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| cfg.quarantine_dir.clone());
+                let quarantine_path = job
+                    .quarantine_path
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| {
+                        "This local review item has no pinned quarantine source.".to_string()
+                    })?;
+                local_output::record_review(&root, &quarantine_root, &quarantine_path, &dismissal)
+                    .map_err(|e| format!("Could not record the local dismissal: {e}"))
+            }
+            _ => Err("This delivery has an unsupported immutable output mode.".into()),
+        }
+    })();
+    if let Err(error) = publish {
+        let _ = state
+            .ledger
+            .release_review_operation(sha256, "dismiss", &review_owner);
+        return Err(error);
+    }
 
     if !state
         .ledger
-        .set_state(sha256, ledger::JobState::Dismissed)
+        .commit_review_operation(
+            sha256,
+            "dismiss",
+            &review_owner,
+            ledger::JobState::Dismissed,
+        )
         .map_err(|e| e.to_string())?
     {
         return Err("That file has already moved on; refresh and try again.".into());
@@ -875,6 +979,7 @@ fn redacted_config(cfg: &Config) -> serde_json::Value {
     serde_json::json!({
         "processing_dir": logging::redact_path(&cfg.processing_dir),
         "outbox_dir": logging::redact_path(&cfg.outbox_dir),
+        "local_output_dir": logging::redact_path(&cfg.local_output_dir),
         "quarantine_dir": logging::redact_path(&cfg.quarantine_dir),
         "cache_dir": logging::redact_path(&cfg.cache_dir),
         "primary_model": cfg.slm_primary_gguf.file_name().map(|n| n.to_string_lossy().into_owned()),
@@ -2163,7 +2268,7 @@ mod tests {
     fn creatable_dir_fields_cover_every_configured_folder() {
         // `create_missing_dir` matches on these names; a field added to one
         // side and not the other would silently fall through to cache_dir.
-        assert_eq!(preflight::CREATABLE_DIR_FIELDS.len(), 4);
+        assert_eq!(preflight::CREATABLE_DIR_FIELDS.len(), 5);
         for field in preflight::CREATABLE_DIR_FIELDS {
             assert!(field.ends_with("_dir"), "unexpected field: {field}");
         }
@@ -2613,5 +2718,75 @@ mod tests {
             }),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn local_dismissal_uses_pinned_root_retains_quarantine_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = stopped_state(dir.path());
+        let local_root = dir.path().join("local-output");
+        std::fs::create_dir_all(&local_root).unwrap();
+        let quarantine = dir.path().join("pinned-quarantine");
+        std::fs::create_dir_all(&quarantine).unwrap();
+        let file = quarantine.join("review.pdf");
+        std::fs::write(&file, b"retain me").unwrap();
+        let sha = pipeline::hash_file(&file).unwrap();
+        state
+            .ledger
+            .ingest_with_delivery(
+                &sha,
+                &dir.path().join("proc/review.pdf").to_string_lossy(),
+                "review.pdf",
+                "review.pdf",
+                "pdf",
+                "local",
+                &local_root.to_string_lossy(),
+                &dir.path().join("proc").to_string_lossy(),
+                &sha,
+            )
+            .unwrap();
+        state
+            .ledger
+            .update_fields(
+                &sha,
+                &[
+                    ("quarantine_path", Some(file.to_string_lossy().into_owned())),
+                    (
+                        "quarantine_planned_path",
+                        Some(file.to_string_lossy().into_owned()),
+                    ),
+                    (
+                        "quarantine_root",
+                        Some(quarantine.to_string_lossy().into_owned()),
+                    ),
+                ],
+            )
+            .unwrap();
+        state
+            .ledger
+            .set_state(&sha, ledger::JobState::Flagged)
+            .unwrap();
+        // Settings now point to PA, but the review decision must remain local.
+        state.cfg.lock().unwrap().output_mode = config::OutputMode::PowerAutomate;
+
+        dismiss_inner(&state, &sha, "junk").unwrap();
+        dismiss_inner(&state, &sha, "junk").unwrap();
+        assert!(file.exists(), "dismissal keeps the review copy");
+        let id = identity::instance_id(&sha, "review.pdf");
+        assert_eq!(
+            local_output::read_receipt(&local_root, &id)
+                .unwrap()
+                .unwrap()
+                .manifest
+                .status,
+            "dismissed"
+        );
+        assert!(!state
+            .cfg
+            .lock()
+            .unwrap()
+            .manifests_dir()
+            .join(format!("{id}.json"))
+            .exists());
     }
 }

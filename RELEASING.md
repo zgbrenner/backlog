@@ -1,13 +1,13 @@
 # Releasing BackLog
 
-BackLog v0.7.0 is built on a clean `windows-2022` GitHub-hosted runner by
+BackLog v0.8.0 is built on a clean `windows-2022` GitHub-hosted runner by
 `.github/workflows/release.yml`. This public repository uses standard public
 Actions runners, which do not consume billable minutes.
 
 The release produces two Windows x64 downloads:
 
-- `BackLog_0.7.0_x64-setup.exe`
-- `BackLog_0.7.0_x64-portable.zip`
+- `BackLog_0.8.0_x64-setup.exe`
+- `BackLog_0.8.0_x64-portable.zip`
 
 Both contain the app, `convertd` and its Python runtime, `llama-server` and its
 runtime DLLs, the verified Qwen3 0.6B primary model, and the pinned MiniLM
@@ -16,16 +16,29 @@ the portable ZIP carries a pinned fixed WebView2 runtime and launches through
 `BackLog-Portable.cmd`. The Qwen3 1.7B escalation model remains an optional
 in-app download.
 
+## Delivery-mode release gates
+
+v0.8.0 preserves **Power Automate / SharePoint** as the default manifest
+handoff to Outbox for Flow 2 and adds **Local folder** direct delivery. Record
+fresh Local Output evidence: the Processing, Local Output, and Quarantine roots
+are distinct and non-nested; each completed delivery has its renamed output
+and `.backlog/receipts/<manifest_id>.json`; and collision, restart/recovery,
+correction, and dismissal reconcile as specified in `docs/PILOT_RUNBOOK.md`.
+
+These local gates do not certify a target Power Automate tenant. Flow 1/Flow 2,
+SharePoint indexing/archive, connector permissions, throttling, and recovery
+need separate tenant evidence. Do not state that they passed without it.
+
 ## Required release state
 
 Before merging or pushing the release commit to `main`:
 
 1. `package.json`, `src-tauri/Cargo.toml`,
    `src-tauri/tauri.conf.json`, `package-lock.json`, and the root `backlog`
-   package in `src-tauri/Cargo.lock` must say `0.7.0`.
+   package in `src-tauri/Cargo.lock` must say `0.8.0`.
 2. `CHANGELOG.md` must contain the matching section.
 3. CI must be green on `main`.
-4. `v0.7.0` must not already be published. The workflow preflight skips a
+4. `v0.8.0` must not already be published. The workflow preflight skips a
    completed release and can resume only an interrupted draft whose tag still
    points at the exact CI-tested commit.
 5. Complete the source and security portions of
@@ -90,16 +103,16 @@ Configure:
 
 The workflow builds with updater artifacts enabled, requires:
 
-- `BackLog_0.7.0_x64-setup.exe`;
-- `BackLog_0.7.0_x64-portable.zip`;
-- `BackLog_0.7.0_x64-setup.exe.sig`; and
+- `BackLog_0.8.0_x64-setup.exe`;
+- `BackLog_0.8.0_x64-portable.zip`;
+- `BackLog_0.8.0_x64-setup.exe.sig`; and
 - `latest.json`;
 
 and verifies that `latest.json` carries the exact detached signature and points
 to the same installer. It also verifies and uploads the portable ZIP. It then
 decodes the updater public key embedded in
 `src-tauri/tauri.conf.json` and cryptographically verifies that signature over
-the exact installer. Only then does it create `v0.7.0` as a draft, upload all
+the exact installer. Only then does it create `v0.8.0` as a draft, upload all
 four files, and publish the stable GitHub release.
 
 Never rotate this updater key casually. Existing installations verify updates
@@ -113,7 +126,7 @@ When `TAURI_SIGNING_PRIVATE_KEY` is absent or blank, the workflow overlays
 It then requires the installer to exist and requires both the signature and
 `latest.json` to be absent.
 
-The workflow still creates `v0.7.0`, but publishes an explicit prerelease with
+The workflow still creates `v0.8.0`, but publishes an explicit prerelease with
 the installer and portable ZIP. The release notes say that v0.4.4 remains the stable
 updater. GitHub's `releases/latest` endpoint therefore continues to resolve to
 the prior stable release.
@@ -130,7 +143,7 @@ no manual dispatch path that can bypass that exact-commit CI result.
 
 The first job derives the release tag from validated package metadata, then
 checks the exact remote tag and GitHub Release state before
-allocating the Windows runner. A published `v0.7.0` exits successfully. If an
+allocating the Windows runner. A published `v0.8.0` exits successfully. If an
 asset upload was interrupted, use **Re-run all jobs** on that same failed
 release-workflow run. A matching draft resumes with `--clobber`; a tag or draft
 pointing at any other commit fails closed. Before publication, the workflow
@@ -177,10 +190,10 @@ python power-automate/validate_examples.py
 npm run tauri build
 $webview2 = Join-Path $env:TEMP "backlog-webview2-fixed"
 ./scripts/stage-webview2-runtime.ps1 -Destination $webview2 -Clean
-./scripts/package-portable.ps1 -Version 0.7.0 -WebView2RuntimeDir $webview2
+./scripts/package-portable.ps1 -Version 0.8.0 -WebView2RuntimeDir $webview2
 ./scripts/validate-portable-package.ps1 `
-  -Archive "src-tauri/target/release/BackLog_0.7.0_x64-portable.zip" `
-  -Version 0.7.0
+  -Archive "src-tauri/target/release/BackLog_0.8.0_x64-portable.zip" `
+  -Version 0.8.0
 ```
 
 This reproduces packaging but does not authorize publication. Use the guarded

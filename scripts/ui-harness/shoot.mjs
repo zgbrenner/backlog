@@ -279,6 +279,128 @@ const CHECKS = [
     },
   },
   {
+    name: "legacy settings visibly default to the Power Automate handoff",
+    async run(page) {
+      await boot(page, "first-run");
+      const mode = page.locator('[name="output_mode"]');
+      const problems = [];
+      if ((await mode.inputValue()) !== "power_automate") {
+        problems.push(`legacy config selected ${JSON.stringify(await mode.inputValue())}, not Power Automate`);
+      }
+      if (!(await page.locator('[name="outbox_dir"]').isVisible())) {
+        problems.push("Power Automate mode did not show Outbox");
+      }
+      if (await page.locator('[name="local_output_dir"]').isVisible()) {
+        problems.push("Power Automate mode still showed Local Output");
+      }
+      if (!(await page.getByText("Outbox folder is writable").isVisible())) {
+        problems.push("Power Automate readiness did not name Outbox");
+      }
+      if (!(await page.getByText(/handoff manifest to Outbox for Flow 2/i).isVisible())) {
+        problems.push("Power Automate explanatory copy was missing");
+      }
+      return problems;
+    },
+  },
+  {
+    name: "Local Output changes only the required delivery folder and readiness label",
+    async run(page) {
+      await boot(page, "local-ready");
+      const problems = [];
+      if (!(await page.locator('[name="local_output_dir"]').isVisible())) {
+        problems.push("Local mode did not show Local Output");
+      }
+      if (await page.locator('[name="outbox_dir"]').isVisible()) {
+        problems.push("Local mode still showed Outbox");
+      }
+      if (!(await page.getByText("Local Output folder is writable").isVisible())) {
+        problems.push("Local mode readiness did not name Local Output");
+      }
+      if (await page.getByText("Outbox folder is writable").isVisible()) {
+        problems.push("Local mode readiness still named Outbox");
+      }
+      if (!(await page.getByText(/finished renamed document directly to Local Output/i).isVisible())) {
+        problems.push("Local Output explanatory copy was missing");
+      }
+      return problems;
+    },
+  },
+  {
+    name: "switching output modes preserves both paths and targets the folder picker",
+    async run(page) {
+      await boot(page, "first-run");
+      const mode = page.locator('[name="output_mode"]');
+      const outbox = page.locator('[name="outbox_dir"]');
+      const local = page.locator('[name="local_output_dir"]');
+      await outbox.fill('D:\\Outbox');
+      await mode.selectOption("local");
+      await local.fill('D:\\Filed');
+      const problems = [];
+      if (await outbox.isVisible()) problems.push("switching to Local did not hide Outbox");
+      if ((await local.inputValue()) !== 'D:\\Filed') problems.push("Local Output value was not retained");
+      const localBrowse = page.getByRole("button", { name: /^Browse for Local Output folder/ });
+      await localBrowse.click();
+      const picker = await page.evaluate(() =>
+        window.__harness.invocations.filter((i) => i.cmd === "open_dialog").at(-1)
+      );
+      if (!picker || picker.args?.directory !== true || picker.args?.multiple !== false) {
+        problems.push(`Local Output Browse did not open a single-folder picker: ${JSON.stringify(picker)}`);
+      }
+      await mode.selectOption("power_automate");
+      if ((await outbox.inputValue()) !== 'D:\\Outbox') problems.push("Outbox value was lost after switching back");
+      if (await local.isVisible()) problems.push("switching back to Power Automate did not hide Local Output");
+      return problems;
+    },
+  },
+  {
+    name: "first-run Local Output saves the selected mode and does not require Outbox",
+    async run(page) {
+      await boot(page, "first-run-save");
+      await page.locator('[name="output_mode"]').selectOption("local");
+      await page.locator('[name="processing_dir"]').fill("D:\\Intake");
+      await page.locator('[name="local_output_dir"]').fill("D:\\Filed");
+      await page.locator('[name="quarantine_dir"]').fill("D:\\Quarantine");
+      const problems = [];
+      const action = page.locator('.settings button[type="submit"]');
+      if ((await action.textContent()).trim() !== "Save and check this computer") {
+        problems.push("Local first run did not retain the combined save-and-check action");
+      }
+      await action.click();
+      await page.waitForTimeout(450);
+      const saved = await page.evaluate(() =>
+        window.__harness.invocations.filter((i) => i.cmd === "set_config").at(-1)?.args?.cfg
+      );
+      if (saved?.output_mode !== "local") {
+        problems.push(`Local first run saved mode ${JSON.stringify(saved?.output_mode)}`);
+      }
+      if (saved?.local_output_dir !== "D:\\Filed") {
+        problems.push(`Local Output path was not saved: ${JSON.stringify(saved?.local_output_dir)}`);
+      }
+      return problems;
+    },
+  },
+  {
+    name: "review copy follows each job's pinned delivery mode after Settings switches",
+    async run(page) {
+      await boot(page, "local-review");
+      await page.getByRole("tab", { name: "Settings" }).click();
+      await page.locator('[name="output_mode"]').selectOption("power_automate");
+      await page.getByRole("tab", { name: /Needs Review/ }).click();
+      const note = page.locator(".delivery-note").first();
+      if (!/directly from Quarantine into Local Output/i.test(await note.innerText())) {
+        return ["Local-pinned review followed the later Power Automate Settings selection"];
+      }
+      await boot(page, "review");
+      await page.getByRole("tab", { name: "Settings" }).click();
+      await page.locator('[name="output_mode"]').selectOption("local");
+      await page.getByRole("tab", { name: /Needs Review/ }).click();
+      if (!/updates the Power Automate handoff/i.test(await page.locator(".delivery-note").first().innerText())) {
+        return ["Power-Automate-pinned review followed the later Local Settings selection"];
+      }
+      return [];
+    },
+  },
+  {
     name: "the narrow queue stays readable without page-wide clipping",
     async run(page) {
       await boot(page, "ready");
@@ -574,16 +696,54 @@ const CHECKS = [
     },
   },
   {
-    name: "a caught-up processing queue still shows real historical work",
+    name: "a Power Automate caught-up queue keeps its handoff copy and real history",
     async run(page) {
       await boot(page, "caught-up-reviews");
       const text = await page.locator(".caught-up").innerText();
       const problems = [];
       if (!/Processing is caught up/.test(text)) problems.push(`missing caught-up state: ${JSON.stringify(text)}`);
       if (!/4 files need review/.test(text)) problems.push(`missing remaining review count: ${JSON.stringify(text)}`);
-      if (!/Power Automate/.test(text)) problems.push("Done handoff copy is missing");
+      if (!/Done means BackLog has handed a document to Power Automate\./.test(text)) {
+        problems.push("Power Automate Done handoff copy changed");
+      }
       if ((await page.locator("tbody tr").count()) !== 22) {
         problems.push("historical queue rows disappeared while showing caught-up status");
+      }
+      return problems;
+    },
+  },
+  {
+    name: "a Local Output caught-up queue describes local delivery and real history",
+    async run(page) {
+      await boot(page, "local-caught-up-reviews");
+      const text = await page.locator(".caught-up").innerText();
+      const problems = [];
+      if (!/Processing is caught up/.test(text)) problems.push(`missing Local caught-up state: ${JSON.stringify(text)}`);
+      if (!/4 files need review/.test(text)) problems.push(`missing Local remaining review count: ${JSON.stringify(text)}`);
+      if (!/Done means BackLog wrote the renamed document to Local Output and recorded its receipt\./.test(text)) {
+        problems.push("Local Output Done copy was missing");
+      }
+      if (/Power Automate|SharePoint/i.test(text)) {
+        problems.push(`Local caught-up copy mentioned an unrelated handoff: ${JSON.stringify(text)}`);
+      }
+      if ((await page.locator("tbody tr").count()) !== 22) {
+        problems.push("Local historical queue rows disappeared while showing caught-up status");
+      }
+      return problems;
+    },
+  },
+  {
+    name: "a Local Output empty queue does not direct intake through SharePoint",
+    async run(page) {
+      await boot(page, "local-queue-awaiting-first-row");
+      const text = await page.locator(".empty").innerText();
+      const problems = [];
+      if (!/No files yet/.test(text)) problems.push(`missing Local queue empty state: ${JSON.stringify(text)}`);
+      if (!/drop files into the Processing folder\./.test(text)) {
+        problems.push("Local queue empty state did not give the direct Processing action");
+      }
+      if (/Power Automate|SharePoint/i.test(text)) {
+        problems.push(`Local queue empty state mentioned unrelated intake: ${JSON.stringify(text)}`);
       }
       return problems;
     },

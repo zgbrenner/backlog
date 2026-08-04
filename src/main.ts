@@ -23,6 +23,10 @@ type Job = {
   state: string;
   flag_reason: string | null;
   quarantine_path: string | null;
+  /** Immutable at ingest: corrections must not follow a later Settings switch. */
+  delivery_mode?: OutputMode | null;
+  /** Kept for IPC compatibility; never shown in ordinary UI copy. */
+  delivery_root?: string | null;
   proposed_date: string | null;
   date_source: string | null;
   proposed_subject: string | null;
@@ -47,6 +51,9 @@ type LedgerEvent = {
 type Config = {
   processing_dir: string;
   outbox_dir: string;
+  /** Missing on a legacy config; that deliberately means the established PA handoff. */
+  output_mode?: OutputMode;
+  local_output_dir?: string;
   quarantine_dir: string;
   cache_dir: string;
   llama_port: number;
@@ -80,12 +87,15 @@ type RuntimeProblem = {
 
 // Mirrors src-tauri/src/preflight.rs::RuntimeStatus.
 type RuntimeStatus = {
+  /** Backend-pinned runtime mode; absent from older hosts means PA. */
+  output_mode?: OutputMode;
   configured: boolean;
   checked: boolean;
   running: boolean;
   paused: boolean;
   processing_dir_ready: boolean;
   outbox_writable: boolean;
+  local_output_writable: boolean;
   quarantine_writable: boolean;
   cache_writable: boolean;
   sidecar_found: boolean;
@@ -137,6 +147,7 @@ type Diagnostics = {
 };
 
 type ViewName = "queue" | "flagged" | "settings";
+type OutputMode = "power_automate" | "local";
 
 // ---------------------------------------------------------------------------
 // Copy tables. The pipeline speaks in machine codes; an office worker does not.
@@ -144,9 +155,8 @@ type ViewName = "queue" | "flagged" | "settings";
 
 // Boolean pass/fail checks surfaced in the Readiness panel, in display order.
 // Mirrors RuntimeStatus::checks() so the panel and `summary()` never disagree.
-const READINESS_CHECKS: Array<[label: string, key: keyof RuntimeStatus]> = [
+const COMMON_READINESS_CHECKS: Array<[label: string, key: keyof RuntimeStatus]> = [
   ["Processing folder is readable", "processing_dir_ready"],
-  ["Outbox folder is writable", "outbox_writable"],
   ["Quarantine folder is writable", "quarantine_writable"],
   ["Working folder is writable", "cache_writable"],
   ["Document reader (convertd) is installed", "sidecar_found"],
@@ -157,6 +167,29 @@ const READINESS_CHECKS: Array<[label: string, key: keyof RuntimeStatus]> = [
   ["Everyday model file is present", "primary_model_found"],
   ["Backup model file is present", "escalation_model_found"],
 ];
+
+function outputModeFor(config: Pick<Config, "output_mode"> | null | undefined): OutputMode {
+  return config?.output_mode === "local" ? "local" : "power_automate";
+}
+
+/** The draft selector wins while Settings is open, so labels change at the
+ * same moment as the fields instead of waiting for a save/readback round trip. */
+function selectedOutputMode(): OutputMode {
+  const select = document.querySelector<HTMLSelectElement>('select[name="output_mode"]');
+  return select?.value === "local" ? "local" : outputModeFor(cfg);
+}
+
+function readinessChecksFor(mode = selectedOutputMode()): Array<[string, keyof RuntimeStatus]> {
+  const deliveryCheck: [string, keyof RuntimeStatus] = mode === "local"
+    ? ["Local Output folder is writable", "local_output_writable"]
+    : ["Outbox folder is writable", "outbox_writable"];
+  return [COMMON_READINESS_CHECKS[0], deliveryCheck, ...COMMON_READINESS_CHECKS.slice(1)];
+}
+
+function hasRequiredFolders(config: Pick<Config, "processing_dir" | "outbox_dir" | "local_output_dir" | "quarantine_dir" | "output_mode"> | null | undefined): boolean {
+  if (!config?.processing_dir || !config.quarantine_dir) return false;
+  return outputModeFor(config) === "local" ? !!config.local_output_dir : !!config.outbox_dir;
+}
 
 // The ledger's seven in-flight/terminal states in the user's language. The raw
 // value still rides along in data-state so a support conversation can ask for
@@ -632,8 +665,9 @@ function loadTheme(): void {
 
 function uncheckedRuntime(): RuntimeStatus {
   return {
-    configured: false, checked: false, running: false, paused: false,
-    processing_dir_ready: false, outbox_writable: false, quarantine_writable: false,
+    output_mode: "power_automate", configured: false, checked: false, running: false, paused: false,
+    processing_dir_ready: false, outbox_writable: false, local_output_writable: false,
+    quarantine_writable: false,
     cache_writable: false, sidecar_found: false, sidecar_ok: false,
     llama_server_found: false, llama_server_ok: false, grammar_found: false,
     primary_model_found: false, escalation_model_found: false, offline_runtime: true,
@@ -874,7 +908,7 @@ async function goToPreflight(): Promise<void> {
  * a readiness check. Once folders are configured, use the live check control. */
 async function goToStartFix(): Promise<void> {
   await navigate("settings");
-  const needsFolders = !cfg || !cfg.processing_dir || !cfg.outbox_dir || !cfg.quarantine_dir;
+  const needsFolders = !hasRequiredFolders(cfg);
   if (!needsFolders) {
     await goToPreflight();
     return;
@@ -940,7 +974,7 @@ function paintActivity(): void {
     // "…in Settings" is wrong when the user is already looking at Settings,
     // which on an unconfigured install is where the app boots.
     const here = view === "settings";
-    const needsFolders = !cfg || !cfg.processing_dir || !cfg.outbox_dir || !cfg.quarantine_dir;
+    const needsFolders = !hasRequiredFolders(cfg);
     const label = needsFolders
       ? (here ? "finish setup below" : "finish setup in Settings")
       : runtime.checked
@@ -1414,6 +1448,20 @@ function buildErrorState(heading: string, raw: string): HTMLElement {
   return box;
 }
 
+/** Queue summaries describe the current delivery contract, rather than making
+ * a Local Output user infer a Power Automate handoff that will never happen. */
+function queueDoneCopy(mode = selectedOutputMode()): string {
+  return mode === "local"
+    ? "<b>Done</b> means BackLog wrote the renamed document to Local Output and recorded its receipt."
+    : "<b>Done</b> means BackLog has handed a document to Power Automate.";
+}
+
+function queueIntakeCopy(mode = selectedOutputMode()): string {
+  return mode === "local"
+    ? "Set your folders in Settings and check this computer, then drop files into the Processing folder."
+    : "Set your folders in Settings and check this computer, then drop files into the Processing folder — or let your SharePoint intake put them there.";
+}
+
 function buildQueue(data: { jobs: Job[]; total: number; error?: string }): Node[] {
   const nodes: Node[] = [buildQueueToolbar()];
   if (data.error) {
@@ -1429,7 +1477,7 @@ function buildQueue(data: { jobs: Job[]; total: number; error?: string }): Node[
       ${reviewCount > 0
         ? `${formatCount(reviewCount)} files need review. `
         : "There is nothing waiting to be processed. "}
-      <b>Done</b> means BackLog has handed a document to Power Automate.</div>`));
+      ${queueDoneCopy()}</div>`));
   }
   if (!data.jobs.length) {
     nodes.push(el(filtered
@@ -1437,10 +1485,8 @@ function buildQueue(data: { jobs: Job[]; total: number; error?: string }): Node[
          Clear them to see everything BackLog has processed.</div>`
       : active === 0
           ? `<div class="empty"><strong>All caught up</strong>There is nothing processing or waiting for
-             review. <b>Done</b> means BackLog has handed a document to Power Automate.</div>`
-          : `<div class="empty"><strong>No files yet</strong>Set your folders in Settings and check this
-             computer, then drop files into the Processing folder — or let your SharePoint intake put
-             them there.</div>`));
+             review. ${queueDoneCopy()}</div>`
+          : `<div class="empty"><strong>No files yet</strong>${queueIntakeCopy()}</div>`));
     return nodes;
   }
   const table = el(`
@@ -1737,6 +1783,14 @@ function paintReviewFoot(): void {
 function buildReviewCard(job: Job): ReviewCard {
   const copy = reasonCopy(job.flag_reason);
   const short = job.sha256.slice(0, 12);
+  // A job's output contract is pinned when it enters the ledger. Falling back
+  // to the current selection is only for legacy rows that predate that field.
+  const deliveryMode = job.delivery_mode === "local" || job.delivery_mode === "power_automate"
+    ? job.delivery_mode
+    : selectedOutputMode();
+  const correctionDelivery = deliveryMode === "local"
+    ? "When you approve this correction, BackLog files the renamed document directly from Quarantine into Local Output."
+    : "When you approve this correction, BackLog updates the Power Automate handoff; Flow 2 files it later.";
   const root = el(`
     <article class="card" data-sha="${esc(job.sha256)}"
       aria-label="Review ${esc(job.original_name)}">
@@ -1754,6 +1808,7 @@ function buildReviewCard(job: Job): ReviewCard {
         </details>
       </div>
       <form class="review-form" novalidate>
+        <p class="delivery-note">${correctionDelivery}</p>
         <div class="fields">
           <label>Date
             <input type="date" name="date" required>
@@ -2482,16 +2537,17 @@ function normalizePath(value: string): string {
 function buildSettings(): Node[] {
   if (!cfg) return [el(`<div class="empty">Loading settings…</div>`)];
   const c = cfg;
+  const initialMode = outputModeFor(c);
   // Models can still be missing after folders are saved, which deliberately
-  // leaves runtime.configured false. First-run is about choosing these three
-  // folders, not about every readiness check already passing.
-  const firstRun = !c.processing_dir || !c.outbox_dir || !c.quarantine_dir;
+  // leaves runtime.configured false. First-run is about choosing the folders
+  // required by the selected delivery mode, not every readiness check.
+  const firstRun = !hasRequiredFolders(c);
   const nodes: Node[] = [];
   if (firstRun) {
     nodes.push(el(`
-      <section class="setup-intro" aria-label="First-time setup">
+      <section class="setup-intro" aria-label="First-time setup" id="setup-intro">
         <h2>Set up this computer</h2>
-        <p>BackLog needs three local folders before it can safely handle documents.</p>
+        <p>Choose an output mode, then choose the three local folders it needs before it can safely handle documents.</p>
         <ol class="setup-steps"><li>1. Choose folders</li><li>2. Save and check this computer</li><li>3. Download an optional backup model if needed</li></ol>
       </section>`));
   }
@@ -2512,12 +2568,25 @@ function buildSettings(): Node[] {
     </label>`;
 
   const form = el(`
-    <form class="settings">
+    <form class="settings ${firstRun ? "first-run-settings" : ""}">
       <h2>Folders</h2>
+      <label class="wide output-mode">Output mode
+        <select name="output_mode" aria-describedby="output-mode-note">
+          <option value="power_automate" ${initialMode === "power_automate" ? "selected" : ""}>Power Automate / SharePoint</option>
+          <option value="local" ${initialMode === "local" ? "selected" : ""}>Local folder</option>
+        </select>
+        <span class="field-note" id="output-mode-note">Power Automate / SharePoint writes a handoff manifest to Outbox for Flow 2. Local folder writes the finished renamed document directly to Local Output and keeps one receipt per delivery in <code>.backlog/receipts</code>.</span>
+      </label>
       ${folder("Processing folder — BackLog watches this for new documents", "processing_dir",
-        "This is the OneDrive folder your SharePoint intake drops files into.")}
-      ${folder("Outbox folder — BackLog writes its results here", "outbox_dir",
-        "Also OneDrive-synced. Manifests go into a <code>_manifests</code> subfolder.")}
+        "Choose the folder BackLog watches. In Power Automate mode, Flow 1 can fill it from SharePoint.")}
+      <div class="mode-folder" data-output-mode="power_automate" ${initialMode === "power_automate" ? "" : "hidden"}>
+        ${folder("Outbox folder — BackLog writes the Power Automate handoff here", "outbox_dir",
+          "OneDrive-synced for Flow 2. BackLog writes manifests into its <code>_manifests</code> subfolder.")}
+      </div>
+      <div class="mode-folder" data-output-mode="local" ${initialMode === "local" ? "" : "hidden"}>
+        ${folder("Local Output folder — BackLog writes finished renamed documents here", "local_output_dir",
+          "BackLog also saves one receipt per delivery in <code>.backlog/receipts</code> inside this folder.")}
+      </div>
       ${folder("Quarantine folder — files that need review wait here", "quarantine_dir",
         "Stays on this computer; it is never synced.")}
 
@@ -2570,6 +2639,28 @@ function buildSettings(): Node[] {
     })
   );
 
+  const outputMode = q<HTMLSelectElement>(form, '[name="output_mode"]');
+  const updateOutputMode = () => {
+    const mode = outputMode.value === "local" ? "local" : "power_automate";
+    form.querySelectorAll<HTMLElement>("[data-output-mode]").forEach((section) => {
+      section.hidden = section.dataset.outputMode !== mode;
+    });
+    const formConfig = {
+      processing_dir: q<HTMLInputElement>(form, '[name="processing_dir"]').value,
+      outbox_dir: q<HTMLInputElement>(form, '[name="outbox_dir"]').value,
+      local_output_dir: q<HTMLInputElement>(form, '[name="local_output_dir"]').value,
+      quarantine_dir: q<HTMLInputElement>(form, '[name="quarantine_dir"]').value,
+      output_mode: mode,
+    } as Pick<Config, "processing_dir" | "outbox_dir" | "local_output_dir" | "quarantine_dir" | "output_mode">;
+    const needsFolders = !hasRequiredFolders(formConfig);
+    document.getElementById("setup-intro")?.toggleAttribute("hidden", !needsFolders);
+    q<HTMLButtonElement>(form, '[type="submit"]').textContent = needsFolders
+      ? "Save and check this computer"
+      : "Save settings";
+    replaceReadinessPanel();
+  };
+  outputMode.addEventListener("change", updateOutputMode);
+
   form.querySelector("#reset-tuning")?.addEventListener("click", () => {
     for (const [key, value] of Object.entries(RECOMMENDED_TUNING)) {
       const input = form.querySelector<HTMLInputElement>(`[name="${key}"]`);
@@ -2588,8 +2679,18 @@ function buildSettings(): Node[] {
   form.addEventListener("submit", (ev) => {
     ev.preventDefault();
     settingsForm = form;
-    if (firstRun) void saveAndCheckComputer().catch(() => {
+    const formConfig = {
+      processing_dir: q<HTMLInputElement>(form, '[name="processing_dir"]').value,
+      outbox_dir: q<HTMLInputElement>(form, '[name="outbox_dir"]').value,
+      local_output_dir: q<HTMLInputElement>(form, '[name="local_output_dir"]').value,
+      quarantine_dir: q<HTMLInputElement>(form, '[name="quarantine_dir"]').value,
+      output_mode: outputMode.value === "local" ? "local" : "power_automate",
+    } as Pick<Config, "processing_dir" | "outbox_dir" | "local_output_dir" | "quarantine_dir" | "output_mode">;
+    if (!hasRequiredFolders(formConfig)) void saveAndCheckComputer().catch(() => {
       // saveConfigFromForm already places the recoverable error beside the form.
+    });
+    else if (firstRun) void saveAndCheckComputer().catch(() => {
+      // A new installation should still check immediately once all folders are entered.
     });
     else void saveSettings();
   });
@@ -2621,7 +2722,11 @@ async function saveConfigFromForm(): Promise<void> {
     return input ? clampNumber(input) : null;
   };
   const next: Config = { ...cfg };
-  for (const key of ["processing_dir", "outbox_dir", "quarantine_dir", "slm_primary_gguf",
+  const mode = form.querySelector<HTMLSelectElement>('[name="output_mode"]')?.value === "local"
+    ? "local"
+    : "power_automate";
+  next.output_mode = mode;
+  for (const key of ["processing_dir", "outbox_dir", "local_output_dir", "quarantine_dir", "slm_primary_gguf",
     "slm_escalation_gguf", "ettin_model_dir"] as const) {
     const value = text(key);
     if (value !== null) next[key] = value;
@@ -2704,7 +2809,7 @@ function renderReadinessPanel(): HTMLElement {
   // Tri-state. On a fresh install every one of these flags is false because
   // nothing has been examined — rendering that as ten red BLOCKED rows is the
   // first thing a non-technical user ever sees, and it is a lie.
-  const rows = READINESS_CHECKS.map(([label, key]) => {
+  const rows = readinessChecksFor().map(([label, key]) => {
     const cls = !runtime.checked ? "check-unknown" : runtime[key] ? "check-pass" : "check-fail";
     const word = !runtime.checked ? "Not checked" : runtime[key] ? "Ready" : "Blocked";
     return `<li class="check-row ${cls}"><span>${esc(label)}</span><strong>${word}</strong></li>`;

@@ -66,6 +66,45 @@ Required results:
 - Qwen output that violates a checker rule is rejected and retried; and
 - replaying an existing delivery or manifest is idempotent.
 
+## Bounded Local folder acceptance path
+
+This path exercises the locally testable delivery mode. It is not evidence that
+the Power Automate tenant flows work; keep Flow 1 and Flow 2 disabled for this
+test.
+
+1. In Settings choose **Local folder**. Choose four separate, non-nested test
+   folders: a read-only source backup, Processing, Local Output, and
+   Quarantine. Save and run **Check this computer**.
+2. Put one ordinary supported document in Processing. Record its original path,
+   expected renamed output path, and the receipt path
+   `Local Output/.backlog/receipts/<manifest_id>.json`.
+3. Put two byte-identical physical copies in different Processing paths. Record
+   their distinct delivery IDs, output names, and receipts. Both copies must be
+   accounted for even though their content hash matches.
+4. Before delivery, create an unrelated file in Local Output with the proposed
+   final name. BackLog must keep that unrelated file and use the deterministic
+   collision suffix for its own output; it must not overwrite either file.
+5. During another delivery, stop BackLog or force the documented fault/restart
+   boundary. Restart it and reconcile the original source, renamed output, and
+   receipt. There must be one durable outcome, not a missing source, duplicate
+   output, or orphaned receipt.
+6. Include one document that reaches Needs Review. Correct it and approve it:
+   the renamed document must move directly from Quarantine to Local Output with
+   its receipt. Include a second flagged document and choose **Can't fix
+   this**: it must remain in Quarantine and must not produce Local Output or a
+   renamed document; its receipt must record the dismissed delivery state.
+7. Reconcile every test source against exactly one allowed outcome: still in
+   Processing only while unfinished; a renamed Local Output file with its
+   matching receipt; or Quarantine for flagged/dismissed work with its review
+   receipt. Record every manifest/delivery ID, output path, receipt path, and quarantine path. Stop
+   on any overwrite, source loss, unpaired completed output/receipt, or
+   unaccounted file.
+
+Pass criteria: the ordinary file, both physical duplicate copies, collision
+case, restart/fault case, corrected flagged file, and dismissed flagged file
+are all accounted for; no unrelated output changes; and Local Output contains
+no Power Automate manifests or `_manifests` directory.
+
 ## Stage 1: 50-document supervised batch
 
 Use non-sensitive or appropriately approved representative documents. Keep a
@@ -126,7 +165,9 @@ Gate for a wider pilot:
 
 For every stage record:
 
-- total physical files, instances, manifests, and unique content hashes;
+- total physical files, instances/deliveries, manifests where Power Automate
+  mode is used, local receipts where Local folder mode is used, and unique
+  content hashes;
 - conversion success by detected MIME type and native or scanned route;
 - OCR confidence and retry distribution;
 - Qwen3 primary versus escalation usage;
@@ -135,7 +176,9 @@ For every stage record:
 - human correction categories;
 - flagged-reason accuracy;
 - per-file and total processing time;
-- manifest-to-completed-flow latency;
+- Power Automate manifest-to-completed-flow latency, where that mode is used;
+- Local Output and receipt commit/recovery latency, where Local folder mode is
+  used;
 - flow retries, conflicts, throttling responses, and failed checkpoints; and
 - counts across every folder and SharePoint list before and after reconciliation.
 
@@ -143,8 +186,8 @@ For every stage record:
 
 Stop the batch and preserve all evidence when any of these occurs:
 
-- a source cannot be located in the backup, Processing, quarantine, Processed,
-  or Archive;
+- a source cannot be located in the backup, Processing, Quarantine, Local
+  Output plus receipt, Processed, or Archive as appropriate to its mode;
 - one ManifestId maps to different bytes or a different physical instance;
 - a destination file is overwritten;
 - a date unsupported by evidence passes the checker;
@@ -158,11 +201,14 @@ Stop the batch and preserve all evidence when any of these occurs:
 ## Rollback
 
 1. Pause BackLog.
-2. Disable Flow 1, Flow 2, and the recovery sweep.
+2. In Power Automate mode, disable Flow 1, Flow 2, and the recovery sweep. In
+   Local folder mode there is no Flow consumer to disable.
 3. Do not delete manifests or checkpoint rows.
 4. Export commit checkpoints, DocumentIndex, NeedsReview, and `_pa_errors`.
-5. Copy the local ledger, config, cache, Processing, Processed, quarantine, and
-   Outbox folders to a dated incident directory.
+5. Copy the local ledger, config, cache, Processing, Quarantine, and the
+   selected output folder (Outbox or Local Output, including local receipts) to
+   a dated incident directory. Include Processed/Archive where Power Automate
+   is in scope.
 6. Record running-process versions and all frozen hashes.
 7. Reconcile every source against the untouched backup.
 8. Fix and validate against synthetic fixtures before resuming at the previous

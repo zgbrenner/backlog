@@ -1,19 +1,21 @@
 # BackLog: a guide for the person who runs it
 
-BackLog watches a folder, works out what each document is, gives it a useful
-name, and hands it to the Power Automate flow that files it in SharePoint.
+BackLog watches a folder, works out what each document is, and gives it a
+useful name. You can use the existing **Power Automate / SharePoint** handoff
+or have BackLog file finished renamed documents directly into a **Local
+folder**.
 
 You do not need a terminal, Python, a separate model download, or a developer
 to install it.
 
 ## 1. Install one file - or use the no-installer package
 
-For the normal per-user install, download **`BackLog_0.7.0_x64-setup.exe`**
-from the [BackLog v0.7.0 release page](https://github.com/zgbrenner/backlog/releases)
+For the normal per-user install, download **`BackLog_0.8.0_x64-setup.exe`**
+from the [BackLog v0.8.0 release page](https://github.com/zgbrenner/backlog/releases)
 and double-click it. This is the only required download.
 
 If you are moving BackLog to another Windows x64 laptop and do not want an
-installer, download **`BackLog_0.7.0_x64-portable.zip`**, extract it completely,
+installer, download **`BackLog_0.8.0_x64-portable.zip`**, extract it completely,
 and double-click **`BackLog-Portable.cmd`**. The portable ZIP includes its own
 fixed WebView2 runtime and does not require a separate runtime, Python, VC++
 Redistributable, administrator password, or model download to launch. Keep the
@@ -42,22 +44,47 @@ your organization blocks unsigned applications, ask IT to review
 
 ## 2. Set it up once
 
-Open **Settings**. BackLog leads you through three steps:
+Open **Settings**. First choose an **Output mode**:
 
-1. Choose the **Processing**, **Outbox**, and **Quarantine** folders.
+- **Power Automate / SharePoint** (the default) writes a handoff manifest to
+  Outbox for Flow 2.
+- **Local folder** writes a finished renamed document to Local Output and a
+  JSON receipt for that delivery under `.backlog/receipts` inside Local Output.
+
+Then BackLog leads you through three steps:
+
+1. Choose **Processing**, **Quarantine**, and **Outbox** for Power Automate,
+   or **Processing**, **Quarantine**, and **Local Output** for Local folder.
 2. Press **Save and check this computer**.
 3. Read any Blocked message and use the action beside it.
 
 The Processing folder is the watched intake folder. New documents arrive
 there, either because you put them there or because the intake flow did.
 
-Outbox is where BackLog writes manifests for Power Automate. Quarantine is the
-local folder where files needing a person wait. Keep all three folders
-separate; do not put one inside another.
+Outbox is only for Power Automate manifests. Local Output is only for finished
+renamed documents and their receipts; Local mode does not write an Outbox
+manifest, a SharePoint index, or a cloud archive. Quarantine is the local
+folder where files needing a person wait. Keep the three folders required by
+your selected mode separate; do not put one inside another.
 
 The check confirms that the folders are usable and that the bundled document
 reader, naming server, rules, and everyday model can start. **Start** becomes
 available when every required check passes.
+
+### Local folder quick start
+
+1. Choose **Local folder** under **Output mode**.
+2. Browse to separate **Processing**, **Local Output**, and **Quarantine**
+   folders, then press **Save and check this computer**.
+3. Press **Start** and drop documents into Processing.
+4. Find each finished renamed document in Local Output. Its matching receipt
+   is at `.backlog/receipts/<manifest_id>.json` below that same folder.
+
+If an output name already exists, BackLog keeps it and chooses a deterministic
+suffix such as `(2)` for the new file. It removes the Processing source only
+after the renamed output and its receipt are durably written. If Windows or
+BackLog stops, restart it: recovery reconciles unfinished deliveries rather
+than overwriting an output.
 
 ### Optional model
 
@@ -87,11 +114,13 @@ The main states mean:
 |---|---|
 | **Processing** | BackLog is watching or working through the intake folder. |
 | **Needs Review** | BackLog needs a person to decide or correct something. |
-| **Done** | BackLog handed a manifest to Power Automate. |
+| **Done** | Power Automate mode: BackLog handed off a manifest. Local folder mode: BackLog wrote the renamed file and its receipt. |
 
-**Done does not mean SharePoint has finished.** The downstream Power Automate
-flow owns the later rename, archive, SharePoint copy, and list update. Its
-status and retry policy are separate from BackLog.
+In **Power Automate / SharePoint** mode, **Done does not mean SharePoint has
+finished.** The downstream flow owns the later rename, archive, SharePoint
+copy, and list update; see [`power-automate/BUILD-GUIDE.md`](../power-automate/BUILD-GUIDE.md).
+In **Local folder** mode, Done is a local delivery, not a Power Automate or
+SharePoint result.
 
 When no file is processing:
 
@@ -120,10 +149,13 @@ date/subject/description, the extracted text, and the event trail. You can
 filter by reason and sort oldest or newest first.
 
 - **Approve and file** uses your corrections and records that a person chose
-  them. A short Undo window follows you if you navigate to another tab.
+  them. In Local folder mode it files directly from Quarantine into Local
+  Output; in Power Automate mode it updates the handoff for Flow 2. A short
+  Undo window follows you if you navigate to another tab.
 - **Try again** sends the document through the bounded retry path.
 - **Can't fix this** sets it aside after confirmation. The document stays in
-  Quarantine, but the dismissal cannot currently be reversed inside BackLog.
+  Quarantine for manual handling, but the dismissal cannot currently be
+  reversed inside BackLog.
 
 A good subject is two to ten words and says what the document is. A good
 description is one sentence. If a correction breaks a rule, BackLog explains
@@ -134,7 +166,8 @@ which rule.
 For several thousand files:
 
 1. Add a few hundred at a time so Needs Review stays manageable.
-2. Ask the flow owner to set `manifest_emit_per_min` to 10.
+2. In Power Automate mode, ask the flow owner to set
+   `manifest_emit_per_min` to 10. It does not apply to Local folder delivery.
 3. Leave BackLog running overnight; hiding the window is safe.
 4. Work through Needs Review in sittings. Nothing expires.
 
@@ -146,13 +179,13 @@ key already inside the app.
 
 That updater signature is different from Windows Authenticode signing. The
 first protects the in-app update channel; the second establishes publisher
-identity and SmartScreen reputation for the installer. BackLog v0.7.0 can have
-a valid updater signature while still showing a SmartScreen warning because a
-trusted Authenticode certificate has not yet been configured.
+identity and SmartScreen reputation for the installer. A correctly signed
+BackLog v0.8.0 build can still show a SmartScreen warning because a trusted
+Authenticode certificate has not yet been configured.
 
-An unsigned v0.7.0 build may appear as a prerelease for manual testing. It is
+An unsigned v0.8.0 build may appear as a prerelease for manual testing. It is
 not offered through the stable updater; v0.4.4 remains the stable updater until
-a correctly signed v0.7.0 release exists.
+a correctly signed v0.8.0 release exists.
 
 ## Help
 

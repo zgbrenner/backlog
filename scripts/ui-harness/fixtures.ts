@@ -29,6 +29,8 @@ export type Scenario = {
 const CONFIG = {
   processing_dir: "C:\\Users\\dana\\OneDrive - Contoso\\BackLog\\Processing",
   outbox_dir: "C:\\Users\\dana\\OneDrive - Contoso\\BackLog\\Outbox",
+  output_mode: "power_automate",
+  local_output_dir: "C:\\Users\\dana\\Documents\\BackLog\\Filed",
   quarantine_dir: "C:\\ProgramData\\BackLog\\Quarantine",
   cache_dir: "C:\\Users\\dana\\AppData\\Roaming\\ai.sonomos.backlog\\cache",
   llama_port: 8137,
@@ -51,12 +53,14 @@ const CONFIG = {
 
 // Mirrors src-tauri/src/preflight.rs::RuntimeStatus.
 const READY_RUNTIME = {
+  output_mode: "power_automate",
   configured: true,
   checked: true,
   running: false,
   paused: false,
   processing_dir_ready: true,
   outbox_writable: true,
+  local_output_writable: true,
   quarantine_writable: true,
   cache_writable: true,
   sidecar_found: true,
@@ -157,6 +161,7 @@ const UNCHECKED_RUNTIME = {
   checked: false,
   processing_dir_ready: false,
   outbox_writable: false,
+  local_output_writable: false,
   quarantine_writable: false,
   cache_writable: false,
   sidecar_found: false,
@@ -186,7 +191,28 @@ const EMPTY_CONFIG = {
   ...CONFIG,
   processing_dir: "",
   outbox_dir: "",
+  local_output_dir: "",
   quarantine_dir: "",
+};
+
+/** Old installations have neither additive field on disk. The frontend must
+ * still visibly choose the established Power Automate handoff. */
+const LEGACY_EMPTY_CONFIG = { ...EMPTY_CONFIG } as Record<string, unknown>;
+delete LEGACY_EMPTY_CONFIG.output_mode;
+delete LEGACY_EMPTY_CONFIG.local_output_dir;
+
+const LOCAL_CONFIG = {
+  ...CONFIG,
+  output_mode: "local",
+  outbox_dir: "",
+  local_output_dir: "C:\\Users\\dana\\Documents\\BackLog\\Filed",
+};
+
+const LOCAL_READY_RUNTIME = {
+  ...READY_RUNTIME,
+  output_mode: "local",
+  outbox_writable: false,
+  local_output_writable: true,
 };
 
 // Mirrors src-tauri/src/ledger.rs::Job — the full row, which is also the
@@ -203,6 +229,8 @@ function job(over: Job): Job {
     detected_type: "pdf",
     route: "pdf_text",
     state: "emitted",
+    delivery_mode: "power_automate",
+    delivery_root: "C:\\Users\\dana\\OneDrive - Contoso\\BackLog\\Outbox",
     attempts: 0,
     last_stage: null,
     active_stage: null,
@@ -333,6 +361,14 @@ const FLAGGED: Job[] = [
     final_filename: null,
   }),
 ];
+
+/** These rows were accepted while Local folder delivery was selected. Their
+ * immutable delivery contract must survive a later Settings change. */
+const LOCAL_FLAGGED: Job[] = FLAGGED.map((row) => ({
+  ...row,
+  delivery_mode: "local",
+  delivery_root: LOCAL_CONFIG.local_output_dir,
+}));
 
 /** A backfill big enough to expose anything that only breaks at size. */
 const BIG_QUEUE: Job[] = Array.from({ length: 5000 }, (_, i) =>
@@ -623,9 +659,14 @@ function shrinking(rows: Job[]): { live: Job[]; remove: (args?: unknown) => unkn
 }
 
 /** The Needs Review screen against a list that empties as it is worked. */
-function reviewScenario(label: string, stats: Record<string, number>): Scenario {
-  const { live, remove } = shrinking(FLAGGED);
-  const s = scenario(label, READY_RUNTIME, stats, QUEUE, live, { view: "flagged" });
+function reviewScenario(
+  label: string,
+  stats: Record<string, number>,
+  runtime: unknown = READY_RUNTIME,
+  rows: Job[] = FLAGGED
+): Scenario {
+  const { live, remove } = shrinking(rows);
+  const s = scenario(label, runtime, stats, QUEUE, live, { view: "flagged" });
   return {
     ...s,
     commands: {
@@ -696,7 +737,7 @@ function reviewReasons(): Scenario {
 
 /** A true caught-up queue has only completed history, and its history matches
  * the counters shown in the header rather than pretending the ledger is empty. */
-function caughtUpHistory(): Job[] {
+function caughtUpHistory(deliveryMode: "local" | "power_automate" = "power_automate"): Job[] {
   return Array.from({ length: 22 }, (_, i) => {
     const flagged = i >= 18;
     const suffix = i.toString(16).padStart(2, "0");
@@ -706,6 +747,8 @@ function caughtUpHistory(): Job[] {
       state: flagged ? "flagged" : "emitted",
       flag_reason: flagged ? "BAD_SUBJECT:generic subject" : null,
       quarantine_path: flagged ? `C:\\ProgramData\\BackLog\\Quarantine\\needs-a-person-${i - 17}.pdf` : null,
+      delivery_mode: deliveryMode,
+      delivery_root: deliveryMode === "local" ? LOCAL_CONFIG.local_output_dir : CONFIG.outbox_dir,
     });
   });
 }
@@ -737,7 +780,7 @@ export const SCENARIOS: Record<string, Scenario> = {
     ...scenario("First run, nothing configured", UNCHECKED_RUNTIME, STATS_EMPTY, [], []),
     commands: {
       ...withFlaggedCount(base(UNCHECKED_RUNTIME, STATS_EMPTY, [], []), [], []),
-      get_config: EMPTY_CONFIG,
+      get_config: LEGACY_EMPTY_CONFIG,
       // Nothing is installed yet on a fresh machine, so the convertd probe
       // behind the version line fails — but the command itself still succeeds
       // and reports the app version, which is the line the pilot runbook asks
@@ -766,6 +809,23 @@ export const SCENARIOS: Record<string, Scenario> = {
       set_config: null,
       run_preflight: () => new Error("the readiness check could not reach BackLog"),
       get_diagnostics: DIAGNOSTICS_NO_SIDECAR,
+    },
+  },
+
+  /** Direct local delivery has no Outbox requirement or manifest consumer. */
+  "local-ready": {
+    ...scenario("Local Output ready", LOCAL_READY_RUNTIME, STATS_EMPTY, [], [], { view: "settings" }),
+    commands: {
+      ...withFlaggedCount(base(LOCAL_READY_RUNTIME, STATS_EMPTY, [], []), [], []),
+      get_config: LOCAL_CONFIG,
+    },
+  },
+
+  "local-review": {
+    ...reviewScenario("Local Output correction", { emitted: 12, flagged: 4 }, LOCAL_READY_RUNTIME, LOCAL_FLAGGED),
+    commands: {
+      ...reviewScenario("Local Output correction", { emitted: 12, flagged: 4 }, LOCAL_READY_RUNTIME, LOCAL_FLAGGED).commands,
+      get_config: LOCAL_CONFIG,
     },
   },
 
@@ -898,6 +958,37 @@ export const SCENARIOS: Record<string, Scenario> = {
     caughtUpHistory(),
     FLAGGED
   ),
+
+  /** Local delivery must never render the Power Automate-only queue summary. */
+  "local-caught-up-reviews": {
+    ...scenario(
+      "Local Output caught up with reviews remaining",
+      LOCAL_READY_RUNTIME,
+      { emitted: 18, flagged: 4, per_hour: 0 },
+      caughtUpHistory("local"),
+      LOCAL_FLAGGED
+    ),
+    commands: {
+      ...scenario(
+        "Local Output caught up with reviews remaining",
+        LOCAL_READY_RUNTIME,
+        { emitted: 18, flagged: 4, per_hour: 0 },
+        caughtUpHistory("local"),
+        LOCAL_FLAGGED
+      ).commands,
+      get_config: LOCAL_CONFIG,
+    },
+  },
+
+  /** The queue can briefly have active counters before its first row arrives;
+   * its empty state must still not direct a Local user to SharePoint intake. */
+  "local-queue-awaiting-first-row": {
+    ...scenario("Local Output queue awaiting first row", LOCAL_READY_RUNTIME, STATS_BUSY, [], []),
+    commands: {
+      ...scenario("Local Output queue awaiting first row", LOCAL_READY_RUNTIME, STATS_BUSY, [], []).commands,
+      get_config: LOCAL_CONFIG,
+    },
+  },
 
   "review-reasons": reviewReasons(),
 

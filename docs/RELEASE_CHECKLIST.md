@@ -1,4 +1,4 @@
-# BackLog v0.7.0 release checklist
+# BackLog v0.8.0 release checklist
 
 A release remains a pilot candidate until every applicable item has fresh
 evidence attached to the release record.
@@ -26,14 +26,14 @@ evidence attached to the release record.
 
 - [ ] `python power-automate/validate_examples.py` passes after installing
       `power-automate/requirements-dev.txt`.
-- [ ] `node .github/scripts/check-versions.mjs` reports 0.7.0, the `backlog`
-      package in `src-tauri/Cargo.lock` is 0.7.0, and `CHANGELOG.md` has the
-      0.7.0 section.
+- [ ] `node .github/scripts/check-versions.mjs` reports 0.8.0, the `backlog`
+      package in `src-tauri/Cargo.lock` is 0.8.0, and `CHANGELOG.md` has the
+      0.8.0 section.
 
 ## One-download package
 
-- [ ] The installer download is `BackLog_0.7.0_x64-setup.exe`; the
-      installer-free option is `BackLog_0.7.0_x64-portable.zip`.
+- [ ] The installer download is `BackLog_0.8.0_x64-setup.exe`; the
+      installer-free option is `BackLog_0.8.0_x64-portable.zip`.
 - [ ] The installer contains the app, `convertd` with its Python runtime,
       `llama-server` and every imported runtime DLL, Qwen3 0.6B Q8_0, the
       pinned MiniLM semantic model/tokenizer, and the offline WebView2 runtime.
@@ -101,6 +101,26 @@ evidence attached to the release record.
 - [ ] Documents without a trustworthy date require review; a genuinely
       undated document uses the file-modified date with honest provenance.
 
+## Local Output direct delivery
+
+- [ ] **Local folder** is available in Settings alongside the default
+      **Power Automate / SharePoint** mode. In Local mode, Processing, Local
+      Output, and Quarantine are distinct, non-nested safe roots; Outbox is not
+      required.
+- [ ] An ordinary Local delivery produces the finished renamed document in
+      Local Output and exactly one receipt at
+      `.backlog/receipts/<manifest_id>.json`. It does not write an Outbox
+      manifest, SharePoint index, or cloud archive.
+- [ ] Duplicate physical copies and an unrelated preexisting output collision
+      retain every existing file and use the deterministic no-overwrite suffix.
+- [ ] Restart/fault recovery reconciles every Local source with its output and
+      receipt. A corrected flagged file moves directly from Quarantine to Local
+      Output; a dismissed file remains in Quarantine with its review receipt
+      and no delivered output path.
+- [ ] Needs Review wording follows each job's immutable delivery mode after a
+      Settings switch; a Local-pinned job never becomes a Power Automate
+      handoff, and vice versa.
+
 ## Power Automate handoff
 
 - [ ] **Done** is described and tested as “manifest handed to Power Automate,”
@@ -114,6 +134,10 @@ evidence attached to the release record.
       `"manifest_emit_per_min": 10`.
 - [ ] Forced failures after archive, index, and source move resume without
       duplicate rows or stranded files.
+- [ ] These are target-tenant gates, not claims made by the Local Output
+      release checks. Record Flow 1/Flow 2 connector permissions, manifest
+      pickup, SharePoint indexing/archive, throttling, and checkpoint-recovery
+      evidence separately.
 
 ## Privacy and security
 
@@ -132,11 +156,11 @@ evidence attached to the release record.
 
 ## Publication guard
 
-- [ ] `v0.7.0` does not exist before the prepared release commit reaches
+- [ ] `v0.8.0` does not exist before the prepared release commit reaches
       `main`; successful CI starts the release workflow automatically for that
       exact commit.
 - [ ] The release-state preflight starts Windows packaging only after successful
-      CI on `main` for the exact release commit. A published `v0.7.0` skips
+      CI on `main` for the exact release commit. A published `v0.8.0` skips
       cleanly; only a matching interrupted draft can resume, and a tag pointing
       at any other commit fails closed.
 - [ ] If `TAURI_SIGNING_PRIVATE_KEY` is present, it matches the updater public
