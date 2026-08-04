@@ -1,5 +1,9 @@
 # Flow 1: Intake Mover
 
+> Build this as an **automated cloud flow** in the Power Automate web portal.
+> It is not a Power Automate for desktop flow and does not require the desktop
+> app.
+
 Moves each new SharePoint intake file into the OneDrive-synced Processing
 folder that BackLog watches. The flow performs transport only — it does not
 rename anything and does not decide anything.
@@ -72,7 +76,8 @@ Do not use either deprecated folder trigger.
 
 - Site Address: the intake site
 - Library Name: `Intake`
-- Folder: `/` or the intended drop subfolder
+- Folder: `/` or the intended drop subfolder. Some tenants represent the
+  library root as a blank picker value; use that if the designer rejects `/`.
 - Concurrency Control: On
 - Degree of Parallelism: `1`
 
@@ -128,8 +133,12 @@ Add **Create file** from the OneDrive for Business connector.
   unmodified
 - File Content: output of `Get_file_content`
 
-The OneDrive connector creates missing folders in the path, so the flow needs
-no separate folder-creation action of its own.
+Start the pilot without a separate folder-creation action. Microsoft's
+connector reference documents `Folder Path` but does not guarantee that
+**Create file** creates a missing delivery folder. Prove this behavior with one
+delivery in the target tenant before rollout. If the action returns `folder
+not found`, keep the stable delivery token and add a tenant-supported,
+deterministic folder-provisioning step.
 
 In the action settings:
 
@@ -146,6 +155,7 @@ record the failure for review rather than inventing another identity.
 
 Add **Delete file** from the SharePoint connector.
 
+- Site Address: the intake site
 - File Identifier: `Identifier` from the trigger
 
 Keep its default run-after setting so it runs only when **Create file**
@@ -183,14 +193,23 @@ BackLog intake transfer failed. The SharePoint source was retained.
 
 ## `_pa_errors` list
 
-Create a SharePoint list named `_pa_errors` with these columns:
+Create one shared SharePoint list named `_pa_errors`. Both flows write to it,
+so use the superset below and make every custom field optional:
 
-| Column | Type | Purpose |
+| Column | Type | Used by |
 |---|---|---|
-| Title | Single line of text | Original source filename |
-| Stage | Single line of text | `flow1-transfer`, `flow2-*`, or sweep stage |
-| Detail | Multiple lines of text | Serialized action or scope result |
-| When | Date and time | Failure timestamp |
+| `Title` | Single line of text | Flow 1 original filename |
+| `ManifestId` | Single line of text, indexed | Flow 2 delivery identity |
+| `Sha256` | Single line of text, indexed | Flow 2 content identity |
+| `Stage` | Single line of text | Both |
+| `Detail` | Multiple lines of plain text | Flow 1 scope result |
+| `Message` | Multiple lines of plain text | Flow 2 error message |
+| `RunId` | Single line of text | Flow 2 run identity |
+| `Retryable` | Yes/No | Flow 2 retry classification |
+| `When` | Date and time | Flow 1 failure timestamp |
+| `OccurredAt` | Date and time | Flow 2 failure timestamp |
+
+See `BUILD-GUIDE.md` for the recommended Solution layout and acceptance order.
 
 ## How this reaches Flow 2
 

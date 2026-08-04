@@ -203,7 +203,13 @@ pipeline keeps running in the background — quit from the tray menu.
 
 ### 5. Power Automate
 
-Build the two flows per `power-automate/FLOW1-intake.md` and
+These are **automated cloud flows** built in the Power Automate web portal,
+not desktop flows. Power Automate for desktop is not required for the BackLog
+handoff described here; use the SharePoint and OneDrive for Business cloud
+connectors and triggers named in the flow guides.
+
+Start with `power-automate/BUILD-GUIDE.md`, then build the two flows per
+`power-automate/FLOW1-intake.md` and
 `power-automate/FLOW2-commit.md`, including the `DocumentIndex`, `NeedsReview`,
 and `_pa_errors` lists.
 
