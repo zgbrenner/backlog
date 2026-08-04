@@ -40,6 +40,19 @@ jobs:
               for line in source.splitlines()
           )
           exec(compile(source, 'signed-release-patch.py', 'exec'))
+
+          validator_path = Path('scripts/validate-release-workflow.mjs')
+          validator = validator_path.read_text()
+          needle = '  if (unsignedPublish) {\n    if (normalizedIf(unsignedPublish)'
+          replacement = (
+              '  if (unsignedPublish) {\n'
+              '    const unsignedRun = stepRun(unsignedPublish);\n'
+              '    if (normalizedIf(unsignedPublish)'
+          )
+          if needle not in validator:
+              raise SystemExit('optional unsigned validator block was not found')
+          validator_path.write_text(validator.replace(needle, replacement, 1))
+
           Path('.github/workflows/apply-signed-release-fix-pr.yml').unlink()
           PY
       - name: Verify implementation
