@@ -74,23 +74,17 @@ jobs:
           repair_path = Path('.github/workflows/repair-v0.8.0.yml')
           repair_path.write_text(textwrap.dedent(repair_path.read_text()).lstrip())
 
-          checklist_path = Path('docs/RELEASE_CHECKLIST.md')
-          checklist = checklist_path.read_text()
-          checklist_marker = '          ## Publication guard'
-          checklist_index = checklist.index(checklist_marker)
-          checklist_path.write_text(
-              checklist[:checklist_index]
-              + textwrap.dedent(checklist[checklist_index:])
-          )
+          def dedent_from_heading(path, heading):
+              file_path = Path(path)
+              content = file_path.read_text()
+              heading_index = content.index(heading)
+              line_start = content.rfind('\n', 0, heading_index) + 1
+              file_path.write_text(
+                  content[:line_start] + textwrap.dedent(content[line_start:])
+              )
 
-          releasing_path = Path('RELEASING.md')
-          releasing = releasing_path.read_text()
-          releasing_marker = '          ## Signing policy'
-          releasing_index = releasing.index(releasing_marker)
-          releasing_path.write_text(
-              releasing[:releasing_index]
-              + textwrap.dedent(releasing[releasing_index:])
-          )
+          dedent_from_heading('docs/RELEASE_CHECKLIST.md', '## Publication guard')
+          dedent_from_heading('RELEASING.md', '## Signing policy')
 
           Path('.github/workflows/apply-signed-release-fix-pr.yml').unlink()
           PY
