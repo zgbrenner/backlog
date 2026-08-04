@@ -646,6 +646,52 @@ fn dismiss(state: tauri::State<AppState>, sha256: String, note: String) -> Resul
     dismiss_inner(&state, &sha256, &note)
 }
 
+fn validate_local_dismissal_source(
+    output_root: &Path,
+    job: &ledger::Job,
+    quarantine_root: &Path,
+    quarantine_path: &Path,
+) -> Result<(), String> {
+    let same_path = |left: &Path, right: &Path| {
+        identity::normalize_relpath(&left.to_string_lossy())
+            == identity::normalize_relpath(&right.to_string_lossy())
+    };
+    if !watcher::is_safe_path_under_root(quarantine_root, quarantine_path)
+        || !quarantine_path.is_file()
+    {
+        return Err(
+            "The pinned quarantine file is missing or outside its recorded quarantine folder."
+                .into(),
+        );
+    }
+    if pipeline::hash_file(quarantine_path).map_err(|error| error.to_string())?
+        != job.content_sha256
+    {
+        return Err("The pinned quarantine file changed after it entered review.".into());
+    }
+    if let Some(receipt) = local_output::read_receipt(output_root, &job.delivery_id)
+        .map_err(|error| error.to_string())?
+    {
+        let receipt_root = PathBuf::from(&receipt.source_root);
+        let receipt_path = PathBuf::from(&receipt.source_path);
+        if receipt.receipt_schema != 1
+            || receipt.delivery_mode != "local"
+            || receipt.output_relpath.is_some()
+            || receipt.manifest.status != "flagged"
+            || receipt.manifest.new_filename.is_some()
+            || receipt.manifest.manifest_id != job.delivery_id
+            || receipt.manifest.sha256 != job.content_sha256
+            || !same_path(&receipt_root, quarantine_root)
+            || !same_path(&receipt_path, quarantine_path)
+        {
+            return Err(
+                "The local review receipt does not match its pinned quarantine file.".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn dismiss_inner(state: &AppState, sha256: &str, note: &str) -> Result<(), String> {
     if !is_ledger_key(sha256) {
         return Err("invalid id".into());
@@ -731,7 +777,9 @@ fn dismiss_inner(state: &AppState, sha256: &str, note: &str) -> Result<(), Strin
                     .quarantine_root
                     .as_deref()
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| cfg.quarantine_dir.clone());
+                    .ok_or_else(|| {
+                        "This local review item has no pinned quarantine folder.".to_string()
+                    })?;
                 let quarantine_path = job
                     .quarantine_path
                     .as_deref()
@@ -739,6 +787,7 @@ fn dismiss_inner(state: &AppState, sha256: &str, note: &str) -> Result<(), Strin
                     .ok_or_else(|| {
                         "This local review item has no pinned quarantine source.".to_string()
                     })?;
+                validate_local_dismissal_source(&root, &job, &quarantine_root, &quarantine_path)?;
                 local_output::record_review(&root, &quarantine_root, &quarantine_path, &dismissal)
                     .map_err(|e| format!("Could not record the local dismissal: {e}"))
             }
@@ -1836,6 +1885,60 @@ mod tests {
         quarantined
     }
 
+    fn local_flagged_job(state: &AppState, root: &Path) -> (String, PathBuf, PathBuf, String) {
+        let local_root = root.join("local-output");
+        let quarantine_root = root.join("pinned-local-quarantine");
+        std::fs::create_dir_all(&local_root).unwrap();
+        std::fs::create_dir_all(&quarantine_root).unwrap();
+        let quarantined = quarantine_root.join("review.pdf");
+        std::fs::write(&quarantined, b"pinned review bytes").unwrap();
+        let sha = pipeline::hash_file(&quarantined).unwrap();
+        let processing = root.join("proc");
+        state
+            .ledger
+            .ingest_with_delivery(
+                &sha,
+                &processing.join("review.pdf").to_string_lossy(),
+                "review.pdf",
+                "review.pdf",
+                "pdf",
+                "local",
+                &local_root.to_string_lossy(),
+                &processing.to_string_lossy(),
+                &sha,
+            )
+            .unwrap();
+        state
+            .ledger
+            .update_fields(
+                &sha,
+                &[
+                    (
+                        "quarantine_path",
+                        Some(quarantined.to_string_lossy().into_owned()),
+                    ),
+                    (
+                        "quarantine_planned_path",
+                        Some(quarantined.to_string_lossy().into_owned()),
+                    ),
+                    (
+                        "quarantine_root",
+                        Some(quarantine_root.to_string_lossy().into_owned()),
+                    ),
+                    ("flag_reason", Some("NEEDS_REVIEW:test".into())),
+                ],
+            )
+            .unwrap();
+        state
+            .ledger
+            .set_state(&sha, ledger::JobState::Flagged)
+            .unwrap();
+        let job = state.ledger.get(&sha).unwrap().unwrap();
+        let flagged = flagged_manifest(&sha, &job.delivery_id, "review.pdf", "review.pdf");
+        local_output::record_review(&local_root, &quarantine_root, &quarantined, &flagged).unwrap();
+        (sha, quarantined, local_root, job.delivery_id)
+    }
+
     /// The pending delivery `Pipeline::flag` leaves in the Outbox, which is
     /// what `dismiss` has to supersede rather than sit alongside.
     fn flagged_manifest(
@@ -2766,6 +2869,9 @@ mod tests {
             .ledger
             .set_state(&sha, ledger::JobState::Flagged)
             .unwrap();
+        let job = state.ledger.get(&sha).unwrap().unwrap();
+        let flagged = flagged_manifest(&sha, &job.delivery_id, "review.pdf", "review.pdf");
+        local_output::record_review(&local_root, &quarantine, &file, &flagged).unwrap();
         // Settings now point to PA, but the review decision must remain local.
         state.cfg.lock().unwrap().output_mode = config::OutputMode::PowerAutomate;
 
@@ -2788,5 +2894,97 @@ mod tests {
             .manifests_dir()
             .join(format!("{id}.json"))
             .exists());
+    }
+
+    #[test]
+    fn local_dismissal_refuses_a_removed_pinned_quarantine_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = stopped_state(dir.path());
+        let (sha, quarantined, local_root, delivery_id) = local_flagged_job(&state, dir.path());
+        let receipt_path = local_root
+            .join(".backlog/receipts")
+            .join(format!("{delivery_id}.json"));
+        let flagged_receipt = std::fs::read(&receipt_path).unwrap();
+        std::fs::remove_file(&quarantined).unwrap();
+
+        let error = dismiss_inner(&state, &sha, "junk").unwrap_err();
+        assert!(error.contains("missing"), "{error}");
+        let after = state.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(after.state, ledger::JobState::Flagged);
+        assert!(after.review_operation.is_none());
+        assert!(after.review_owner.is_none());
+        assert!(!quarantined.exists());
+        assert_eq!(std::fs::read(receipt_path).unwrap(), flagged_receipt);
+    }
+
+    #[test]
+    fn local_dismissal_refuses_a_modified_pinned_quarantine_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = stopped_state(dir.path());
+        let (sha, quarantined, local_root, delivery_id) = local_flagged_job(&state, dir.path());
+        let receipt_path = local_root
+            .join(".backlog/receipts")
+            .join(format!("{delivery_id}.json"));
+        let flagged_receipt = std::fs::read(&receipt_path).unwrap();
+        std::fs::write(&quarantined, b"modified after review").unwrap();
+
+        let error = dismiss_inner(&state, &sha, "junk").unwrap_err();
+        assert!(error.contains("changed"), "{error}");
+        let after = state.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(after.state, ledger::JobState::Flagged);
+        assert!(after.review_operation.is_none());
+        assert!(after.review_owner.is_none());
+        assert_eq!(
+            std::fs::read(&quarantined).unwrap(),
+            b"modified after review"
+        );
+        assert_eq!(std::fs::read(receipt_path).unwrap(), flagged_receipt);
+    }
+
+    #[test]
+    fn local_dismissal_recreates_a_missing_flagged_receipt_from_the_pinned_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = stopped_state(dir.path());
+        let (sha, quarantined, local_root, delivery_id) = local_flagged_job(&state, dir.path());
+        let receipt_path = local_root
+            .join(".backlog/receipts")
+            .join(format!("{delivery_id}.json"));
+        std::fs::remove_file(&receipt_path).unwrap();
+
+        dismiss_inner(&state, &sha, "safe recreation").unwrap();
+        let job = state.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(job.state, ledger::JobState::Dismissed);
+        assert!(job.review_operation.is_none());
+        assert!(job.review_owner.is_none());
+        assert!(quarantined.exists());
+        let receipt = local_output::read_receipt(&local_root, &delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.manifest.status, "dismissed");
+        assert_eq!(receipt.source_path, quarantined.to_string_lossy());
+    }
+
+    #[test]
+    fn local_dismissal_rejects_legacy_row_without_pinned_quarantine_root_and_releases_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = stopped_state(dir.path());
+        let (sha, quarantined, local_root, delivery_id) = local_flagged_job(&state, dir.path());
+        let receipt_path = local_root
+            .join(".backlog/receipts")
+            .join(format!("{delivery_id}.json"));
+        let receipt = std::fs::read(&receipt_path).unwrap();
+        state
+            .ledger
+            .update_fields(&sha, &[("quarantine_root", None)])
+            .unwrap();
+
+        let error = dismiss_inner(&state, &sha, "legacy root missing").unwrap_err();
+        assert!(error.contains("no pinned quarantine folder"), "{error}");
+        let after = state.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(after.state, ledger::JobState::Flagged);
+        assert!(after.review_operation.is_none());
+        assert!(after.review_owner.is_none());
+        assert!(quarantined.exists());
+        assert_eq!(std::fs::read(receipt_path).unwrap(), receipt);
     }
 }

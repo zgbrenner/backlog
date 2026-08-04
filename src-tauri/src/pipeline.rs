@@ -2405,6 +2405,18 @@ fn validate_local_receipt_identity(
     job: &Job,
     original_relpath: &str,
 ) -> anyhow::Result<()> {
+    let output_name_matches_ledger = if receipt.manifest.status == "ok" {
+        let receipt_name = receipt
+            .manifest
+            .new_filename
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("local ok receipt has no output name"))?;
+        receipt.output_relpath.as_deref() == Some(receipt_name)
+            && (job.final_filename.as_deref() == Some(receipt_name)
+                || job.recovery_previous_filename.as_deref() == Some(receipt_name))
+    } else {
+        true
+    };
     anyhow::ensure!(
         receipt.receipt_schema == 1
             && receipt.delivery_mode == "local"
@@ -2413,7 +2425,8 @@ fn validate_local_receipt_identity(
             && receipt.manifest.sha256 == job.content_sha256
             && receipt.manifest.duplicate_of == manifest_duplicate_of(job)
             && crate::identity::normalize_relpath(&receipt.manifest.original_relpath)
-                == crate::identity::normalize_relpath(original_relpath),
+                == crate::identity::normalize_relpath(original_relpath)
+            && output_name_matches_ledger,
         "local receipt does not match its ledger delivery"
     );
     Ok(())
@@ -2637,6 +2650,14 @@ fn reconcile_local_receipt(
             },
         )?;
     }
+    // Intent recovery may atomically advance the ledger through one or more
+    // filesystem collisions. Bind the resulting receipt and terminal CAS to
+    // that current reservation rather than the row snapshot from before the
+    // recovery loop.
+    let refreshed_job = ledger
+        .get(&job.sha256)?
+        .ok_or_else(|| anyhow::anyhow!("local delivery disappeared during recovery"))?;
+    let job = &refreshed_job;
     let receipt = match local_output::read_receipt(&root, &mid)? {
         Some(receipt) => receipt,
         None => {
@@ -3909,6 +3930,7 @@ mod tests {
             let base = format!("2026-08-04 Live {kind}");
             let initial = format!("{base}.pdf");
             let recovered_name = format!("{base} (2).pdf");
+            let safe_name = format!("{base} (3).pdf");
             let soft_flags = if duplicate {
                 vec!["DUPLICATE_CONTENT".to_string()]
             } else {
@@ -4021,6 +4043,11 @@ mod tests {
                 after_advance.recovery_previous_filename.as_deref(),
                 Some(initial.as_str())
             );
+            std::fs::write(
+                h.pipeline.cfg.local_output_dir.join(&recovered_name),
+                body.as_bytes(),
+            )
+            .unwrap();
 
             assert_eq!(
                 reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
@@ -4030,7 +4057,7 @@ mod tests {
             assert_eq!(recovered.state, JobState::Emitted);
             assert_eq!(
                 recovered.final_filename.as_deref(),
-                Some(recovered_name.as_str())
+                Some(safe_name.as_str())
             );
             assert!(recovered.recovery_previous_filename.is_none());
             assert!(!source.exists());
@@ -4040,6 +4067,11 @@ mod tests {
             );
             assert_eq!(
                 std::fs::read(h.pipeline.cfg.local_output_dir.join(&recovered_name)).unwrap(),
+                body.as_bytes(),
+                "same-hash foreign suffix must not be adopted"
+            );
+            assert_eq!(
+                std::fs::read(h.pipeline.cfg.local_output_dir.join(&safe_name)).unwrap(),
                 body.as_bytes()
             );
             let receipt =
@@ -4077,6 +4109,13 @@ mod tests {
                 &h.pipeline.cfg.local_output_dir.to_string_lossy(),
                 &old_processing.to_string_lossy(),
                 &content_sha,
+            )
+            .unwrap();
+        h.pipeline
+            .ledger
+            .update_fields(
+                &duplicate_id,
+                &[("final_filename", Some("copy (2).pdf".into()))],
             )
             .unwrap();
         let manifest = Manifest {
@@ -4214,6 +4253,111 @@ mod tests {
             after_manifest_tamper.review_owner.as_deref(),
             Some(owner.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn receipt_only_ok_recovery_rejects_same_hash_foreign_name_outside_ledger_reservation() {
+        let h = Harness::with(|cfg| {
+            cfg.output_mode = crate::config::OutputMode::Local;
+            cfg.local_output_dir = cfg.processing_dir.parent().unwrap().join("local-output");
+        });
+        let rel = "review/tampered-receipt-name.pdf";
+        let body = b"receipt name must remain ledger bound";
+        let (sha, processing_source) = h.seed(rel, std::str::from_utf8(body).unwrap());
+        h.pipeline
+            .flag(&sha, &processing_source, "SLM_FAIL:review".into(), &clock())
+            .await;
+        let flagged = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let quarantine_root = PathBuf::from(flagged.quarantine_root.as_ref().unwrap());
+        let quarantined = PathBuf::from(flagged.quarantine_path.as_ref().unwrap());
+        let owner = h
+            .pipeline
+            .ledger
+            .begin_review_operation(&sha, "correct")
+            .unwrap()
+            .unwrap();
+        let reserved_name = "2026-08-04 Ledger Reserved.pdf";
+        h.pipeline
+            .ledger
+            .update_fields(&sha, &[("final_filename", Some(reserved_name.into()))])
+            .unwrap();
+        let job = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        let corrected = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            manifest_id: job.delivery_id.clone(),
+            sha256: job.content_sha256.clone(),
+            status: "ok".into(),
+            original_name: job.original_name.clone(),
+            original_relpath: rel.into(),
+            new_filename: Some(reserved_name.into()),
+            description: Some("A ledger-bound corrected document.".into()),
+            date: Some("2026-08-04".into()),
+            date_source: Some("human".into()),
+            doc_type: job.doc_type.clone(),
+            language: job.language.clone(),
+            duplicate_of: None,
+            soft_flags: vec!["HUMAN_CORRECTED".into()],
+            flag_reason: None,
+            model_versions: json!({"human": "test"}),
+            processed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let delete_error = local_output::deliver_with_remove_for_test(
+            &h.pipeline.cfg.local_output_dir,
+            &quarantine_root,
+            &quarantined,
+            &corrected,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected delete failure",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(delete_error.to_string().contains("injected delete failure"));
+        let intent_path = h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join(".backlog/intents")
+            .join(format!("{}.json", job.delivery_id));
+        std::fs::remove_file(intent_path).unwrap();
+
+        let foreign_name = "same-hash-foreign.pdf";
+        let foreign = h.pipeline.cfg.local_output_dir.join(foreign_name);
+        std::fs::write(&foreign, body).unwrap();
+        let receipt_path = h
+            .pipeline
+            .cfg
+            .local_output_dir
+            .join(".backlog/receipts")
+            .join(format!("{}.json", job.delivery_id));
+        let mut receipt: local_output::Receipt =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        receipt.output_relpath = Some(foreign_name.into());
+        receipt.manifest.new_filename = Some(foreign_name.into());
+        let tampered = serde_json::to_vec_pretty(&receipt).unwrap();
+        std::fs::write(&receipt_path, &tampered).unwrap();
+        let before = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+
+        assert_eq!(
+            reconcile_terminal_manifests(&h.pipeline.cfg, &h.pipeline.ledger).unwrap(),
+            0
+        );
+        let after = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(after.state, JobState::Flagged);
+        assert_eq!(after.review_owner.as_deref(), Some(owner.as_str()));
+        assert!(quarantined.exists());
+        assert_eq!(std::fs::read(&foreign).unwrap(), body);
+        assert_eq!(
+            std::fs::read(h.pipeline.cfg.local_output_dir.join(reserved_name)).unwrap(),
+            body
+        );
+        assert_eq!(std::fs::read(receipt_path).unwrap(), tampered);
     }
 
     #[tokio::test]
