@@ -104,10 +104,15 @@ export function shouldStartRelease({
 
 export function releasePlan(privateKey) {
   const signed = typeof privateKey === "string" && privateKey.trim().length > 0;
+  if (!signed) {
+    throw new Error(
+      "TAURI_SIGNING_PRIVATE_KEY is required for stable release publication",
+    );
+  }
   return {
-    signed,
-    prerelease: !signed,
-    publishUpdater: signed,
+    signed: true,
+    prerelease: false,
+    publishUpdater: true,
   };
 }
 
@@ -399,11 +404,7 @@ async function runCli() {
         `publish_updater=${plan.publishUpdater}\n`,
       "utf8",
     );
-    console.log(
-      plan.signed
-        ? "Updater key available: stable signed publication enabled."
-        : "Updater key absent: unsigned prerelease selected.",
-    );
+    console.log("Updater key available: stable signed publication enabled.");
     return;
   }
 

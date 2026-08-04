@@ -229,7 +229,7 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   if (normalizedIf(signedBuild) !== signedCondition) {
     problems.push("signed build must run only when the updater key is present");
   }
-  if (normalizedIf(unsignedBuild) !== unsignedCondition) {
+  if (unsignedBuild && normalizedIf(unsignedBuild) !== unsignedCondition) {
     problems.push("unsigned build must run only when the updater key is absent");
   }
   if (!stepRun(signedBuild).includes("npm run tauri build")) {
@@ -244,8 +244,9 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     problems.push("signed build must receive the updater key and optional password");
   }
   if (
-    !stepRun(unsignedBuild).includes("npm run tauri build") ||
-    !stepRun(unsignedBuild).includes("tauri.unsigned.conf.json")
+    unsignedBuild &&
+    (!stepRun(unsignedBuild).includes("npm run tauri build") ||
+      !stepRun(unsignedBuild).includes("tauri.unsigned.conf.json"))
   ) {
     problems.push("unsigned build must explicitly disable updater artifacts");
   }
@@ -279,8 +280,11 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   if (steps.indexOf(releaseNotes) <= steps.indexOf(portableVerify)) {
     problems.push("release notes must be written after portable ZIP verification");
   }
-  if (steps.indexOf(portableBuild) <= steps.indexOf(unsignedBuild)) {
-    problems.push("portable ZIP packaging must run after either signed or unsigned Tauri build");
+  if (
+    steps.indexOf(portableBuild) <= steps.indexOf(signedBuild) ||
+    (unsignedBuild && steps.indexOf(portableBuild) <= steps.indexOf(unsignedBuild))
+  ) {
+    problems.push("portable ZIP packaging must run after every configured Tauri build");
   }
   if (steps.indexOf(portableVerify) <= steps.indexOf(portableBuild)) {
     problems.push("portable ZIP validation must run after portable ZIP packaging");
@@ -297,9 +301,9 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     !stepRun(webviewStage).includes("scripts/stage-webview2-runtime.ps1") ||
     !stepRun(webviewStage).includes("-Destination $env:WEBVIEW2_RUNTIME_DIR") ||
     steps.indexOf(webviewStage) >= steps.indexOf(signedBuild) ||
-    steps.indexOf(webviewStage) >= steps.indexOf(unsignedBuild)
+    (unsignedBuild && steps.indexOf(webviewStage) >= steps.indexOf(unsignedBuild))
   ) {
-    problems.push("fixed WebView2 runtime staging must finish before either Tauri build");
+    problems.push("fixed WebView2 runtime staging must finish before every configured Tauri build");
   }
 
   const manifest = findNamed("Create signed updater manifest");
@@ -356,6 +360,7 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   }
 
   const unsignedPublish = findNamed("Publish unsigned prerelease");
+if (unsignedPublish) {
   const unsignedRun = stepRun(unsignedPublish);
   if (normalizedIf(unsignedPublish) !== unsignedCondition) {
     problems.push("unsigned publication must run only when the updater key is absent");
@@ -389,6 +394,7 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   if (!unsignedRun.includes("v0.4.4 remains the stable updater")) {
     problems.push("unsigned prerelease note must say v0.4.4 remains the stable updater");
   }
+}
 
   if (
     !signedRun.includes("--draft") ||
@@ -400,10 +406,11 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
   if (
     !signedRun.includes("--json assets") ||
     !signedRun.includes("Compare-Object") ||
-    !unsignedRun.includes("--json assets") ||
-    !unsignedRun.includes("Compare-Object")
+    (unsignedPublish &&
+      (!stepRun(unsignedPublish).includes("--json assets") ||
+        !stepRun(unsignedPublish).includes("Compare-Object")))
   ) {
-    problems.push("each release mode must prove its exact remote draft asset set");
+    problems.push("each configured release mode must prove its exact remote draft asset set");
   }
   const assertRetryState = (run, expectedName) => {
     const modeCheck = run.indexOf(`$release.name -ne "${expectedName}"`);
@@ -442,7 +449,12 @@ export function validateReleaseWorkflow(workflowSource, stageSource) {
     }
   };
   assertRetryState(signedRun, "BackLog v$env:VERSION");
-  assertRetryState(unsignedRun, "BackLog v$env:VERSION (unsigned prerelease)");
+  if (unsignedPublish) {
+    assertRetryState(
+      stepRun(unsignedPublish),
+      "BackLog v$env:VERSION (unsigned prerelease)",
+    );
+  }
   const signatureIndex = steps.indexOf(signatureVerification);
   const signedPublishIndex = steps.indexOf(signedPublish);
   if (

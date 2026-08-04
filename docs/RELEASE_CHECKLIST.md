@@ -156,23 +156,25 @@ evidence attached to the release record.
 
 ## Publication guard
 
-- [ ] `v0.8.0` does not exist before the prepared release commit reaches
-      `main`; successful CI starts the release workflow automatically for that
-      exact commit.
-- [ ] The release-state preflight starts Windows packaging only after successful
-      CI on `main` for the exact release commit. A published `v0.8.0` skips
-      cleanly; only a matching interrupted draft can resume, and a tag pointing
-      at any other commit fails closed.
-- [ ] If `TAURI_SIGNING_PRIVATE_KEY` is present, it matches the updater public
-      key embedded in the app. The stable release contains exactly the
-      installer, its `.sig`, and `latest.json`; the manifest signature matches
-      the detached signature, cryptographically verifies against the embedded
-      key over this installer, and its URL resolves to this installer.
-- [ ] If the updater key is absent, the release is a prerelease containing the
-      installer and portable ZIP. There is no `.sig` and no `latest.json`, and
-      the notes explicitly say v0.4.4 remains the stable updater.
+- [ ] `v0.8.0` remains permanently attached to commit
+      `74e31fbd2b31ad99ceaf5390bb27fb197fc706a7`; the repair workflow never
+      moves, deletes, or recreates the tag.
+- [ ] `TAURI_SIGNING_PRIVATE_KEY` is present and matches the updater public
+      key embedded in the tagged app. A missing or mismatched key fails the
+      workflow without changing the published release.
+- [ ] The stable release contains exactly these four downloadable assets:
+      `BackLog_0.8.0_x64-setup.exe`,
+      `BackLog_0.8.0_x64-portable.zip`,
+      `BackLog_0.8.0_x64-setup.exe.sig`, and `latest.json`.
+- [ ] The detached signature matches `latest.json`, cryptographically
+      verifies against the updater public key embedded in the tagged app,
+      and covers the exact published installer bytes.
+- [ ] The installer and portable ZIP SHA-256 values are included in the
+      release notes and match freshly downloaded public assets.
+- [ ] The release is neither a draft nor a prerelease, is marked Latest,
+      and `releases/latest/download/latest.json` resolves to this release.
 - [ ] No signature was generated, copied, or fabricated outside the Tauri
       signing path.
-- [ ] Updater signing and Authenticode are recorded separately: updater signing
-      protects installed-app updates; Authenticode identifies the Windows
-      publisher and affects SmartScreen.
+- [ ] Updater signing and Authenticode are recorded separately: updater
+      signing protects installed-app updates; Authenticode identifies the
+      Windows publisher and affects SmartScreen.

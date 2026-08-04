@@ -119,17 +119,15 @@ test("a matching interrupted draft can be retried without moving its tag", () =>
   );
 });
 
-test("an absent updater key selects an unsigned prerelease", () => {
-  assert.deepEqual(releasePlan(""), {
-    signed: false,
-    prerelease: true,
-    publishUpdater: false,
-  });
-  assert.deepEqual(releasePlan(" \r\n\t"), {
-    signed: false,
-    prerelease: true,
-    publishUpdater: false,
-  });
+test("an absent updater key fails closed", () => {
+  assert.throws(
+    () => releasePlan(""),
+    /TAURI_SIGNING_PRIVATE_KEY is required/,
+  );
+  assert.throws(
+    () => releasePlan(" \r\n\t"),
+    /TAURI_SIGNING_PRIVATE_KEY is required/,
+  );
 });
 
 test("a present updater key selects a stable signed release", () => {

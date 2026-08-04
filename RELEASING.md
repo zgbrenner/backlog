@@ -31,16 +31,17 @@ need separate tenant evidence. Do not state that they passed without it.
 
 ## Required release state
 
-Before merging or pushing the release commit to `main`:
+Before merging or pushing a normal release commit to `main`:
 
 1. `package.json`, `src-tauri/Cargo.toml`,
    `src-tauri/tauri.conf.json`, `package-lock.json`, and the root `backlog`
-   package in `src-tauri/Cargo.lock` must say `0.8.0`.
+   package in `src-tauri/Cargo.lock` must carry the same version.
 2. `CHANGELOG.md` must contain the matching section.
 3. CI must be green on `main`.
-4. `v0.8.0` must not already be published. The workflow preflight skips a
-   completed release and can resume only an interrupted draft whose tag still
-   points at the exact CI-tested commit.
+4. The target tag must not already be published. The normal workflow can resume
+   only an interrupted draft whose tag still points at the exact CI-tested
+   commit. The already-published v0.8.0 prerelease is handled only by the
+   dedicated immutable-tag repair workflow described below.
 5. Complete the source and security portions of
    `docs/RELEASE_CHECKLIST.md`.
 
@@ -54,8 +55,8 @@ npm run check
 python power-automate/validate_examples.py
 ```
 
-`npm run check:release` runs the behavioral signed/unsigned artifact tests and
-validates the workflow structure.
+`npm run check:release` validates the signed artifact contract, rejects an
+unsigned publication fallback, and checks the workflow structure.
 
 ## Immutable build inputs
 
@@ -85,73 +86,55 @@ runner's installed MSVC toolchain. `scripts/verify-binaries.ps1` then checks PE
 structure, recorded hashes, and every imported DLL before Tauri runs.
 
 The Python sidecar is built with Python 3.11 and smoke-tested against real
-  DOCX, PDF, image, and semantic evidence fixtures by `scripts/build-sidecar.ps1`.
+DOCX, PDF, image, and semantic evidence fixtures by `scripts/build-sidecar.ps1`.
 
-## Signing modes
+## Signing policy
 
-The workflow selects exactly one mode from the presence of the GitHub secret
-`TAURI_SIGNING_PRIVATE_KEY`.
+Stable BackLog releases require the existing Tauri updater signing key.
+Configure `TAURI_SIGNING_PRIVATE_KEY` with the private key matching the
+updater public key embedded in `src-tauri/tauri.conf.json`; set
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` only when that key is password protected.
 
-### Signed: stable updater release
-
-Configure:
-
-- `TAURI_SIGNING_PRIVATE_KEY` — the private key matching the updater public key
-  embedded in `src-tauri/tauri.conf.json`;
-- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — optional; set it only when the key has
-  a password.
-
-The workflow builds with updater artifacts enabled, requires:
-
-- `BackLog_0.8.0_x64-setup.exe`;
-- `BackLog_0.8.0_x64-portable.zip`;
-- `BackLog_0.8.0_x64-setup.exe.sig`; and
-- `latest.json`;
-
-and verifies that `latest.json` carries the exact detached signature and points
-to the same installer. It also verifies and uploads the portable ZIP. It then
-decodes the updater public key embedded in
-`src-tauri/tauri.conf.json` and cryptographically verifies that signature over
-the exact installer. Only then does it create `v0.8.0` as a draft, upload all
-four files, and publish the stable GitHub release.
+The release workflow fails closed when the key is absent. It does not publish
+an unsigned fallback, synthesize a signature, or rotate the updater key. A
+signed release must contain the installer, portable ZIP, detached `.sig`, and
+`latest.json`. The workflow verifies the detached signature against the public
+key embedded in the exact app build before publication.
 
 Never rotate this updater key casually. Existing installations verify updates
 against the public key they already contain; losing or replacing its private
 half breaks that update chain.
 
-### No updater key: unsigned prerelease
+### One-time v0.8.0 repair
 
-When `TAURI_SIGNING_PRIVATE_KEY` is absent or blank, the workflow overlays
-`scripts/tauri.unsigned.conf.json`, which disables updater artifact generation.
-It then requires the installer to exist and requires both the signature and
-`latest.json` to be absent.
+`.github/workflows/repair-v0.8.0.yml` repairs the already-published unsigned
+v0.8.0 prerelease. It checks out the immutable `v0.8.0` tag at
+`74e31fbd2b31ad99ceaf5390bb27fb197fc706a7`, rebuilds and signs those exact
+sources, verifies the signature against the tagged app's embedded public key,
+replaces the two existing downloads, adds the `.sig` and `latest.json`, and
+promotes the same release to stable Latest. It never moves or recreates the
+tag. A missing or mismatched private key leaves the prerelease unchanged.
 
-The workflow still creates `v0.8.0`, but publishes an explicit prerelease with
-the installer and portable ZIP. The release notes say that v0.4.4 remains the stable
-updater. GitHub's `releases/latest` endpoint therefore continues to resolve to
-the prior stable release.
-
-Never synthesize a signature, upload a blank signature, or publish unsigned
-`latest.json`. An installed BackLog cannot trust any of those states.
+Tauri updater signing and Windows Authenticode remain separate trust
+boundaries. BackLog does not yet have a trusted Authenticode certificate, so
+Windows SmartScreen can still warn on a correctly updater-signed installer.
 
 ## Trigger and clean skip
 
-After the prepared release commit reaches `main`, the release workflow starts
-from that exact push and waits for a successful **CI** run for the same commit.
-Failed CI does not allocate the Windows release build. There is intentionally
-no manual dispatch path that can bypass that exact-commit CI result.
+After a prepared release commit reaches `main`, the normal release workflow
+starts from that exact push and waits for a successful **CI** run for the same
+commit. Failed CI does not allocate the Windows release build. There is
+intentionally no manual dispatch path that can bypass that exact-commit CI
+result.
 
 The first job derives the release tag from validated package metadata, then
-checks the exact remote tag and GitHub Release state before
-allocating the Windows runner. A published `v0.8.0` exits successfully. If an
-asset upload was interrupted, use **Re-run all jobs** on that same failed
-release-workflow run. A matching draft resumes with `--clobber`; a tag or draft
-pointing at any other commit fails closed. Before publication, the workflow
-also requires the remote draft to contain exactly the assets allowed by the
-selected signing mode and its durable release title to identify that mode. A
-signed draft therefore cannot be downgraded to an unsigned prerelease if
-signing credentials disappear on a retry. The tag is resolved back to the
-exact CI-tested commit before any retry mutation and again immediately before
+checks the exact remote tag and GitHub Release state before allocating the
+Windows runner. A published tag exits successfully. If an asset upload was
+interrupted, use **Re-run all jobs** on that same failed workflow run. A matching
+draft resumes with `--clobber`; a tag or draft pointing at any other commit
+fails closed. Before publication, the workflow requires the remote draft to
+contain exactly the four signed assets and verifies the tag against the exact
+CI-tested commit before any retry mutation and again immediately before
 publication.
 
 It performs:
@@ -162,14 +145,14 @@ It performs:
 4. release-contract, frontend, and Power Automate validation;
 5. exact release-input and fixed-WebView2 download/hash verification;
 6. sidecar build and full binary/import verification;
-7. signed or explicitly unsigned Tauri build;
+7. signed Tauri installer build;
 8. installer-free portable ZIP build and post-compression validation;
-9. guarded artifact-set verification;
-10. cryptographic updater verification when signing is enabled; and
-11. draft upload followed by stable or prerelease publication.
+9. guarded four-asset verification;
+10. cryptographic updater verification against the embedded public key; and
+11. draft upload followed by stable publication.
 
-Attach the workflow URL and the installer SHA-256 (written into release notes)
-to the release evidence.
+Attach the workflow URL and the installer SHA-256 written into the release
+notes to the release evidence.
 
 ## Reproducing packaging on Windows
 
@@ -197,7 +180,8 @@ $webview2 = Join-Path $env:TEMP "backlog-webview2-fixed"
 ```
 
 This reproduces packaging but does not authorize publication. Use the guarded
-workflow to create the tag and release.
+workflow to create a new release, or the dedicated repair workflow for the
+existing immutable v0.8.0 tag.
 
 ## Two separate trust boundaries
 
