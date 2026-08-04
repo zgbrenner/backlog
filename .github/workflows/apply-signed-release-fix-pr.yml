@@ -1,0 +1,55 @@
+name: Apply signed release fix in PR
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-signed-release-fix-pr
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.head_ref == 'release/signed-v0.8.0-exec'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: release/signed-v0.8.0-exec
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Execute the reviewed patch script
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/apply-signed-release-fix.yml').read_text()
+          marker = "python3 <<'PY'\n"
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index("\n          PY\n", start)
+          source = workflow[start:end]
+          source = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in source.splitlines()
+          )
+          exec(compile(source, 'signed-release-patch.py', 'exec'))
+          Path('.github/workflows/apply-signed-release-fix-pr.yml').unlink()
+          PY
+      - name: Verify implementation
+        run: |
+          npm ci
+          npm run check:release
+      - name: Commit verified implementation
+        run: |
+          git config user.name "BackLog Release Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: require signed releases and repair v0.8.0 [signed-release-fix]"
+          git push origin HEAD:release/signed-v0.8.0-exec
