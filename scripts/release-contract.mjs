@@ -93,10 +93,13 @@ export function shouldStartRelease({
   if (!/^[0-9a-f]{40}$/i.test(releaseSha ?? "")) {
     throw new TypeError("releaseSha must be a full commit SHA");
   }
+  if (releaseState === "published") {
+    return false;
+  }
   if (tagTarget && tagTarget.toLowerCase() !== releaseSha.toLowerCase()) {
     throw new Error("the release tag points at a different commit");
   }
-  return ref === "refs/heads/main" && releaseState !== "published";
+  return ref === "refs/heads/main";
 }
 
 export function releasePlan(privateKey) {

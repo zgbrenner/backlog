@@ -79,6 +79,15 @@ test("the release starts only for main when the version tag is absent", () => {
   );
   assert.equal(
     shouldStartRelease({
+      ref: "refs/heads/main",
+      tagTarget: "b".repeat(40),
+      releaseState: "published",
+      releaseSha: "a".repeat(40),
+    }),
+    false,
+  );
+  assert.equal(
+    shouldStartRelease({
       ref: "refs/heads/feature",
       tagTarget: null,
       releaseState: "missing",

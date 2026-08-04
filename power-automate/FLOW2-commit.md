@@ -1,5 +1,9 @@
 # Flow 2: Commit manifest v3 to SharePoint
 
+> Build this as an **automated cloud flow** in the Power Automate web portal.
+> It is not a Power Automate for desktop flow and does not require the desktop
+> app.
+
 Flow 2 consumes each JSON file from `<Outbox>/_manifests`, commits one physical
 file instance to SharePoint, records the result, and deletes the manifest only
 after every required side effect is durable.
@@ -85,9 +89,10 @@ Keep committed rows for audit. Create a default view filtered to
 
 ### SharePoint list: `_pa_errors`
 
-Create `ManifestId` and `Sha256` as indexed single-line text columns, plus
-`Stage`, `Message`, `RunId`, `Retryable`, and `OccurredAt`. Every failure branch
-writes one actionable row and leaves the manifest in place.
+Use the shared superset schema in `FLOW1-intake.md` and `BUILD-GUIDE.md`.
+Flow 2 populates `ManifestId`, `Sha256`, `Stage`, `Message`, `RunId`,
+`Retryable`, and `OccurredAt`. Every failure branch writes one actionable row
+and leaves the manifest in place.
 
 ## 2. Manifest contract
 
@@ -114,6 +119,21 @@ condition enforces stable identifiers and status-specific requirements before
 any file or SharePoint side effect is permitted.
 
 ## 3. Trigger and concurrency
+
+The recommended deployment keeps all flows in one Power Automate Solution:
+
+```text
+BackLog - Commit Manifest              instant child flow
+BackLog - Flow 2 - Manifest Trigger    automated wrapper
+BackLog - Flow 2 - Recovery Sweep      scheduled wrapper
+```
+
+Create the child flow with **Manually trigger a flow** and text inputs
+`ManifestPath` and `OneDriveFileId`. Put the complete commit scope below in the
+child. Both wrappers call it with a manifest Path and Id. Configure connector
+run-only settings on the child to **Use this connection**. If Solutions or
+child flows are unavailable, build the commit scope directly in the automated
+flow and duplicate it exactly in the scheduled sweep.
 
 Use **When a file is created (properties only)** from OneDrive for Business.
 
