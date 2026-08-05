@@ -8,8 +8,10 @@
 //! A pool rather than one process because convertd's main loop is
 //! `while True: readline()` — strictly one request at a time — so a single
 //! warm process made every conversion in the app queue behind every other one
-//! however large `Config::convert_workers` was. Each worker is its own ~195 MB
-//! Python process, which is why that setting is capped against installed RAM.
+//! however large `Config::convert_workers` was. Each worker is its own Python
+//! process, measured at 450-530 MB resident once RapidOCR and lingua have both
+//! loaded (worse than the ~195 MB MarkItDown-only figure this comment used to
+//! quote), which is why that setting is capped against installed RAM.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,7 +20,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -278,12 +280,30 @@ pub struct Sidecar {
     /// registry closes both spawn-vs-shutdown and PID-reuse races.
     children: Arc<Mutex<HashSet<u32>>>,
     pub timeout: Duration,
+    /// Reaping never drops `live` below this. Default 1: always keep one
+    /// worker warm so the next request after a lull skips the ~1s cold
+    /// spawn (see `sidecar/BUILD.md`).
+    min_idle_workers: usize,
+    /// `Duration::ZERO` disables idle reaping (the default). Only
+    /// `start_pipeline`'s long-lived pool opts in via `with_idle_reap`; the
+    /// six other call sites that build short-lived one-shot `Sidecar`s are
+    /// unaffected by construction.
+    idle_timeout: Duration,
+}
+
+/// An idle worker plus when it was returned to the pool, so the reaper can
+/// age entries without ever inspecting one that is currently checked out.
+struct IdleProc {
+    proc: Proc,
+    /// Set when pushed onto `idle` (`Checkout::drop`). Never read while
+    /// checked out.
+    since: std::time::Instant,
 }
 
 #[derive(Default)]
 struct PoolState {
     /// Spawned and ready. Popped on checkout, pushed back on success.
-    idle: Vec<Proc>,
+    idle: Vec<IdleProc>,
     /// Spawned and not yet retired, whether idle or checked out. Bounded by
     /// `max_workers`; counted separately from `idle.len()` because a checked-out
     /// worker is in neither collection.
@@ -355,19 +375,36 @@ impl Sidecar {
             shutting_down: AtomicBool::new(false),
             children: Arc::new(Mutex::new(HashSet::new())),
             timeout,
+            // Byte-identical behavior for every existing caller: reaping
+            // stays off until `.with_idle_reap(...)` opts in.
+            min_idle_workers: 1,
+            idle_timeout: Duration::ZERO,
         }
     }
 
     /// Run up to `workers` convertd processes, converting that many documents at
     /// once.
     ///
-    /// Each worker is a separate Python process at roughly 195 MB resident once
-    /// MarkItDown and RapidOCR have loaded, so this is a memory decision as much
-    /// as a throughput one — `Config::convert_workers` is capped against
-    /// installed RAM for that reason. Builder-style, and clamped to at least one
-    /// so a nonsense value cannot produce a `Sidecar` that can never answer.
+    /// Each worker is a separate Python process, measured at 450-530 MB
+    /// resident once RapidOCR and lingua have both loaded — worse than the
+    /// ~195 MB MarkItDown-only figure this comment used to say — so this is a
+    /// memory decision as much as a throughput one — `Config::convert_workers`
+    /// is capped against installed RAM for that reason. Builder-style, and
+    /// clamped to at least one so a nonsense value cannot produce a `Sidecar`
+    /// that can never answer.
     pub fn with_workers(mut self, workers: usize) -> Self {
         self.max_workers = workers.max(1);
+        self
+    }
+
+    /// Opt into idle-pool shrink. `spawn_idle_reaper` retires idle workers
+    /// past `idle_timeout`, down to a floor of `min_idle`. Leaving this unset
+    /// (`idle_timeout: Duration::ZERO`, the default) disables reaping
+    /// entirely — every call site except the pipeline's long-lived pool
+    /// leaves it unset and sees zero behavior change.
+    pub fn with_idle_reap(mut self, min_idle: usize, idle_timeout: Duration) -> Self {
+        self.min_idle_workers = min_idle.max(1);
+        self.idle_timeout = idle_timeout;
         self
     }
 
@@ -390,7 +427,7 @@ impl Sidecar {
             if self.shutting_down.load(Ordering::Acquire) {
                 anyhow::bail!("document processing is shutting down");
             }
-            if let Some(proc) = state.idle.pop() {
+            if let Some(IdleProc { proc, .. }) = state.idle.pop() {
                 return Ok(Checkout {
                     sidecar: self,
                     proc: Some(proc),
@@ -429,6 +466,117 @@ impl Sidecar {
     }
 }
 
+/// Poll finer than `idle_timeout` so a real, multi-minute timeout is honored
+/// within about 10% slop; floored at 50ms so a test-scale timeout does not
+/// busy-loop the pool mutex, and capped at 30s so a very long timeout still
+/// notices `begin_shutdown` reasonably promptly if the condvar wake is ever
+/// missed.
+fn reap_poll_interval(idle_timeout: Duration) -> Duration {
+    (idle_timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(30))
+}
+
+impl Sidecar {
+    /// No-op unless `.with_idle_reap(...)` set a nonzero timeout with room
+    /// under `max_workers` — on the 8 GB tier, for instance, `min_idle(1) ==
+    /// max_workers(1)` and this never spawns anything. Takes `Arc<Self>`
+    /// because the reaper thread must not hold a strong ref to the `Sidecar`
+    /// it reaps: every long-lived caller already wraps in `Arc` before this
+    /// is called, so `Weak` is the only ownership that does not create a
+    /// cycle with `Drop for Sidecar`.
+    pub fn spawn_idle_reaper(self: &Arc<Self>) {
+        if self.idle_timeout.is_zero() || self.min_idle_workers >= self.max_workers {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        if let Err(e) = std::thread::Builder::new()
+            .name("convertd-reaper".into())
+            .spawn(move || Sidecar::reap_idle_loop(weak))
+        {
+            log::warn!("could not start convertd idle reaper: {e}");
+        }
+    }
+
+    /// Background loop for the idle reaper thread.
+    ///
+    /// Holds only a `Weak` ref: a strong one here would leak the pool for the
+    /// life of the process, since `Sidecar` never otherwise drops while its
+    /// own reaper thread holds a strong `Arc` to it. `Weak` self-heals if a
+    /// caller ever drops a reaper-bearing `Sidecar` without calling
+    /// `begin_shutdown` first — worst case, the thread outlives it by one
+    /// poll tick, never leaked.
+    fn reap_idle_loop(weak: Weak<Sidecar>) {
+        loop {
+            let Some(sidecar) = weak.upgrade() else {
+                return; // the Sidecar is fully gone; nothing left to reap
+            };
+            if sidecar.shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+
+            let reaped = sidecar.reap_idle_once();
+            if reaped > 0 {
+                log::info!(
+                    "convertd idle reaper: retired {reaped} worker(s) idle past {:?}",
+                    sidecar.idle_timeout
+                );
+            }
+
+            // Reuse the SAME condvar `checkout`/`Checkout::drop`/`begin_shutdown`
+            // already signal on, so `begin_shutdown`'s notify_all wakes this
+            // thread immediately instead of after a full poll tick.
+            let guard = sidecar.lock_pool();
+            let (_guard, _) = sidecar
+                .available
+                .wait_timeout(guard, reap_poll_interval(sidecar.idle_timeout))
+                .unwrap_or_else(|e| e.into_inner());
+            // `sidecar` (the upgraded strong Arc) drops HERE, at loop-back —
+            // never held across more than one lock+wait cycle.
+        }
+    }
+
+    /// One reaping pass. Returns the number of workers retired.
+    ///
+    /// Lock scope: acquired once, released BEFORE dropping any expired
+    /// worker — identical discipline to `Checkout::drop`: reaping takes the
+    /// child-registry lock (via `TrackedChild::drop`), so it must happen
+    /// outside the pool lock or shutdown and a simultaneous check-in could
+    /// deadlock each other.
+    ///
+    /// No invariant break with `checkout`'s free-list contract: a blocked
+    /// waiter only exists when `idle` is empty, and this only ever removes
+    /// from a non-empty `idle`, so a blocked waiter and a reap-eligible list
+    /// are mutually exclusive under the one pool mutex.
+    fn reap_idle_once(&self) -> usize {
+        let mut state = self.lock_pool();
+        if self.shutting_down.load(Ordering::Acquire) {
+            return 0;
+        }
+
+        let now = std::time::Instant::now();
+        state.idle.sort_unstable_by_key(|w| w.since); // oldest-idle-first
+        let mut expired = Vec::new();
+        while state.live > self.min_idle_workers {
+            match state.idle.first() {
+                Some(w) if now.duration_since(w.since) >= self.idle_timeout => {
+                    expired.push(state.idle.remove(0));
+                    state.live -= 1;
+                }
+                _ => break,
+            }
+        }
+        drop(state); // UNLOCK pool before touching the child registry below
+
+        let count = expired.len();
+        // TrackedChild::drop hard-kills each expired worker, waits on it, and
+        // unregisters it from the children registry — outside the pool lock.
+        drop(expired);
+        if count > 0 {
+            self.available.notify_all();
+        }
+        count
+    }
+}
+
 /// A worker on loan from the pool, returned on drop.
 ///
 /// RAII rather than an explicit check-in because `call` can leave by several
@@ -464,7 +612,10 @@ impl Drop for Checkout<'_> {
             let mut state = self.sidecar.lock_pool();
             match self.proc.take() {
                 Some(proc) if !self.sidecar.shutting_down.load(Ordering::Acquire) => {
-                    state.idle.push(proc);
+                    state.idle.push(IdleProc {
+                        proc,
+                        since: std::time::Instant::now(),
+                    });
                     None
                 }
                 Some(proc) => {
@@ -1150,6 +1301,22 @@ mod pool_tests {
         )
     }
 
+    /// Same fake pool, opted into idle reaping and already spawned — the
+    /// shape every reaper test below needs.
+    fn pool_with_idle_reap(
+        workers: usize,
+        min_idle: usize,
+        idle_timeout: Duration,
+    ) -> Arc<Sidecar> {
+        let sidecar = Arc::new(
+            Sidecar::with_timeout(stdin_reader(), Duration::from_millis(50))
+                .with_workers(workers)
+                .with_idle_reap(min_idle, idle_timeout),
+        );
+        sidecar.spawn_idle_reaper();
+        sidecar
+    }
+
     #[test]
     fn shutdown_latch_rejects_new_checkout_without_spawning() {
         let sidecar = pool(1);
@@ -1441,6 +1608,155 @@ mod pool_tests {
         let b = sidecar.checkout().expect("both slots still available");
         assert_eq!(sidecar.lock_pool().live, 2);
         drop((a, b));
+    }
+
+    // ---- idle reaper -------------------------------------------------------
+    //
+    // `idle_timeout` here is milliseconds, not the 300s a real config uses, so
+    // every test below polls for its expected state against a generous
+    // multi-second deadline rather than sleeping a fixed amount and asserting
+    // once. This box runs a demo app alongside the test suite, so a fixed
+    // sleep sized for an idle CI runner is exactly the kind of thing that goes
+    // flaky under real load; a poll loop only cares that the state is reached
+    // before the deadline, not how many scheduler ticks it took.
+
+    /// The core behavior: idle workers beyond `min_idle_workers` are retired
+    /// once they have sat past `idle_timeout`.
+    #[test]
+    fn idle_reaper_retires_workers_beyond_min_after_timeout() {
+        let idle_timeout = Duration::from_millis(200);
+        let sidecar = pool_with_idle_reap(3, 1, idle_timeout);
+        let a = sidecar.checkout().expect("spawned worker one");
+        let b = sidecar.checkout().expect("spawned worker two");
+        let c = sidecar.checkout().expect("spawned worker three");
+        assert_eq!(sidecar.lock_pool().live, 3);
+        drop((a, b, c)); // all three go idle at roughly the same instant
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if sidecar.lock_pool().live == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reaper must shrink the pool down to min_idle_workers"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            sidecar.tracked_children().len(),
+            1,
+            "two workers must have been retired and unregistered, one kept warm"
+        );
+    }
+
+    /// The floor is a floor, not a target passed through on the way to zero.
+    #[test]
+    fn idle_reaper_never_drops_below_min_idle_workers() {
+        let idle_timeout = Duration::from_millis(200);
+        let sidecar = pool_with_idle_reap(3, 2, idle_timeout);
+        let a = sidecar.checkout().expect("spawned worker one");
+        let b = sidecar.checkout().expect("spawned worker two");
+        let c = sidecar.checkout().expect("spawned worker three");
+        drop((a, b, c));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if sidecar.lock_pool().live == 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reaper must shrink toward min_idle_workers"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Several more poll cycles' worth of time to prove it settles at the
+        // floor rather than merely passing through it on its way lower.
+        std::thread::sleep(idle_timeout * 5);
+        assert_eq!(
+            sidecar.lock_pool().live,
+            2,
+            "live must never drop below min_idle_workers"
+        );
+    }
+
+    /// A worker on loan is never in `idle`, so the reaper must never touch it
+    /// regardless of how long the caller holds it.
+    #[test]
+    fn idle_reaper_leaves_checked_out_workers_alone() {
+        let idle_timeout = Duration::from_millis(200);
+        let sidecar = pool_with_idle_reap(3, 1, idle_timeout);
+        let a = sidecar.checkout().expect("spawned worker one");
+        let b = sidecar.checkout().expect("spawned worker two");
+        let c = sidecar.checkout().expect("spawned worker three");
+        drop(c); // only this one goes idle and is eligible for reaping
+
+        // Generous multiple of idle_timeout so the reaper has clearly had
+        // several chances to act before this asserts.
+        std::thread::sleep(idle_timeout * 5);
+
+        assert_eq!(
+            sidecar.lock_pool().live,
+            2,
+            "checked-out workers must survive; only the idle one is eligible"
+        );
+        drop((a, b));
+    }
+
+    /// Every call site except `start_pipeline` never calls `with_idle_reap`,
+    /// so `idle_timeout` stays `Duration::ZERO` and `spawn_idle_reaper` must
+    /// be inert for them by construction.
+    #[test]
+    fn spawn_idle_reaper_is_a_no_op_by_default() {
+        let sidecar = pool(2);
+        sidecar.spawn_idle_reaper(); // no `.with_idle_reap(...)` was called
+        let a = sidecar.checkout().expect("spawned worker one");
+        let b = sidecar.checkout().expect("spawned worker two");
+        drop((a, b));
+        assert_eq!(sidecar.lock_pool().idle.len(), 2);
+
+        // Generous window: long enough that an opted-in reaper would have
+        // acted several times over.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let state = sidecar.lock_pool();
+        assert_eq!(
+            state.live, 2,
+            "a Sidecar that never opted in must never reap"
+        );
+        assert_eq!(state.idle.len(), 2);
+    }
+
+    /// `begin_shutdown`'s `notify_all` on the shared condvar must wake the
+    /// reaper immediately rather than making it sleep out `idle_timeout`.
+    #[test]
+    fn idle_reaper_exits_promptly_on_shutdown() {
+        // Deliberately long relative to the shutdown latency under test: if
+        // the reaper only exited by timing out its own poll wait, this test
+        // would need to run for the better part of an hour.
+        let sidecar = pool_with_idle_reap(2, 1, Duration::from_secs(3600));
+        let a = sidecar.checkout().expect("spawned worker one");
+        let b = sidecar.checkout().expect("spawned worker two");
+        drop((a, b));
+
+        assert_eq!(sidecar.begin_shutdown(), 0);
+
+        // The reaper thread holds only a Weak ref, so once it wakes, sees the
+        // shutdown latch, and returns, nothing but this test's own binding
+        // keeps the Arc alive. Generous bound for a loaded machine.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if Arc::strong_count(&sidecar) == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the idle reaper must exit promptly on shutdown, not wait out idle_timeout"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 

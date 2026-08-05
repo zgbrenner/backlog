@@ -1039,6 +1039,8 @@ fn redacted_config(cfg: &Config) -> serde_json::Value {
         "slm_recycle_after_requests": cfg.slm_recycle_after_requests,
         "slm_escalation_idle_secs": cfg.slm_escalation_idle_secs,
         "convert_workers": cfg.convert_workers,
+        "convert_min_idle_workers": cfg.convert_min_idle_workers,
+        "convert_idle_reap_secs": cfg.convert_idle_reap_secs,
         "sidecar_timeout_secs": cfg.sidecar_timeout_secs,
         "manifest_emit_per_min": cfg.manifest_emit_per_min,
         "max_stage_attempts": cfg.max_stage_attempts,
@@ -1220,8 +1222,19 @@ async fn start_pipeline(
         // to the convert stage and the number of processes that can serve them
         // are the same number. They were not before: one process served every
         // document while the semaphore cheerfully admitted six.
-        .with_workers(cfg.convert_workers),
+        .with_workers(cfg.convert_workers)
+        .with_idle_reap(
+            cfg.convert_min_idle_workers,
+            Duration::from_secs(cfg.convert_idle_reap_secs),
+        ),
     );
+    // No-op unless `.with_idle_reap` above set a nonzero timeout with room
+    // under `max_workers` (e.g. inert on the corrected 8 GB tier, where
+    // convert_workers is clamped to 1 and min_idle(1) == max_workers(1)).
+    // The other five short-lived `Sidecar`s built elsewhere in this file
+    // never call `.with_idle_reap`, so this is unreachable behavior change
+    // for them by construction.
+    sidecar.spawn_idle_reaper();
     let slm = Arc::new(SlmLane::new(
         binary(&app, "llama-server")?,
         grammar,

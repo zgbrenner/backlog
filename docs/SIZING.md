@@ -67,8 +67,18 @@ convertd all live:
 |---|---|
 | llama-server (escalation, 1.7B) | 2,477 MB |
 | llama-server (primary, 0.6B) | 1,715 MB |
-| convertd (worker + PyInstaller bootstrap stub) | 204 MB |
+| convertd (worker + PyInstaller bootstrap stub) | 204 MB[^convertd-rss] |
 | **total model + sidecar layer** | **4,396 MB** |
+
+[^convertd-rss]: This 204 MB is a snapshot of a worker that has only run
+    MarkItDown conversions. It is not the number `convert_workers_ram_ceiling`
+    plans against: `convertd.py`'s loaders memoize each lazily-loaded
+    component per-process with no unload path, so a worker that has ever
+    serviced an `ocr` op or a `langid` op (effectively every document, once a
+    batch runs long enough) keeps RapidOCR and lingua resident for the rest of
+    its life. Measured with both loaded: 450–530 MB, which is the figure
+    `config.rs`'s `CONVERTD_WORKER_RSS_MB` (550) budgets against. A
+    long-running pool converges toward that worse number, not this one.
 
 Add the app and WebView2 (~400 MB) and Windows itself (2.5–3 GB) and an 8 GB
 machine is at roughly 7.8 GB — inside the box, but without much room. It
