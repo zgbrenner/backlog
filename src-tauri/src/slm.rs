@@ -681,6 +681,15 @@ impl SlmLane {
         // 0.6B reached for it anyway, DATE_NOT_IN_EVIDENCE rejected it, and the
         // ladder escalated to the 1.7B: removing the line cut escalations ~3x in
         // the 2026-07 stress campaign.
+        //
+        // No concrete example names in the subject rules, for the same reason.
+        // The former example `Form 8829 - Marcus Alvarez` (plus the form-number
+        // enumeration next to it) was copied verbatim into the subject of 34 of
+        // 54 files in the 2026-08-05 v0.8.2 validation run — the 0.6B parrots
+        // any salient literal it is handed. The checker cannot catch this: the
+        // subject is well-formed, only unfaithful. Keep these rules structural;
+        // the one surviving example lives in the description rule, whose
+        // output was never observed to parrot.
         let mut system = format!(
             "You name business and legal documents from evidence excerpts.\n\
              Document language: {language}. Classified type: {doc_type}.\n\
@@ -688,8 +697,8 @@ impl SlmLane {
              Rules:\n\
              - date: extract the date written IN the document body (for example a letter date, filing date, or effective date), formatted YYYY-MM-DD. Never invent a date that is not present in the text. Use none only if the body contains no date at all.\n\
              - date_source: use document when the date appears in the body text; use metadata only when the body has no date of its own; use none when no date exists.\n\
-             - subject: exactly `<short form> - <party>`, at most 8 words, for example `Form 8829 - Marcus Alvarez`. Use the short identifier (Form 8829, Schedule E, K-1, W-2, 941, 1120S), never the form's full legal title. Name the one party the document belongs to, once, and never omit it.\n\
-             - subject: add nothing else — no tax year, no EIN, no address, no generic word such as Document or Scan, and never the labels Taxpayer or Entity.\n\
+             - subject: exactly `<short form> - <party>`, at most 8 words. <short form> is the document's own short identifier: its form number if it shows one, otherwise its document type in a few words, never a full legal title. <party> is the one party the document belongs to, copied exactly from the document text, named once and never omitted.\n\
+             - subject: every word of the subject must come from this document. Add nothing else — no tax year, no EIN, no address, no generic word such as Document or Scan, and never the labels Taxpayer or Entity.\n\
              - description: exactly ONE sentence, 15 to 200 characters, adding useful information beyond the subject. It must end with a single full stop. Do not write a second sentence, and do not stop mid-sentence.\n\
              - description: begin with the document type or action itself, for example `Shareholder's register transferring 40,000 shares to John Smith.` — never open with `The document`, `This document`, or `The file`.\n\
              Never invent dates, parties, or facts."
