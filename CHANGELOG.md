@@ -17,6 +17,15 @@ field of `latest.json` should quote it.
 
 ## [0.8.1] — no file left behind
 
+### Security
+
+- The updater signing key was rotated (new minisign ID `199849F4EB9588F7`);
+  the private half of the previous key (`F6BB6D5A6C3954C6`) was lost, so no
+  release after v0.4.4 could be updater-signed. Existing v0.4.x and v0.8.0
+  installations cannot verify this release through the in-app updater and
+  need one manual download of v0.8.1; updates verify automatically from then
+  on.
+
 ### Fixed
 
 - A same-content copy arriving while its original was still queued was parked
