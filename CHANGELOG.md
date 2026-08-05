@@ -15,6 +15,40 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.8.1] — no file left behind
+
+### Security
+
+- The updater signing key was rotated (new minisign ID `199849F4EB9588F7`);
+  the private half of the previous key (`F6BB6D5A6C3954C6`) was lost, so no
+  release after v0.4.4 could be updater-signed. Existing v0.4.x and v0.8.0
+  installations cannot verify this release through the in-app updater and
+  need one manual download of v0.8.1; updates verify automatically from then
+  on.
+
+### Fixed
+
+- A same-content copy arriving while its original was still queued was parked
+  for a fixed window of wall-clock time and then silently abandoned — no
+  ledger row, no flag, no UI count, the file just sat in Processing. The copy
+  now waits for the original's terminal transition (which the original's own
+  wall clock guarantees) and then gets its own duplicate delivery; the old
+  window only paces a diagnostic log line.
+- A copy of a file already waiting in Needs Review vanished without a trace —
+  and because every zero-byte file shares one content hash, the second empty
+  file always hit this path and restarts never recovered it. The copy is now
+  moved into Quarantine beside its original, with a ledger event and a
+  `DUPLICATE_QUARANTINE_FAILED` troubleshooting entry for the failure case.
+
+### Changed
+
+- Descriptions now open in register style — "Shareholder's register
+  transferring 40,000 shares to John Smith." — never "The document is a…".
+  The checker strips the preamble deterministically from model proposals
+  (human-typed descriptions pass through untouched, and stripping never takes
+  a description under the length floor), and the naming prompt tells the
+  model not to write it in the first place.
+
 ## [0.8.0] — native Local Output delivery
 
 ### Added

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "BackLog",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "identifier": "ai.sonomos.backlog",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -58,7 +58,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY2QkI2RDVBNkMzOTU0QzYKUldUR1ZEbHNXbTI3OXJlY0wrTG12czUybDlpdWxxTnNFb1pzNVp5K1RQUWo3SXNTWG0wdTNHNXIK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE5OTg0OUY0RUI5NTg4RjcKUldUM2lKWHI5RW1ZR1hWNHhjRkhsZEdLMy8wZm9IZCs3Z2w4YWc5R2lSb3BUVmJab2UvMDRkdzAK",
       "endpoints": [
         "https://github.com/zgbrenner/backlog/releases/latest/download/latest.json"
       ],
