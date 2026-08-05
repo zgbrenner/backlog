@@ -15,6 +15,38 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.8.2] — the appliance behaves like one
+
+### Changed
+
+- The naming servers now respect the rest of the machine. Both llama-server
+  tiers get an explicit thread budget (`cores − convert_workers`, floor 2)
+  instead of each claiming every core beside six conversion workers doing
+  the same — the measured order-of-magnitude batch slowdown. The primary
+  server is recycled after `slm_recycle_after_requests` served requests
+  (default 64; llama.cpp's Windows memory growth is unfixed upstream), the
+  1.7B escalation server is retired after `slm_escalation_idle_secs`
+  (default 600) without a completed request — never mid-request — and
+  escalation runs with its own small `slm_escalation_parallel` (RAM-tiered
+  1–2) instead of inheriting the primary's, returning roughly a gigabyte on
+  16 GB machines.
+- Idle conversion workers are now reaped. A worker that has served an OCR
+  or language call holds 450–530 MB for the life of the process; after
+  `convert_idle_reap_secs` (default 300) idle, the pool shrinks to
+  `convert_min_idle_workers` (default 1) and respawns on demand in about a
+  second. The per-worker memory budget was corrected to the measured
+  figure, which drops the 8 GB tier from two conversion workers to one —
+  two consumed nearly the whole tier's margin before any document work.
+- A file re-processed after a crash or restart no longer redoes conversion
+  and OCR when its cached conversion is still valid: a new sidecar
+  metadata artifact carries what the resume needs, any mismatch falls
+  through silently to a full conversion, and the cache is now written
+  atomically and before the ledger admits the stage — closing a window
+  where a crash could leave a converted state with no cache behind it.
+- Plain-text files are read through a 2 MiB cap instead of feeding up to
+  64 MB into charset detection for output that was truncated to 200k
+  characters anyway; OCR's ONNX sessions are capped to two threads each.
+
 ## [0.8.1] — no file left behind
 
 ### Security
