@@ -111,7 +111,17 @@ def _rapidocr():
     def create():
         from rapidocr import RapidOCR
 
-        return RapidOCR()
+        # Cap the ONNX thread pools the same way semantic.py already caps its
+        # embedder session. RapidOCR's default (-1) lets each of its three
+        # sessions (det/cls/rec) claim every logical core -- per worker
+        # process. With a full convert pool that oversubscription starves the
+        # llama-server naming lane, which is the measured batch bottleneck.
+        return RapidOCR(
+            params={
+                "EngineConfig.onnxruntime.intra_op_num_threads": 2,
+                "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+            }
+        )
 
     return _get("rapidocr", create)
 
@@ -673,12 +683,41 @@ def _conversion_result(
     }
 
 
+# Plain text needs no structural parser, and charset detection is the one
+# conversion stage whose cost scales with the WHOLE file: MarkItDown hands
+# charset-normalizer the entire input (its own docs call large inputs a weak
+# point) even though `_cap_markdown` throws away everything past
+# MAX_MARKDOWN_CHARS immediately afterwards. 2 MiB comfortably covers the
+# 200k-char cap in any encoding MarkItDown would have detected; a giant
+# single-line txt drops from minutes to milliseconds.
+_TEXT_FAST_PATH_SUFFIXES = {".txt", ".text", ".log", ".md"}
+TEXT_FAST_PATH_CAP = 2 * 1024 * 1024
+
+
+def _convert_text_fast(path: str) -> str:
+    with open(path, "rb") as handle:
+        raw = handle.read(TEXT_FAST_PATH_CAP)
+    if not raw:
+        return ""
+    from charset_normalizer import from_bytes
+
+    best = from_bytes(raw).best()
+    return str(best) if best is not None else raw.decode("utf-8", "replace")
+
+
 def op_convert(args: dict) -> dict:
     path = args["path"]
     _check_input_size(path)
     container = _ole_container_kind(path)
     if container == "encrypted":
         return _conversion_result(path, "", encrypted=True)
+    if container is None and Path(path).suffix.lower() in _TEXT_FAST_PATH_SUFFIXES:
+        return _conversion_result(
+            path,
+            _convert_text_fast(path),
+            ocr_used=False,
+            ocr_mean_conf=1.0,
+        )
     if container is None and Path(path).suffix.lower() in _OOXML_SUFFIXES:
         _check_ooxml_text_budget(path)
     try:

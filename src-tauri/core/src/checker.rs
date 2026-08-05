@@ -231,6 +231,12 @@ static RE_UNSPACED_SCRIPT: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"[\p{Han}\p{Hiragana}\p{Katakana}\p{Thai}]").unwrap());
 /// Trailing serial numbers a scanner appends: "… 001", "… (2)", "… #3".
 static RE_TRAILING_SERIAL: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s*[#(]?\d{1,4}\)?$").unwrap());
+/// A bare year dangling at the end of a subject ("… - 2026"). Full dates are
+/// caught by the harvester in `strip_trailing_dates`; a lone year is below the
+/// harvester's bar for a date but still noise in a filename that already
+/// starts with one.
+static RE_TRAILING_YEAR: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:^|[\s\-_/:,])(?:19|20)\d{2}$").unwrap());
 static RE_LEADING_QUALIFIER: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)^(?:new|copy of)\s+").unwrap());
 /// A file extension echoed back into the subject, which pipeline.rs would then
@@ -643,6 +649,19 @@ impl Checker {
             if !tidied.is_empty() {
                 s = tidied;
             }
+            // The model also echoes its date at the END — observed shipping
+            // as "… - 2026-08-05 - 2026" — and the schema's character cap
+            // leaves clause fragments like "… - Effective" or "… shall
+            // recover". Both are model-only habits; a human subject is taken
+            // as written.
+            if let Some(stripped) = strip_trailing_dates(&s) {
+                s = stripped;
+                flags.push("SUBJECT_TRAILING_DATE_STRIPPED".into());
+            }
+            if let Some(stripped) = strip_dangling_words(&s, SUBJECT_MIN_WORDS) {
+                s = stripped;
+                flags.push("SUBJECT_DANGLING_TAIL_STRIPPED".into());
+            }
         }
 
         // Generic check runs BEFORE the size gate. Behind it, every entry in
@@ -689,6 +708,13 @@ impl Checker {
                 if retained.len() >= SUBJECT_MIN_WORDS {
                     flags.push("SUBJECT_TRUNCATED".into());
                     s = trimmed;
+                    // The word-boundary cut can itself mint a fresh clause
+                    // fragment ("… Globex Corporation shall"); clean it the
+                    // same way an arriving fragment is cleaned above.
+                    if let Some(stripped) = strip_dangling_words(&s, SUBJECT_MIN_WORDS) {
+                        s = stripped;
+                        flags.push("SUBJECT_DANGLING_TAIL_STRIPPED".into());
+                    }
                     words = subject_words(&s);
                 }
             }
@@ -883,6 +909,104 @@ fn strip_leading_date(s: &str) -> Option<String> {
             .trim()
             .to_string(),
     )
+}
+
+/// A date (or bare year) the model appended to the end of the subject, plus
+/// whatever separator precedes it. Mirrors `strip_leading_date` — the model
+/// echoes its own `date` field at either end — and loops, because the observed
+/// failure shape is stacked: `"… - 2026-08-05 - 2026"`. The filename already
+/// begins with the validated date; a second copy in the subject is only noise.
+fn strip_trailing_dates(s: &str) -> Option<String> {
+    let mut out = s.to_string();
+    let mut stripped_any = false;
+    loop {
+        let probe = out.replace('_', " ");
+        let tail_date = harvest::extract_dates(&probe)
+            .into_iter()
+            .find(|d| d.offset + d.raw.len() == probe.len() && d.offset > 0);
+        if let Some(d) = tail_date {
+            out = trim_dangling_tail(out[..d.offset].trim_end());
+            stripped_any = true;
+            continue;
+        }
+        if let Some(m) = RE_TRAILING_YEAR.find(&out) {
+            if m.start() > 0 {
+                out = trim_dangling_tail(out[..m.start()].trim_end());
+                stripped_any = true;
+                continue;
+            }
+        }
+        break;
+    }
+    (stripped_any && !out.is_empty()).then_some(out)
+}
+
+/// Function words that cannot end a subject: a truncation cut mid-clause, or
+/// the schema's character cap stopping generation, leaves tails like
+/// "… - Effective" or "… shall recover". Trailing-position only — every one of
+/// these words is legitimate mid-subject.
+const DANGLING_TAIL_WORDS: [&str; 26] = [
+    "a",
+    "an",
+    "and",
+    "at",
+    "but",
+    "by",
+    "dated",
+    "effective",
+    "for",
+    "from",
+    "in",
+    "is",
+    "of",
+    "on",
+    "or",
+    "per",
+    "re",
+    "regarding",
+    "shall",
+    "the",
+    "to",
+    "was",
+    "which",
+    "will",
+    "with",
+    "would",
+];
+
+/// Auxiliaries that orphan the single word after them: "shall recover" is a
+/// clause fragment even though "recover" alone would survive the tail list.
+const DANGLING_PAIR_HEADS: [&str; 9] = [
+    "are", "be", "been", "is", "shall", "to", "was", "were", "will",
+];
+
+/// Drop clause fragments off the end of a model subject, keeping at least
+/// `min_words`. Returns `None` when nothing was stripped.
+fn strip_dangling_words(s: &str, min_words: usize) -> Option<String> {
+    let mut out = s.to_string();
+    let mut stripped_any = false;
+    loop {
+        let words = subject_words(&out);
+        if words.len() <= min_words {
+            break;
+        }
+        let last = words[words.len() - 1].to_lowercase();
+        let penult = words[words.len() - 2].to_lowercase();
+        let drop = if DANGLING_TAIL_WORDS.contains(&last.as_str()) {
+            1
+        } else if words.len() > min_words + 1 && DANGLING_PAIR_HEADS.contains(&penult.as_str()) {
+            2
+        } else {
+            break;
+        };
+        let trimmed = truncate_to_words(&out, words.len() - drop);
+        if trimmed.is_empty() || trimmed == out {
+            break;
+        }
+        out = trimmed;
+        stripped_any = true;
+    }
+    (stripped_any && !out.is_empty()).then_some(out)
 }
 
 /// True when every content token is a scanner default. Serial suffixes and
@@ -2625,6 +2749,52 @@ mod tests {
             modified_iso,
             Local::now().date_naive().format("%Y-%m-%d").to_string()
         );
+    }
+
+    #[test]
+    fn trailing_dates_and_years_are_stripped_from_subjects() {
+        // The exact shape observed shipping in the 2026-08 E2E.
+        assert_eq!(
+            strip_trailing_dates(
+                "Form 8829 - Marcus Alvarez - Globex Corporation - 2026-08-05 - 2026"
+            )
+            .as_deref(),
+            Some("Form 8829 - Marcus Alvarez - Globex Corporation")
+        );
+        assert_eq!(
+            strip_trailing_dates("Termination Notice - Northwind - 2021 - 2021 - 2021").as_deref(),
+            Some("Termination Notice - Northwind")
+        );
+        // A year that IS the subject's head stays; only a dangling tail goes.
+        assert_eq!(strip_trailing_dates("2026 Annual Report - Acme"), None);
+        // No date, no change.
+        assert_eq!(strip_trailing_dates("Form 8829 - Marcus Alvarez"), None);
+        // A form number is not a year.
+        assert_eq!(strip_trailing_dates("Schedule E - Form 1120"), None);
+    }
+
+    #[test]
+    fn dangling_clause_fragments_are_stripped_from_subjects() {
+        assert_eq!(
+            strip_dangling_words("Form 8829 - Initech - Globex Corporation shall recover", 2)
+                .as_deref(),
+            Some("Form 8829 - Initech - Globex Corporation")
+        );
+        assert_eq!(
+            strip_dangling_words(
+                "Form 8829 - Acme Industries - Umbrella Holdings - Effective",
+                2
+            )
+            .as_deref(),
+            Some("Form 8829 - Acme Industries - Umbrella Holdings")
+        );
+        // Trailing-position only: these words are legitimate mid-subject.
+        assert_eq!(
+            strip_dangling_words("Notice of Termination - Smith", 2),
+            None
+        );
+        // Never strip below the minimum word count.
+        assert_eq!(strip_dangling_words("Notice of", 2), None);
     }
 
     #[test]

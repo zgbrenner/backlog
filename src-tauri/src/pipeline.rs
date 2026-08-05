@@ -375,7 +375,23 @@ impl Pipeline {
                     )
                     .await;
                 }
-                None => log::error!("wall-clock cap blown for {path:?} before it was identified"),
+                None => {
+                    // No content sha yet, so there is no ledger row to flag
+                    // and no quarantine key — the classic shape is a OneDrive
+                    // placeholder hydrating (or a file locked by another
+                    // process) inside `hash_file`. The file itself is left
+                    // untouched in Processing; make the stall VISIBLE instead
+                    // of leaving only a log line nobody reads: a greppable
+                    // code for support bundles, and an event the UI can
+                    // surface as "a file is stuck before identification".
+                    log::error!(
+                        "STALL:pre-sha wall-clock cap blown for {path:?} before it was identified; \
+                         the file remains in Processing (sync placeholder or a lock held by another process?)"
+                    );
+                    if let Some(app) = &self.app {
+                        let _ = app.emit("pre-identify-stall", ());
+                    }
+                }
             }
         }
     }
@@ -1196,9 +1212,12 @@ impl Pipeline {
                             "validate",
                             &format!("attempt {attempt} rejected: {}", ce.code()),
                         );
-                        if matches!(ce, CheckError::TooLong(_, _)) && attempt >= 2 {
+                        if matches!(ce, CheckError::TooLong(_, _)) {
                             // Length problems rarely improve with escalation;
-                            // ask for a shorter subject explicitly.
+                            // ask for a shorter subject explicitly, and from the
+                            // FIRST rejection — the old `attempt >= 2` guard meant
+                            // a TooLong on attempt 1 escalated to the 1.7B without
+                            // the primary ever hearing the length-specific ask.
                             violation = Some("subject too long; use at most 6 short words".into());
                         }
                     }
@@ -3338,6 +3357,7 @@ mod tests {
                 root.join("escalation.gguf"),
                 18137,
                 1,
+                2,
             ));
             let pipeline = Arc::new(Pipeline {
                 convert_slots: Arc::new(Semaphore::new(1)),
@@ -5186,6 +5206,7 @@ mod tests {
             cfg.slm_escalation_gguf.clone(),
             cfg.llama_port,
             cfg.slm_parallel,
+            cfg.slm_threads(),
         );
         let checker = crate::checker::Checker::new(cfg.max_filename_len);
 
@@ -5372,6 +5393,7 @@ mod tests {
             cfg.slm_escalation_gguf.clone(),
             cfg.llama_port,
             cfg.slm_parallel,
+            cfg.slm_threads(),
         ));
         let model_versions = sidecar.versions().unwrap_or_else(|_| json!({}));
         assert!(
@@ -5662,6 +5684,7 @@ server.serve_forever()
                 h.dir.path().join("escalation.gguf"),
                 18937,
                 1,
+                2,
             )),
             cfg: h.pipeline.cfg.clone(),
             ledger: h.pipeline.ledger.clone(),

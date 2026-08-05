@@ -69,6 +69,11 @@ pub struct SlmLane {
     primary_gguf: PathBuf,
     escalation_gguf: PathBuf,
     parallel: u8,
+    /// `--threads` for each spawned server. Never left to llama.cpp's
+    /// default (all logical cores): two resident servers plus the convertd
+    /// pool oversubscribing every core is the measured order-of-magnitude
+    /// batch slowdown. See `Config::slm_threads`.
+    threads: usize,
     primary_port: u16,
     escalation_port: u16,
     /// Per-run bearer token handed to llama-server via `--api-key`. Without
@@ -124,6 +129,7 @@ impl SlmLane {
         escalation_gguf: PathBuf,
         base_port: u16,
         parallel: u8,
+        threads: usize,
     ) -> Self {
         let mut token = [0u8; 32];
         getrandom::getrandom(&mut token).expect("CSPRNG for the llama-server API key");
@@ -133,6 +139,7 @@ impl SlmLane {
             primary_gguf,
             escalation_gguf,
             parallel,
+            threads,
             primary_port: base_port,
             escalation_port: base_port + 1,
             api_key: hex::encode(token),
@@ -161,6 +168,8 @@ impl SlmLane {
                 &port.to_string(),
                 "--parallel",
                 &self.parallel.to_string(),
+                "--threads",
+                &self.threads.to_string(),
                 "--ctx-size",
                 &(4096u32 * self.parallel as u32).to_string(),
                 // Required so llama-server renders Qwen3's embedded chat
@@ -437,7 +446,6 @@ impl SlmLane {
         violation_note: Option<&str>,
     ) -> anyhow::Result<SlmOutput> {
         let port = self.ensure_up(tier).await?;
-        let today = chrono::Utc::now().date_naive().format("%Y-%m-%d");
 
         // The two `subject` rules below are the measured shape, and the length of
         // this prompt is a throughput decision as much as a quality one.
@@ -466,12 +474,20 @@ impl SlmLane {
         // because the model writes past eight words and the checker trims at a
         // word boundary. That is the flagged, clean outcome replacing a silent
         // mid-word cut, but it is loud. See docs/KNOWN_ISSUES.md item 0h.
+        // No "Today's date" line, deliberately. Nothing downstream consumes it —
+        // the checker computes its own now() for the future-date ceiling, and the
+        // metadata fallback comes from the file's mtime — so the only thing the
+        // line ever did was hand a weak model a concrete, salient date string
+        // right next to an instruction not to use it. On dateless documents the
+        // 0.6B reached for it anyway, DATE_NOT_IN_EVIDENCE rejected it, and the
+        // ladder escalated to the 1.7B: removing the line cut escalations ~3x in
+        // the 2026-07 stress campaign.
         let mut system = format!(
             "You name business and legal documents from evidence excerpts.\n\
-             Today's date: {today}. Document language: {language}. Classified type: {doc_type}.\n\
+             Document language: {language}. Classified type: {doc_type}.\n\
              Do not reveal reasoning. Return only the requested JSON object.\n\
              Rules:\n\
-             - date: extract the date written IN the document body (for example a letter date, filing date, or effective date), formatted YYYY-MM-DD. Do NOT use today's date. Use none only if the body contains no date at all.\n\
+             - date: extract the date written IN the document body (for example a letter date, filing date, or effective date), formatted YYYY-MM-DD. Never invent a date that is not present in the text. Use none only if the body contains no date at all.\n\
              - date_source: use document when the date appears in the body text; use metadata only when the body has no date of its own; use none when no date exists.\n\
              - subject: exactly `<short form> - <party>`, at most 8 words, for example `Form 8829 - Marcus Alvarez`. Use the short identifier (Form 8829, Schedule E, K-1, W-2, 941, 1120S), never the form's full legal title. Name the one party the document belongs to, once, and never omit it.\n\
              - subject: add nothing else — no tax year, no EIN, no address, no generic word such as Document or Scan, and never the labels Taxpayer or Entity.\n\
@@ -549,6 +565,7 @@ mod tests {
             dir.path().join("missing-escalation.gguf"),
             28_137,
             1,
+            2,
         );
 
         lane.begin_shutdown();
@@ -599,6 +616,7 @@ mod tests {
             PathBuf::from("/nonexistent/escalation.gguf"),
             base_port,
             1,
+            2,
         )
     }
 

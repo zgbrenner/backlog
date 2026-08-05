@@ -1128,6 +1128,7 @@ async fn review_only_pipeline(
             // to overflow that add.
             cfg.llama_port.min(u16::MAX - 1),
             cfg.slm_parallel,
+            cfg.slm_threads(),
         ));
         Pipeline::new(cfg, ledger, sidecar, slm, app)
     })
@@ -1216,6 +1217,7 @@ async fn start_pipeline(
         cfg.effective_escalation_gguf().to_path_buf(),
         cfg.llama_port,
         cfg.slm_parallel,
+        cfg.slm_threads(),
     ));
     let pipeline = Pipeline::new(cfg.clone(), state.ledger.clone(), sidecar, slm, app);
 

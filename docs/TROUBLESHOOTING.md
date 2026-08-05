@@ -91,6 +91,8 @@ These do not stop anything. They ride along on the manifest and land in the
 | `SUBJECT_UNGROUNDED` | The subject is not a phrase that appears in the document. Not wrong by itself — a good summary often is not a quote — but the one to check first when a name looks off. |
 | `SUBJECT_DATE_STRIPPED` | A date was removed from the subject, because the filename already starts with one. |
 | `SUBJECT_EXT_STRIPPED` | A file extension (`.pdf`) was removed from the subject. |
+| `SUBJECT_TRAILING_DATE_STRIPPED` | A date or bare year was removed from the END of the subject, because the filename already starts with the validated date and a second copy is only noise. |
+| `SUBJECT_DANGLING_TAIL_STRIPPED` | A clause fragment the model left dangling at the end of the subject ("… shall", "… - Effective") was removed. A trim, never an addition; the full wording is still in the description. |
 | `SUBJECT_TRUNCATED` | The suggested subject ran past the ten-word limit a filename can carry, so it was cut to the first ten words — the form number and the party, which is what a filename is for — and any trailing separator left dangling by the cut was removed too. A trim, never an addition: nothing was invented, and the full wording is still in the file's description. |
 | `DESCRIPTION_TRIMMED_TO_ONE_SENTENCE` | The description ran past one sentence, or was cut off mid-sentence, so it was trimmed back to its first complete sentence. Also a trim, never an addition. |
 | `HUMAN_CORRECTED` | You corrected this file's name by hand in Needs Review. Recorded so the index shows which names were human-chosen. |
@@ -136,6 +138,7 @@ They deliberately carry no document text — see `docs/PRIVACY.md`.
 | `PANIC` / `TIMEOUT` / `ENCRYPTED` / `ERROR` | Value-free classification of a failed conversion attempt. The full message goes to the app log, never to the ledger, because the raw error embeds the document's full path. |
 | `QUARANTINE_FAILED` | BackLog could not move the flagged file into Quarantine. **The source file is still in Processing and is safe.** Check the Quarantine folder's permissions. |
 | `DUPLICATE_QUARANTINE_FAILED` | A copy of a file already waiting in Needs Review arrived, and BackLog could not move that copy into Quarantine next to its original. **The copy is still in Processing and is safe.** Check the Quarantine folder's permissions, then drop the copy in again. |
+| `STALL:pre-sha` | A file used up its whole time budget before BackLog could even read it — typically a OneDrive placeholder still downloading, or another program holding the file open. **The file is untouched in Processing.** Wait for the sync icon to settle (or close the other program), then touch or re-drop the file. |
 | `RESTORE_FAILED` | You approved a corrected name, but BackLog could not continue the delivery from Quarantine. In Local folder mode it files from Quarantine into Local Output; in Power Automate mode it prepares the handoff again. Check the selected output folder and Quarantine permissions, then Try again. |
 
 ## Still stuck
