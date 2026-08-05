@@ -995,6 +995,17 @@ impl Sidecar {
     pub fn ping(&self) -> anyhow::Result<()> {
         self.call("ping", serde_json::json!({})).map(|_| ())
     }
+
+    /// How many `call()` invocations this sidecar has attempted, successful
+    /// or not — `call()` allocates the request id (and so bumps this) before
+    /// checkout, so a failed spawn against a nonexistent exe still counts.
+    /// Test-only: lets a pipeline test assert "no convert/OCR round-trip
+    /// happened" (a resume-from-cache hit) or "one did" (a cache miss/
+    /// corrupt-cache fallback) without a live convertd process.
+    #[cfg(test)]
+    pub(crate) fn call_count(&self) -> u64 {
+        self.counter.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for Sidecar {
