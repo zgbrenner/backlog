@@ -11,7 +11,12 @@ fn verify(installer: &Path, signature: &Path, public_key: &Path) -> Result<(), S
         .map_err(|error| format!("could not initialize updater verification: {error}"))?;
     let mut file = File::open(installer)
         .map_err(|error| format!("could not open installer for verification: {error}"))?;
-    let mut chunk = [0_u8; 1024 * 1024];
+    // Heap, not stack: a 1 MiB stack array overflows the Windows main
+    // thread's default 1 MB stack in a debug build — which is exactly how
+    // the release workflow runs this example, and how the first-ever signed
+    // release run died with STATUS_STACK_OVERFLOW after an otherwise
+    // successful build.
+    let mut chunk = vec![0_u8; 1024 * 1024];
     loop {
         let read = file
             .read(&mut chunk)
