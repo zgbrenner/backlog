@@ -1,9 +1,11 @@
 //! Local structured-output naming lane backed by llama.cpp.
 //!
 //! The primary Qwen3-0.6B server starts on demand. The Qwen3-1.7B escalation
-//! server starts only after a rejected primary attempt and remains resident for
-//! the batch. Both bind to loopback and use the model's embedded chat template
-//! through llama.cpp's OpenAI-compatible chat-completions endpoint.
+//! server starts only after a rejected primary attempt and remains resident
+//! until `escalation_idle_secs` of no completed request, or for the batch
+//! when that is disabled. Both bind to loopback and use the model's embedded
+//! chat template through llama.cpp's OpenAI-compatible chat-completions
+//! endpoint.
 //!
 //! Qwen3 and its GGUF conversions are Apache-2.0; this replaces the prior
 //! Liquid-licensed LFM2.5 lane so the app can be redistributed without a
@@ -15,8 +17,8 @@ use serde_json::{json, Value};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// How long a freshly spawned llama-server gets to answer `/health` before
@@ -61,6 +63,73 @@ impl Drop for Server {
     }
 }
 
+/// Which physical slot a request actually landed on. Needed because collapse
+/// (`escalation_gguf == primary_gguf`, the 8 GB single-model install) routes
+/// `Tier::Escalation` calls onto `self.primary` — recycling and idle-reap
+/// must key off the physical slot, not the nominal `Tier`, or a collapsed
+/// install would never recycle and a non-collapsed one would double-count.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResolvedSlot {
+    Primary,
+    Escalation,
+}
+
+/// Per-tier server tuning. Grouped so adding a knob touches one call site's
+/// field list, not every positional `SlmLane::new` call's argument order.
+pub struct SlmTuning {
+    pub escalation_parallel: u8,
+    /// 0 disables request-count recycling of the primary server.
+    pub recycle_after_requests: u32,
+    /// 0 disables escalation idle-reaping (resident for process lifetime,
+    /// today's behavior).
+    pub escalation_idle_secs: u64,
+}
+
+impl Default for SlmTuning {
+    fn default() -> Self {
+        Self {
+            escalation_parallel: 1,
+            recycle_after_requests: 0,
+            escalation_idle_secs: 0,
+        }
+    }
+}
+
+/// How often the idle reaper polls. Independent of the idle window itself so
+/// the check granularity stays coarse regardless of what an operator
+/// configures for `slm_escalation_idle_secs`.
+pub(crate) const ESCALATION_REAP_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Reserves one in-flight dispatch against a resolved slot for the lifetime
+/// of one naming attempt (one `name_document` call, including the
+/// span-mismatch re-prompt, which reuses the same tier/slot). Constructed
+/// only once a request has fully committed to a specific, healthy child —
+/// see `ensure_up`. Drop is the only place that decrements, so it fires
+/// symmetrically on success, on any `?`-propagated error inside
+/// `name_document`, and on task cancellation (wall-clock-cap drop).
+struct ServeGuard<'a> {
+    lane: &'a SlmLane,
+    slot: ResolvedSlot,
+}
+
+impl Drop for ServeGuard<'_> {
+    fn drop(&mut self) {
+        match self.slot {
+            ResolvedSlot::Primary => {
+                self.lane.primary_inflight.fetch_sub(1, Ordering::SeqCst);
+            }
+            ResolvedSlot::Escalation => {
+                self.lane.escalation_inflight.fetch_sub(1, Ordering::SeqCst);
+                // "Idle" is measured from last COMPLETION, not last start —
+                // this is what makes reaping a saturated, legitimately-busy
+                // server structurally impossible: the clock only ever resets
+                // when a request actually finishes.
+                *self.lane.escalation_last_completion.lock().unwrap() = Some(Instant::now());
+            }
+        }
+    }
+}
+
 pub struct SlmLane {
     // Retained as a compatibility input while older installations still bundle
     // the GBNF resource. Current chat requests use JSON Schema directly.
@@ -68,7 +137,8 @@ pub struct SlmLane {
     llama_server_exe: PathBuf,
     primary_gguf: PathBuf,
     escalation_gguf: PathBuf,
-    parallel: u8,
+    primary_parallel: u8,
+    escalation_parallel: u8,
     /// `--threads` for each spawned server. Never left to llama.cpp's
     /// default (all logical cores): two resident servers plus the convertd
     /// pool oversubscribing every core is the measured order-of-magnitude
@@ -87,6 +157,18 @@ pub struct SlmLane {
     primary: Mutex<Option<Server>>,
     escalation: Mutex<Option<Server>>,
     http: reqwest::Client,
+    /// 0 disables request-count recycling of the primary server.
+    recycle_after_requests: u32,
+    /// 0 disables escalation idle-reaping (resident for process lifetime).
+    escalation_idle_secs: u64,
+    /// Reset to 0 on every successful (re)spawn of the primary server.
+    primary_requests_served: AtomicU64,
+    /// Requests currently dispatched to the live primary child.
+    primary_inflight: AtomicU64,
+    /// Same, for a genuinely separate (non-collapsed) escalation child.
+    escalation_inflight: AtomicU64,
+    /// `None` until the first escalation request completes.
+    escalation_last_completion: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,8 +210,9 @@ impl SlmLane {
         primary_gguf: PathBuf,
         escalation_gguf: PathBuf,
         base_port: u16,
-        parallel: u8,
+        primary_parallel: u8,
         threads: usize,
+        tuning: SlmTuning,
     ) -> Self {
         let mut token = [0u8; 32];
         getrandom::getrandom(&mut token).expect("CSPRNG for the llama-server API key");
@@ -138,7 +221,8 @@ impl SlmLane {
             llama_server_exe,
             primary_gguf,
             escalation_gguf,
-            parallel,
+            primary_parallel,
+            escalation_parallel: tuning.escalation_parallel,
             threads,
             primary_port: base_port,
             escalation_port: base_port + 1,
@@ -152,34 +236,66 @@ impl SlmLane {
                 .no_proxy()
                 .build()
                 .expect("localhost HTTP client"),
+            recycle_after_requests: tuning.recycle_after_requests,
+            escalation_idle_secs: tuning.escalation_idle_secs,
+            primary_requests_served: AtomicU64::new(0),
+            primary_inflight: AtomicU64::new(0),
+            escalation_inflight: AtomicU64::new(0),
+            escalation_last_completion: Mutex::new(None),
         }
     }
 
-    fn spawn_server(&self, gguf: &Path, port: u16) -> anyhow::Result<Server> {
+    /// Pure argument construction, split out so ctx-size/parallel-per-tier is
+    /// unit-testable without spawning a process (mirrors `rung()`'s "provable
+    /// without a live llama-server" split in `pipeline.rs`).
+    fn server_args(
+        gguf: &Path,
+        port: u16,
+        parallel: u8,
+        threads: usize,
+        api_key: &str,
+    ) -> Vec<String> {
+        vec![
+            "--model".to_string(),
+            gguf.to_str().unwrap_or_default().to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            port.to_string(),
+            "--parallel".to_string(),
+            parallel.to_string(),
+            "--threads".to_string(),
+            threads.to_string(),
+            "--ctx-size".to_string(),
+            (4096u32 * parallel as u32).to_string(),
+            // Required so llama-server renders Qwen3's embedded chat
+            // template for the /v1/chat/completions endpoint below.
+            "--jinja".to_string(),
+            "--no-webui".to_string(),
+            // Reject requests from anything that is not this process.
+            "--api-key".to_string(),
+            api_key.to_string(),
+        ]
+    }
+
+    fn parallel_for(&self, slot: ResolvedSlot) -> u8 {
+        match slot {
+            ResolvedSlot::Primary => self.primary_parallel,
+            ResolvedSlot::Escalation => self.escalation_parallel,
+        }
+    }
+
+    fn spawn_server(&self, gguf: &Path, port: u16, parallel: u8) -> anyhow::Result<Server> {
         anyhow::ensure!(gguf.is_file(), "GGUF model not found: {}", gguf.display());
         let mut command = Command::new(&self.llama_server_exe);
         command
-            .args([
-                "--model",
-                gguf.to_str().unwrap_or_default(),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--parallel",
-                &self.parallel.to_string(),
-                "--threads",
-                &self.threads.to_string(),
-                "--ctx-size",
-                &(4096u32 * self.parallel as u32).to_string(),
-                // Required so llama-server renders Qwen3's embedded chat
-                // template for the /v1/chat/completions endpoint below.
-                "--jinja",
-                "--no-webui",
-                // Reject requests from anything that is not this process.
-                "--api-key",
+            .args(Self::server_args(
+                gguf,
+                port,
+                parallel,
+                self.threads,
                 &self.api_key,
-            ])
+            ))
             .stdout(Stdio::null())
             // Piped, not null: llama-server explains a refused port, a bad
             // GGUF or an OOM here and nowhere else. See `log_child_stderr`.
@@ -203,40 +319,78 @@ impl SlmLane {
         })
     }
 
+    /// When both tiers name the same weights, escalation is a second pass
+    /// over a wider evidence bundle rather than a bigger model, so it runs on
+    /// the server that is already up. Standing a second llama-server on a
+    /// second port over the same GGUF would double the resident cost — and
+    /// the KV cache, not the weights, is the expensive half — to buy nothing.
+    /// This is the configuration an 8 GB machine ships in: the installer
+    /// carries only the 0.6B, `Config::normalize` points both tiers at it,
+    /// and the escalation rung still happens.
+    pub fn escalation_collapsed(&self) -> bool {
+        self.escalation_gguf == self.primary_gguf
+    }
+
     /// Why the child is re-checked and the slot cleared rather than polled to
     /// exhaustion: a llama-server that died on startup (missing CUDA runtime,
     /// corrupt GGUF, port taken) used to cost 60 seconds of polling followed
     /// by a message that named the port and nothing else — and every later
     /// call paid the same 60 seconds against the same dead child forever.
-    async fn ensure_up(&self, tier: Tier) -> anyhow::Result<u16> {
+    async fn ensure_up(&self, tier: Tier) -> anyhow::Result<(u16, ServeGuard<'_>)> {
         anyhow::ensure!(
             !self.shutting_down.load(Ordering::SeqCst),
             "llama-server is shutting down"
         );
-        // When both tiers name the same weights, escalation is a second pass
-        // over a wider evidence bundle rather than a bigger model, so it runs
-        // on the server that is already up. Standing a second llama-server on a
-        // second port over the same GGUF would double the resident cost — and
-        // the KV cache, not the weights, is the expensive half — to buy
-        // nothing. This is the configuration an 8 GB machine ships in: the
-        // installer carries only the 0.6B, `Config::normalize` points both
-        // tiers at it, and the escalation rung still happens.
-        let collapse = tier == Tier::Escalation && self.escalation_gguf == self.primary_gguf;
-        let (slot, gguf, preferred_port) = match tier {
-            Tier::Primary => (&self.primary, &self.primary_gguf, self.primary_port),
-            Tier::Escalation if collapse => (&self.primary, &self.primary_gguf, self.primary_port),
+        let collapse = tier == Tier::Escalation && self.escalation_collapsed();
+        let (slot, gguf, preferred_port, resolved) = match tier {
+            Tier::Primary => (
+                &self.primary,
+                &self.primary_gguf,
+                self.primary_port,
+                ResolvedSlot::Primary,
+            ),
+            Tier::Escalation if collapse => (
+                &self.primary,
+                &self.primary_gguf,
+                self.primary_port,
+                ResolvedSlot::Primary,
+            ),
             Tier::Escalation => (
                 &self.escalation,
                 &self.escalation_gguf,
                 self.escalation_port,
+                ResolvedSlot::Escalation,
             ),
         };
+
         let port = {
             let mut guard = slot.lock().unwrap();
             anyhow::ensure!(
                 !self.shutting_down.load(Ordering::SeqCst),
                 "llama-server is shutting down"
             );
+
+            // Recycle check runs BEFORE the live/dead check and under the
+            // same lock as the respawn decision below — this is the only
+            // place two concurrent ensure_up calls for the primary slot are
+            // serialized, and it is what makes "never race an in-flight
+            // request" provable: the inflight read here can never be stale
+            // relative to another task's reservation, because reservations
+            // (below) are also made inside this same critical section.
+            if resolved == ResolvedSlot::Primary && guard.is_some() {
+                let served = self.primary_requests_served.load(Ordering::SeqCst);
+                let inflight = self.primary_inflight.load(Ordering::SeqCst);
+                if self.recycle_after_requests > 0
+                    && served >= self.recycle_after_requests as u64
+                    && inflight == 0
+                {
+                    log::info!("recycling primary llama-server after {served} requests");
+                    *guard = None; // Server::drop kills the outgoing child
+                }
+                // inflight > 0: defer. The next ensure_up call that finds
+                // inflight == 0 will recycle instead.
+            }
+
             let live = match guard.as_mut() {
                 Some(server) => match server.child.try_wait() {
                     Ok(None) => Some(server.port),
@@ -244,16 +398,48 @@ impl SlmLane {
                 },
                 None => None,
             };
-            match live {
+            let port = match live {
                 Some(port) => port,
                 None => {
                     // Drops (and therefore kills) whatever was there before.
                     *guard = None;
                     let port = reserve_port(preferred_port)?;
-                    let server = self.spawn_server(gguf, port)?;
+                    let server = self.spawn_server(gguf, port, self.parallel_for(resolved))?;
                     *guard = Some(server);
+                    if resolved == ResolvedSlot::Primary {
+                        self.primary_requests_served.store(0, Ordering::SeqCst);
+                    }
                     port
                 }
+            };
+
+            // Reserve the dispatch while still holding the lock (see comment
+            // above). This does NOT yet count toward `primary_requests_served`
+            // — that only happens once health is confirmed, so a server that
+            // never comes up doesn't inflate the "served" count that gates
+            // the NEXT recycle decision.
+            match resolved {
+                ResolvedSlot::Primary => {
+                    self.primary_inflight.fetch_add(1, Ordering::SeqCst);
+                }
+                ResolvedSlot::Escalation => {
+                    self.escalation_inflight.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            port
+        };
+
+        // Every exit from here must either return a ServeGuard (which owns
+        // the reservation made above) or explicitly release it — a
+        // health-check failure that leaked the reservation would freeze
+        // `primary_inflight` at "busy" forever and permanently disable
+        // recycling.
+        let release = |lane: &Self| match resolved {
+            ResolvedSlot::Primary => {
+                lane.primary_inflight.fetch_sub(1, Ordering::SeqCst);
+            }
+            ResolvedSlot::Escalation => {
+                lane.escalation_inflight.fetch_sub(1, Ordering::SeqCst);
             }
         };
 
@@ -262,10 +448,12 @@ impl SlmLane {
         loop {
             if self.shutting_down.load(Ordering::SeqCst) {
                 *slot.lock().unwrap() = None;
+                release(self);
                 anyhow::bail!("llama-server is shutting down");
             }
             if let Some(exit) = self.child_exit(slot)? {
                 *slot.lock().unwrap() = None;
+                release(self);
                 anyhow::bail!(
                     "llama-server exited during startup ({exit}); its output is in the log file"
                 );
@@ -278,7 +466,16 @@ impl SlmLane {
                 .await
             {
                 if response.status().is_success() {
-                    return Ok(port);
+                    if resolved == ResolvedSlot::Primary {
+                        self.primary_requests_served.fetch_add(1, Ordering::SeqCst);
+                    }
+                    return Ok((
+                        port,
+                        ServeGuard {
+                            lane: self,
+                            slot: resolved,
+                        },
+                    ));
                 }
             }
             if Instant::now() >= deadline {
@@ -289,6 +486,7 @@ impl SlmLane {
         // Clear the slot so the next call gets a clean spawn instead of
         // re-paying the full wait against the same wedged child.
         *slot.lock().unwrap() = None;
+        release(self);
         anyhow::bail!(
             "llama-server on port {port} did not become healthy within {}s; it has been stopped",
             HEALTH_TIMEOUT.as_secs()
@@ -445,7 +643,7 @@ impl SlmLane {
         language: &str,
         violation_note: Option<&str>,
     ) -> anyhow::Result<SlmOutput> {
-        let port = self.ensure_up(tier).await?;
+        let (port, _serve_guard) = self.ensure_up(tier).await?;
 
         // The two `subject` rules below are the measured shape, and the length of
         // this prompt is a throughput decision as much as a quality one.
@@ -543,6 +741,90 @@ impl SlmLane {
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
     }
+
+    /// Spawns the periodic escalation reaper, using this lane's own
+    /// `escalation_idle_secs` (a no-op task if that is 0). Must be called
+    /// from a live Tokio runtime — `SlmLane::new` stays synchronous and
+    /// reactor-free on purpose (it is constructed from plain `#[test] fn`s
+    /// with no runtime, and from `spawn_blocking` closures). Uses a `Weak`
+    /// reference: the task exits on its own once every `Arc<SlmLane>` clone
+    /// is dropped, so the caller does not need to hold or abort the returned
+    /// handle. It ALSO checks `shutting_down` every tick, because in the
+    /// shipped app `Drop` never runs at all (`App::run` exits via
+    /// `std::process::exit`) and `stop_pipeline_inner` sets `shutting_down`
+    /// explicitly instead. Either signal alone is sufficient; both are
+    /// present because only one of them fires in production.
+    pub fn spawn_idle_reaper(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let idle_secs = self.escalation_idle_secs;
+        self.spawn_idle_reaper_with_poll(idle_secs, ESCALATION_REAP_POLL_INTERVAL)
+    }
+
+    pub(crate) fn spawn_idle_reaper_with_poll(
+        self: Arc<Self>,
+        idle_secs: u64,
+        poll: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let weak: Weak<Self> = Arc::downgrade(&self);
+        tokio::spawn(async move {
+            if idle_secs == 0 {
+                return;
+            }
+            let mut ticker = tokio::time::interval(poll);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(lane) = weak.upgrade() else {
+                    return;
+                };
+                if lane.shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
+                lane.reap_idle_escalation(idle_secs);
+            }
+        })
+    }
+
+    fn reap_idle_escalation(&self, idle_secs: u64) {
+        // Guards itself even in collapsed mode: escalation_inflight and
+        // escalation_last_completion are only ever touched by a request that
+        // resolved to ResolvedSlot::Escalation, which never happens when
+        // collapsed (Tier::Escalation resolves to Primary). So in collapsed
+        // mode `last` stays None forever and this is a no-op — no explicit
+        // `escalation_collapsed()` check needed here.
+        if self.escalation_inflight.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        let mut last = self.escalation_last_completion.lock().unwrap();
+        let Some(completed_at) = *last else { return };
+        if completed_at.elapsed() >= Duration::from_secs(idle_secs) {
+            *last = None;
+            drop(last);
+            let mut guard = self.escalation.lock().unwrap();
+            if guard.is_some() {
+                *guard = None; // Server::drop kills the child
+                log::info!("escalation llama-server reaped after {idle_secs}s idle");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn primary_child_pid(&self) -> Option<u32> {
+        self.primary.lock().unwrap().as_ref().map(|s| s.child.id())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn escalation_child_pid(&self) -> Option<u32> {
+        self.escalation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.child.id())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn primary_inflight(&self) -> u64 {
+        self.primary_inflight.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for SlmLane {
@@ -566,11 +848,14 @@ mod tests {
             28_137,
             1,
             2,
+            SlmTuning::default(),
         );
 
         lane.begin_shutdown();
         assert!(lane.is_shutting_down());
-        let error = lane.ensure_up(Tier::Primary).await.unwrap_err();
+        // `ServeGuard` (the Ok side) is deliberately not `Debug`, so this
+        // goes through `.err()` rather than `unwrap_err()`.
+        let error = lane.ensure_up(Tier::Primary).await.err().unwrap();
         assert!(
             error.to_string().contains("shutting down"),
             "shutdown must fail before inspecting or spawning any binary: {error}"
@@ -617,6 +902,7 @@ mod tests {
             base_port,
             1,
             2,
+            SlmTuning::default(),
         )
     }
 
@@ -663,7 +949,8 @@ mod tests {
         let error = lane
             .ensure_up(Tier::Primary)
             .await
-            .expect_err("a nonexistent GGUF must not be waited on");
+            .err()
+            .expect("a nonexistent GGUF must not be waited on");
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "must not burn the health timeout first"
@@ -675,6 +962,238 @@ mod tests {
         assert!(
             lane.primary.lock().unwrap().is_none(),
             "a failed spawn must not leave a slot behind"
+        );
+    }
+
+    #[test]
+    fn spawn_server_uses_the_resolved_tiers_own_parallel_and_ctx_size() {
+        let get = |args: &[String], flag: &str| -> Option<String> {
+            args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+        };
+
+        let primary_args =
+            SlmLane::server_args(Path::new("/models/x.gguf"), 18_137, 2, 4, "secret-token");
+        assert_eq!(get(&primary_args, "--parallel").as_deref(), Some("2"));
+        assert_eq!(get(&primary_args, "--ctx-size").as_deref(), Some("8192"));
+        assert_eq!(get(&primary_args, "--threads").as_deref(), Some("4"));
+        assert_eq!(get(&primary_args, "--port").as_deref(), Some("18137"));
+        assert_eq!(
+            get(&primary_args, "--api-key").as_deref(),
+            Some("secret-token")
+        );
+
+        // A different tier's own parallel changes both --parallel and
+        // --ctx-size together (4096 * parallel), independent of --threads.
+        let escalation_args =
+            SlmLane::server_args(Path::new("/models/x.gguf"), 18_138, 1, 4, "secret-token");
+        assert_eq!(get(&escalation_args, "--parallel").as_deref(), Some("1"));
+        assert_eq!(get(&escalation_args, "--ctx-size").as_deref(), Some("4096"));
+    }
+
+    /// §7.4 regression: nothing ever resolves to `ResolvedSlot::Escalation`
+    /// when collapsed, so `escalation_last_completion` stays `None` forever
+    /// and the reap sweep must be a no-op regardless of `idle_secs`.
+    #[test]
+    fn escalation_idle_reap_is_a_no_op_when_collapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared.gguf");
+        let lane = SlmLane::new(
+            dir.path().join("missing-llama-server"),
+            String::new(),
+            shared.clone(),
+            shared,
+            29_401,
+            1,
+            2,
+            SlmTuning {
+                escalation_idle_secs: 1,
+                ..SlmTuning::default()
+            },
+        );
+        assert!(lane.escalation_collapsed());
+        lane.reap_idle_escalation(0);
+        assert!(lane.escalation_child_pid().is_none());
+    }
+
+    // ---- fake-server infra (unix only: shebang script + chmod) -----------
+    //
+    // These tests drive a real, spawned llama-server stand-in through
+    // `ensure_up` / the idle reaper, so — unlike the pure tests above — they
+    // need a script this OS can exec. They mirror `pipeline.rs`'s
+    // `FAKE_LLAMA_SERVER` pattern: `/health` only, since the recycle and
+    // idle-reap logic under test never reaches `name_document`'s POST.
+
+    #[cfg(unix)]
+    const FAKE_LLAMA_SERVER_HEALTH_ONLY: &str = r##"#!/usr/bin/env python3
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        body = b'{"status":"ok"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+port = int(sys.argv[sys.argv.index("--port") + 1])
+server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+server.daemon_threads = True
+server.serve_forever()
+"##;
+
+    #[cfg(unix)]
+    fn write_fake_llama_server(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("fake-llama-server");
+        std::fs::write(&p, FAKE_LLAMA_SERVER_HEALTH_ONLY).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    fn fake_lane(base_port: u16, dir: &Path, tuning: SlmTuning) -> SlmLane {
+        let primary_gguf = dir.join("primary.gguf");
+        let escalation_gguf = dir.join("escalation.gguf");
+        std::fs::write(&primary_gguf, b"").unwrap();
+        std::fs::write(&escalation_gguf, b"").unwrap();
+        SlmLane::new(
+            write_fake_llama_server(dir),
+            String::new(),
+            primary_gguf,
+            escalation_gguf,
+            base_port,
+            2,
+            2,
+            tuning,
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn primary_recycles_after_the_configured_request_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let lane = fake_lane(
+            29_101,
+            dir.path(),
+            SlmTuning {
+                recycle_after_requests: 3,
+                ..SlmTuning::default()
+            },
+        );
+
+        let mut first_pid = None;
+        for call in 1..=4u32 {
+            let (_port, guard) = lane.ensure_up(Tier::Primary).await.unwrap();
+            drop(guard);
+            let pid = lane.primary_child_pid().expect("server must be up");
+            match call {
+                1 => first_pid = Some(pid),
+                3 => assert_eq!(
+                    Some(pid),
+                    first_pid,
+                    "must not recycle before the configured threshold"
+                ),
+                4 => assert_ne!(
+                    Some(pid),
+                    first_pid,
+                    "the 4th call must recycle after 3 served requests"
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    /// The "two concurrent calls" from the design are modelled by holding
+    /// both `ServeGuard`s open at once rather than racing real tasks: the
+    /// reservation each `ensure_up` call makes inside its critical section
+    /// (§5 lock-ordering rule 1) is exactly what the recycle check reads,
+    /// so this proves the same invariant deterministically, regardless of
+    /// how two real concurrent callers happen to interleave.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn primary_recycle_never_kills_an_in_flight_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let lane = fake_lane(
+            29_201,
+            dir.path(),
+            SlmTuning {
+                recycle_after_requests: 1,
+                ..SlmTuning::default()
+            },
+        );
+
+        let (port1, guard1) = lane.ensure_up(Tier::Primary).await.unwrap();
+        assert_eq!(lane.primary_inflight(), 1);
+        let (port2, guard2) = lane.ensure_up(Tier::Primary).await.unwrap();
+        assert_eq!(port1, port2, "both in-flight calls must share the server");
+        assert_eq!(lane.primary_inflight(), 2);
+
+        let pid_while_in_flight = lane.primary_child_pid().expect("server must be up");
+
+        drop(guard1);
+        drop(guard2);
+        assert_eq!(lane.primary_inflight(), 0);
+
+        let (_port3, guard3) = lane.ensure_up(Tier::Primary).await.unwrap();
+        let pid_after_third_call = lane.primary_child_pid().expect("server must be up");
+        assert_ne!(
+            pid_while_in_flight, pid_after_third_call,
+            "the 3rd call must recycle now that nothing is in flight"
+        );
+        drop(guard3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escalation_server_is_reaped_after_idle_and_never_while_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let lane = Arc::new(fake_lane(
+            29_301,
+            dir.path(),
+            SlmTuning {
+                escalation_idle_secs: 1,
+                ..SlmTuning::default()
+            },
+        ));
+        let _reaper = lane
+            .clone()
+            .spawn_idle_reaper_with_poll(1, Duration::from_millis(50));
+
+        // Phase 1: a completed request followed by silence must be reaped
+        // once the idle window elapses.
+        let (_port, guard) = lane.ensure_up(Tier::Escalation).await.unwrap();
+        drop(guard); // marks the completion timestamp the reaper reads
+        assert!(
+            lane.escalation_child_pid().is_some(),
+            "the escalation server must be up right after completion"
+        );
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(
+            lane.escalation_child_pid().is_none(),
+            "an idle escalation server must be reaped"
+        );
+
+        // Phase 2: a request still in flight when the idle window would
+        // otherwise have elapsed must never be reaped mid-flight — the clock
+        // only ever starts on COMPLETION, never on start.
+        let (_port2, guard2) = lane.ensure_up(Tier::Escalation).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(
+            lane.escalation_child_pid().is_some(),
+            "a server serving an in-flight request must never be reaped"
+        );
+        drop(guard2);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(
+            lane.escalation_child_pid().is_none(),
+            "the same server must be reaped once the request actually completes and goes idle"
         );
     }
 }

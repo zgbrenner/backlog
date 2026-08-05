@@ -48,6 +48,16 @@ pub struct Config {
     pub slm_primary_gguf: PathBuf,
     pub slm_escalation_gguf: PathBuf,
     pub slm_parallel: u8,
+    pub slm_escalation_parallel: u8,
+    /// Requests a primary llama-server serves before being killed and
+    /// respawned — llama.cpp Windows RSS growth is unfixed upstream
+    /// (ggml-org/llama.cpp#24356; measured 3.45->4.45 GB over 21 files).
+    /// 0 disables recycling.
+    pub slm_recycle_after_requests: u32,
+    /// Seconds since the escalation server's last request COMPLETED (never
+    /// mid-request — see `SlmLane::reap_idle_escalation`) before it is
+    /// dropped. 0 disables idle-reaping (resident for the process lifetime).
+    pub slm_escalation_idle_secs: u64,
     /// Max evidence tokens (approximate, chars/4) sent to the SLM.
     pub evidence_token_budget: usize,
 
@@ -106,6 +116,9 @@ impl Default for Config {
             slm_primary_gguf: PathBuf::from("models/Qwen3-0.6B-Q8_0.gguf"),
             slm_escalation_gguf: PathBuf::from("models/Qwen3-1.7B-Q8_0.gguf"),
             slm_parallel: default_slm_parallel(),
+            slm_escalation_parallel: default_slm_escalation_parallel(),
+            slm_recycle_after_requests: 64,
+            slm_escalation_idle_secs: 600,
             evidence_token_budget: 1500,
             ettin_model_dir: String::new(),
             convert_workers: default_convert_workers(),
@@ -352,6 +365,21 @@ fn slm_parallel_for_ram(gib: Option<u64>) -> u8 {
     }
 }
 
+fn default_slm_escalation_parallel() -> u8 {
+    slm_escalation_parallel_for_ram(total_ram_gib())
+}
+
+/// Deliberately never inherits `slm_parallel_for_ram`'s 4 — the whole point
+/// of a separate knob is decoupling escalation's KV cost from primary's.
+/// `docs/SIZING.md` measures 2,262 MB (parallel 1) vs 3,609 MB (parallel 4)
+/// for the 1.7B; this keeps it at the low end always.
+fn slm_escalation_parallel_for_ram(gib: Option<u64>) -> u8 {
+    match gib {
+        Some(g) if g <= 9 => 1,
+        _ => 2, // >9 GiB and unknown RAM both get the small ceiling
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Self {
         let parse = |candidate: &Path| -> Option<Self> {
@@ -410,9 +438,22 @@ impl Config {
         }
     }
 
+    /// Same one-directional contract as `clamp_slm_parallel_for_test`, for
+    /// the escalation tier's own ceiling.
+    #[cfg(test)]
+    fn clamp_slm_escalation_parallel_for_test(&mut self, gib: Option<u64>) {
+        let ceiling = slm_escalation_parallel_for_ram(gib);
+        if self.slm_escalation_parallel > ceiling {
+            self.slm_escalation_parallel = ceiling;
+        }
+    }
+
     #[cfg(test)]
     fn clamp_resources_for_test(&mut self, gib: Option<u64>) {
         self.slm_parallel = self.slm_parallel.min(slm_parallel_for_ram(gib));
+        self.slm_escalation_parallel = self
+            .slm_escalation_parallel
+            .min(slm_escalation_parallel_for_ram(gib));
         self.convert_workers = self
             .convert_workers
             .min(convert_workers_ram_ceiling(gib))
@@ -436,6 +477,18 @@ impl Config {
                 slm_ceiling
             );
             self.slm_parallel = slm_ceiling;
+        }
+        let slm_escalation_ceiling = slm_escalation_parallel_for_ram(gib);
+        if self.slm_escalation_parallel > slm_escalation_ceiling {
+            log::warn!(
+                "slm_escalation_parallel {} exceeds what {} GiB of RAM supports; using {} for this run \
+                 (set it explicitly lower to silence this, or see docs/SIZING.md)",
+                self.slm_escalation_parallel,
+                gib.map(|g| g.to_string())
+                    .unwrap_or_else(|| "an unknown amount of".into()),
+                slm_escalation_ceiling
+            );
+            self.slm_escalation_parallel = slm_escalation_ceiling;
         }
         let convert_ceiling = convert_workers_ram_ceiling(gib);
         if self.convert_workers > convert_ceiling {
@@ -643,6 +696,24 @@ impl Config {
                 self.slm_parallel
             ));
         }
+        if !(1..=4).contains(&self.slm_escalation_parallel) {
+            return Err(format!(
+                "slm_escalation_parallel must be between 1 and 4; got {}.",
+                self.slm_escalation_parallel
+            ));
+        }
+        if self.slm_recycle_after_requests > 100_000 {
+            return Err(format!(
+                "slm_recycle_after_requests must be 0 or at most 100000; got {}.",
+                self.slm_recycle_after_requests
+            ));
+        }
+        if self.slm_escalation_idle_secs > 86_400 {
+            return Err(format!(
+                "slm_escalation_idle_secs must be 0 or at most 86400; got {}.",
+                self.slm_escalation_idle_secs
+            ));
+        }
         if self.evidence_token_budget == 0 || self.evidence_token_budget > 16_384 {
             return Err(format!(
                 "evidence_token_budget must be between 1 and 16384; got {}.",
@@ -798,6 +869,22 @@ mod tests {
         let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
         c.slm_parallel = 0;
         cases.push((c, "slm_parallel"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.slm_escalation_parallel = 0;
+        cases.push((c, "slm_escalation_parallel"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.slm_escalation_parallel = 5;
+        cases.push((c, "slm_escalation_parallel"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.slm_recycle_after_requests = 100_001;
+        cases.push((c, "slm_recycle_after_requests"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.slm_escalation_idle_secs = 86_401;
+        cases.push((c, "slm_escalation_idle_secs"));
 
         let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
         c.evidence_token_budget = 0;
@@ -992,6 +1079,30 @@ mod tests {
         assert_eq!(slm_parallel_for_ram(None), 2);
     }
 
+    /// The escalation tier deliberately never inherits `slm_parallel_for_ram`'s
+    /// 4 — it stays at the low end (1 or 2) on every machine, because its
+    /// whole point is decoupling escalation's KV cost from primary's.
+    #[test]
+    fn slm_escalation_parallel_is_chosen_from_installed_ram() {
+        for (gib, expected) in [
+            (4u64, 1u8),
+            (8, 1),
+            (9, 1),
+            (12, 2),
+            (16, 2),
+            (17, 2),
+            (32, 2),
+        ] {
+            assert_eq!(
+                slm_escalation_parallel_for_ram(Some(gib)),
+                expected,
+                "{gib} GiB should give {expected}"
+            );
+        }
+        // Unknown RAM must not gamble on behalf of the smaller machine.
+        assert_eq!(slm_escalation_parallel_for_ram(None), 2);
+    }
+
     /// Each `convertd` worker is a ~195 MB Python process now that `Sidecar`
     /// pools them, so six of them is ~1.2 GB and does not fit on 8 GB beside
     /// Windows, the two model servers and the app.
@@ -1032,15 +1143,39 @@ mod tests {
         assert_eq!(cfg.slm_parallel, 1, "a deliberate 1 must survive on 64 GB");
     }
 
+    /// Same one-directional contract for the escalation tier's own knob.
+    #[test]
+    fn a_persisted_slm_escalation_parallel_is_clamped_down_but_never_up() {
+        let mut cfg = Config {
+            slm_escalation_parallel: 2,
+            ..Default::default()
+        };
+        cfg.clamp_slm_escalation_parallel_for_test(Some(8));
+        assert_eq!(cfg.slm_escalation_parallel, 1, "8 GB must not inherit 2");
+
+        // One-directional: someone who lowered it knows their machine.
+        let mut cfg = Config {
+            slm_escalation_parallel: 1,
+            ..Default::default()
+        };
+        cfg.clamp_slm_escalation_parallel_for_test(Some(64));
+        assert_eq!(
+            cfg.slm_escalation_parallel, 1,
+            "a deliberate 1 must survive on 64 GB"
+        );
+    }
+
     #[test]
     fn an_eight_gib_machine_clamps_every_process_pool() {
         let mut cfg = Config {
             slm_parallel: 4,
+            slm_escalation_parallel: 2,
             convert_workers: 6,
             ..Default::default()
         };
         cfg.clamp_resources_for_test(Some(8));
         assert_eq!(cfg.slm_parallel, 1);
+        assert_eq!(cfg.slm_escalation_parallel, 1);
         assert_eq!(cfg.convert_workers, 2);
     }
 

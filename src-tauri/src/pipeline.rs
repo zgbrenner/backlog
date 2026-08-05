@@ -33,6 +33,11 @@ pub struct Pipeline {
     pub paused: Arc<AtomicBool>,
     convert_slots: Arc<Semaphore>,
     slm_slots: Arc<Semaphore>,
+    /// Gates concurrent Tier::Escalation HTTP calls independently of
+    /// `slm_slots`. Never acquired when `slm.escalation_collapsed()` — a
+    /// collapsed (single-server) install has no second server to protect,
+    /// so gating it here would only over-throttle it for no memory benefit.
+    escalation_slots: Arc<Semaphore>,
     /// Global cap on files being hashed / stability-probed / processed at once,
     /// so a large backfill applies backpressure instead of spawning thousands
     /// of concurrent blocking probes.
@@ -266,6 +271,7 @@ impl Pipeline {
         Arc::new(Self {
             convert_slots: Arc::new(Semaphore::new(cfg.convert_workers.max(1))),
             slm_slots: Arc::new(Semaphore::new(cfg.slm_parallel.max(1) as usize)),
+            escalation_slots: Arc::new(Semaphore::new(cfg.slm_escalation_parallel.max(1) as usize)),
             ingest_slots: Arc::new(Semaphore::new(
                 (cfg.convert_workers.max(1) * 4).clamp(8, 64),
             )),
@@ -279,6 +285,11 @@ impl Pipeline {
             paused: Arc::new(AtomicBool::new(false)),
             model_versions,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn escalation_slots_available(&self) -> usize {
+        self.escalation_slots.available_permits()
     }
 
     fn emit_update(&self, sha: &str) {
@@ -857,6 +868,7 @@ impl Pipeline {
                 &meta_dates,
                 &modified_iso,
                 ettin_date.as_deref(),
+                &clock,
             )
             .await
         };
@@ -1121,6 +1133,7 @@ impl Pipeline {
         meta_dates: &[String],
         modified_iso: &str,
         ettin_date: Option<&str>,
+        clock: &WorkClock,
         // `Err` carries the code of the last rule that rejected, so the flag
         // reason can name it. `None` inside the `Err` means the ladder never got
         // a parseable proposal at all — a model or transport failure rather than
@@ -1133,6 +1146,18 @@ impl Pipeline {
         let doc_type_hint = ev.doc_type.as_deref().unwrap_or("unknown");
         for attempt in 1..=self.cfg.max_stage_attempts.max(1) {
             let (tier, bundle) = self.rung(attempt, ev);
+            // Gates concurrent Tier::Escalation HTTP calls independently of
+            // `slm_slots` (§7.3 of the lifecycle design). Held across both
+            // this attempt's call AND the span-mismatch re-prompt below,
+            // which reuses the same `tier` — released at the end of this
+            // loop iteration, before the next attempt acquires it again.
+            // Off the wall-clock cap, same as `slm_slots.acquire()` above.
+            let _escalation_permit = if tier == Tier::Escalation && !self.slm.escalation_collapsed()
+            {
+                Some(clock.parked(self.escalation_slots.acquire()).await.unwrap())
+            } else {
+                None
+            };
             let out = self
                 .slm
                 .name_document(
@@ -3219,6 +3244,7 @@ fn manifest_id(content_sha: &str, relpath: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::slm::SlmTuning;
 
     #[test]
     fn manifest_id_is_fs_safe_and_path_case_insensitive() {
@@ -3358,10 +3384,12 @@ mod tests {
                 18137,
                 1,
                 2,
+                SlmTuning::default(),
             ));
             let pipeline = Arc::new(Pipeline {
                 convert_slots: Arc::new(Semaphore::new(1)),
                 slm_slots: Arc::new(Semaphore::new(1)),
+                escalation_slots: Arc::new(Semaphore::new(1)),
                 ingest_slots: Arc::new(Semaphore::new(8)),
                 inflight: Arc::new(Mutex::new(HashSet::new())),
                 pacer: Arc::new(Pacer::new(0)),
@@ -3386,6 +3414,7 @@ mod tests {
             Arc::new(Pipeline {
                 convert_slots: self.pipeline.convert_slots.clone(),
                 slm_slots: self.pipeline.slm_slots.clone(),
+                escalation_slots: self.pipeline.escalation_slots.clone(),
                 ingest_slots: self.pipeline.ingest_slots.clone(),
                 inflight: self.pipeline.inflight.clone(),
                 pacer: self.pipeline.pacer.clone(),
@@ -5207,6 +5236,11 @@ mod tests {
             cfg.llama_port,
             cfg.slm_parallel,
             cfg.slm_threads(),
+            SlmTuning {
+                escalation_parallel: cfg.slm_escalation_parallel,
+                recycle_after_requests: cfg.slm_recycle_after_requests,
+                escalation_idle_secs: cfg.slm_escalation_idle_secs,
+            },
         );
         let checker = crate::checker::Checker::new(cfg.max_filename_len);
 
@@ -5394,6 +5428,11 @@ mod tests {
             cfg.llama_port,
             cfg.slm_parallel,
             cfg.slm_threads(),
+            SlmTuning {
+                escalation_parallel: cfg.slm_escalation_parallel,
+                recycle_after_requests: cfg.slm_recycle_after_requests,
+                escalation_idle_secs: cfg.slm_escalation_idle_secs,
+            },
         ));
         let model_versions = sidecar.versions().unwrap_or_else(|_| json!({}));
         assert!(
@@ -5404,6 +5443,7 @@ mod tests {
         let pipeline = Arc::new(Pipeline {
             convert_slots: Arc::new(Semaphore::new(cfg.convert_workers.max(1))),
             slm_slots: Arc::new(Semaphore::new(cfg.slm_parallel.max(1) as usize)),
+            escalation_slots: Arc::new(Semaphore::new(cfg.slm_escalation_parallel.max(1) as usize)),
             ingest_slots: Arc::new(Semaphore::new(
                 (cfg.convert_workers.max(1) * 4).clamp(8, 64),
             )),
@@ -5685,6 +5725,7 @@ server.serve_forever()
                 18937,
                 1,
                 2,
+                SlmTuning::default(),
             )),
             cfg: h.pipeline.cfg.clone(),
             ledger: h.pipeline.ledger.clone(),
@@ -5692,6 +5733,7 @@ server.serve_forever()
             paused: h.pipeline.paused.clone(),
             convert_slots: convert_slots.clone(),
             slm_slots: Arc::new(Semaphore::new(1)),
+            escalation_slots: Arc::new(Semaphore::new(1)),
             ingest_slots: Arc::new(Semaphore::new(8)),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             pacer: Arc::new(Pacer::new(0)),
@@ -5766,6 +5808,7 @@ server.serve_forever()
             paused: h.pipeline.paused.clone(),
             convert_slots: Arc::new(Semaphore::new(1)),
             slm_slots: Arc::new(Semaphore::new(1)),
+            escalation_slots: Arc::new(Semaphore::new(1)),
             ingest_slots: Arc::new(Semaphore::new(8)),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             pacer: Arc::new(Pacer::new(0)),
@@ -5825,6 +5868,293 @@ server.serve_forever()
             .unwrap()
             .claimed_at
             .is_none());
+    }
+
+    /// Stands in for llama-server, tiered by which port it was started on:
+    /// the primary port always rejects (a date not present in the evidence),
+    /// the escalation port always accepts. `rung()` only escalates on the
+    /// 3rd attempt, so a file driven through this always burns two primary
+    /// attempts before landing on the escalation server — exactly the
+    /// "forced to escalate" shape `escalation_slots` needs a test for. The
+    /// escalation reply sleeps briefly to widen the window in which two
+    /// files' escalation attempts can genuinely overlap.
+    #[cfg(unix)]
+    fn fake_llama_server_tiered(primary_port: u16) -> String {
+        format!(
+            r##"#!/usr/bin/env python3
+import json, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PRIMARY_PORT = {primary_port}
+BAD = {{
+    "date": "1999-01-01",
+    "date_source": "document",
+    "subject": "Acme Corporation Invoice March",
+    "description": "Invoice from Acme Corporation covering March consulting services.",
+}}
+OK = {{
+    "date": "2024-03-05",
+    "date_source": "document",
+    "subject": "Acme Corporation Invoice March",
+    "description": "Invoice from Acme Corporation covering March consulting services.",
+}}
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def reply(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.reply({{"status": "ok"}})
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        name = BAD
+        if PORT != PRIMARY_PORT:
+            time.sleep(0.15)
+            name = OK
+        self.reply({{"choices": [{{"message": {{"content": json.dumps(name)}}}}]}})
+
+    def log_message(self, *args):
+        pass
+
+PORT = int(sys.argv[sys.argv.index("--port") + 1])
+server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+server.daemon_threads = True
+server.serve_forever()
+"##,
+            primary_port = primary_port
+        )
+    }
+
+    /// Stands in for llama-server: always proposes a date absent from the
+    /// evidence, so every naming attempt is a hard `DATE_NOT_IN_EVIDENCE`
+    /// rejection regardless of tier. Used for the collapsed-install test,
+    /// where a single physical server answers both tiers.
+    #[cfg(unix)]
+    const FAKE_LLAMA_SERVER_ALWAYS_REJECTS: &str = r##"#!/usr/bin/env python3
+import json, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BAD = {
+    "date": "1999-01-01",
+    "date_source": "document",
+    "subject": "Acme Corporation Invoice March",
+    "description": "Invoice from Acme Corporation covering March consulting services.",
+}
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def reply(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.reply({"status": "ok"})
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        time.sleep(0.08)
+        self.reply({"choices": [{"message": {"content": json.dumps(BAD)}}]})
+
+    def log_message(self, *args):
+        pass
+
+port = int(sys.argv[sys.argv.index("--port") + 1])
+server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+server.daemon_threads = True
+server.serve_forever()
+"##;
+
+    /// §7.3: `escalation_slots` (cap 1) must not deadlock against `slm_slots`
+    /// (cap 2) when two files hold a naming permit at once and both need to
+    /// escalate. Acquisition is one-directional — `slm_slots` before
+    /// `escalation_slots`, never the reverse (§5 rule 4) — so the excess
+    /// escalation attempt queues rather than hangs.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn escalation_slots_bounds_concurrency_without_deadlocking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = Harness::new();
+        let script = |name: &str, body: &str| {
+            let p = h.dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let convertd = script("fake-convertd-escalation-bound", FAKE_CONVERTD);
+        let primary_port: u16 = 18_957;
+        let llama = script(
+            "fake-llama-server-tiered",
+            &fake_llama_server_tiered(primary_port),
+        );
+        let primary_gguf = h.dir.path().join("primary-bound.gguf");
+        let escalation_gguf = h.dir.path().join("escalation-bound.gguf");
+        for gguf in [&primary_gguf, &escalation_gguf] {
+            std::fs::write(gguf, b"").unwrap();
+        }
+
+        let slm = Arc::new(SlmLane::new(
+            llama,
+            String::new(),
+            primary_gguf,
+            escalation_gguf,
+            primary_port,
+            1,
+            2,
+            SlmTuning::default(),
+        ));
+        let pipeline = Arc::new(Pipeline {
+            sidecar: Arc::new(Sidecar::with_timeout(
+                convertd,
+                std::time::Duration::from_secs(30),
+            )),
+            slm,
+            cfg: h.pipeline.cfg.clone(),
+            ledger: h.pipeline.ledger.clone(),
+            app: None,
+            paused: h.pipeline.paused.clone(),
+            convert_slots: Arc::new(Semaphore::new(2)),
+            slm_slots: Arc::new(Semaphore::new(2)),
+            escalation_slots: Arc::new(Semaphore::new(1)),
+            ingest_slots: Arc::new(Semaphore::new(8)),
+            inflight: Arc::new(Mutex::new(HashSet::new())),
+            pacer: Arc::new(Pacer::new(0)),
+            model_versions: json!({ "convertd": "test" }),
+        });
+
+        let (sha_a, path_a) = h.seed("vendor/a.txt", QUEUED_DOCUMENT);
+        let (sha_b, path_b) = h.seed("vendor/b.txt", QUEUED_DOCUMENT);
+
+        let run = async {
+            tokio::join!(
+                pipeline.clone().process_file(path_a.clone()),
+                pipeline.clone().process_file(path_b.clone())
+            );
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("two escalating files must not deadlock on the escalation cap");
+
+        for sha in [&sha_a, &sha_b] {
+            let job = pipeline
+                .ledger
+                .get(sha)
+                .unwrap()
+                .expect("the job must exist");
+            assert_eq!(
+                job.state,
+                JobState::Emitted,
+                "both files must reach a terminal state (reason: {:?})",
+                job.flag_reason
+            );
+        }
+    }
+
+    /// §7.4 regression: a collapsed install (escalation resolves onto the
+    /// same physical server as primary) must never touch `escalation_slots`
+    /// — if the `!self.slm.escalation_collapsed()` guard in
+    /// `name_with_retries` were ever dropped, this would observe the permit
+    /// count fall below its starting value while attempt 3 (Tier::Escalation)
+    /// is in flight.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn escalation_slots_not_acquired_when_collapsed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = Harness::new();
+        let script = |name: &str, body: &str| {
+            let p = h.dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let convertd = script("fake-convertd-collapsed", FAKE_CONVERTD);
+        let llama = script(
+            "fake-llama-server-collapsed",
+            FAKE_LLAMA_SERVER_ALWAYS_REJECTS,
+        );
+        let shared_gguf = h.dir.path().join("shared.gguf");
+        std::fs::write(&shared_gguf, b"").unwrap();
+
+        let slm = Arc::new(SlmLane::new(
+            llama,
+            String::new(),
+            shared_gguf.clone(),
+            shared_gguf,
+            18_967,
+            1,
+            2,
+            SlmTuning::default(),
+        ));
+        assert!(slm.escalation_collapsed());
+
+        let pipeline = Arc::new(Pipeline {
+            sidecar: Arc::new(Sidecar::with_timeout(
+                convertd,
+                std::time::Duration::from_secs(30),
+            )),
+            slm,
+            cfg: h.pipeline.cfg.clone(),
+            ledger: h.pipeline.ledger.clone(),
+            app: None,
+            paused: h.pipeline.paused.clone(),
+            convert_slots: Arc::new(Semaphore::new(1)),
+            slm_slots: Arc::new(Semaphore::new(1)),
+            escalation_slots: Arc::new(Semaphore::new(1)),
+            ingest_slots: Arc::new(Semaphore::new(8)),
+            inflight: Arc::new(Mutex::new(HashSet::new())),
+            pacer: Arc::new(Pacer::new(0)),
+            model_versions: json!({ "convertd": "test" }),
+        });
+
+        let (sha, path) = h.seed("vendor/collapsed.txt", QUEUED_DOCUMENT);
+
+        let min_seen = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let monitor_pipeline = pipeline.clone();
+        let monitor_min = min_seen.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let monitor_stop = stop.clone();
+        let monitor = tokio::spawn(async move {
+            while !monitor_stop.load(Ordering::Relaxed) {
+                let available = monitor_pipeline.escalation_slots_available();
+                monitor_min.fetch_min(available, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        pipeline.clone().process_file(path.clone()).await;
+        stop.store(true, Ordering::Relaxed);
+        monitor.await.unwrap();
+
+        assert_eq!(
+            min_seen.load(Ordering::Relaxed),
+            1,
+            "a collapsed install must never acquire escalation_slots"
+        );
+
+        let job = pipeline
+            .ledger
+            .get(&sha)
+            .unwrap()
+            .expect("the job must exist");
+        assert_eq!(
+            job.state,
+            JobState::Flagged,
+            "every attempt rejects in this fixture, so the file must be flagged, not stuck"
+        );
     }
 
     /// P3: two flagged documents sharing a leaf name must both survive. The

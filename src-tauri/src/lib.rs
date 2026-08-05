@@ -24,7 +24,7 @@ use ledger::Ledger;
 use pipeline::Pipeline;
 use preflight::RuntimeStatus;
 use sidecar::Sidecar;
-use slm::SlmLane;
+use slm::{SlmLane, SlmTuning};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1035,6 +1035,9 @@ fn redacted_config(cfg: &Config) -> serde_json::Value {
         "escalation_model": cfg.slm_escalation_gguf.file_name().map(|n| n.to_string_lossy().into_owned()),
         "llama_port": cfg.llama_port,
         "slm_parallel": cfg.slm_parallel,
+        "slm_escalation_parallel": cfg.slm_escalation_parallel,
+        "slm_recycle_after_requests": cfg.slm_recycle_after_requests,
+        "slm_escalation_idle_secs": cfg.slm_escalation_idle_secs,
         "convert_workers": cfg.convert_workers,
         "sidecar_timeout_secs": cfg.sidecar_timeout_secs,
         "manifest_emit_per_min": cfg.manifest_emit_per_min,
@@ -1129,7 +1132,16 @@ async fn review_only_pipeline(
             cfg.llama_port.min(u16::MAX - 1),
             cfg.slm_parallel,
             cfg.slm_threads(),
+            SlmTuning {
+                escalation_parallel: cfg.slm_escalation_parallel,
+                recycle_after_requests: cfg.slm_recycle_after_requests,
+                escalation_idle_secs: cfg.slm_escalation_idle_secs,
+            },
         ));
+        // No idle reaper here on purpose: this pipeline is throwaway (one
+        // resubmit, then dropped), and its `Arc<SlmLane>`'s natural `Drop`
+        // (this path exits normally, unlike the real app's
+        // `std::process::exit`) already runs `begin_shutdown`.
         Pipeline::new(cfg, ledger, sidecar, slm, app)
     })
     .await
@@ -1218,7 +1230,19 @@ async fn start_pipeline(
         cfg.llama_port,
         cfg.slm_parallel,
         cfg.slm_threads(),
+        SlmTuning {
+            escalation_parallel: cfg.slm_escalation_parallel,
+            recycle_after_requests: cfg.slm_recycle_after_requests,
+            escalation_idle_secs: cfg.slm_escalation_idle_secs,
+        },
     ));
+    // `start_pipeline` is itself `async fn` and calls this directly (not
+    // `spawn_blocking`), so the reaper's `tokio::spawn` has a live reactor to
+    // land on. `_idle_reaper`'s `JoinHandle` is intentionally dropped
+    // (detached) — the task self-terminates via `Weak::upgrade` once every
+    // `Arc<SlmLane>` clone is gone, or via the `shutting_down` latch that
+    // `stop_pipeline_inner` sets, whichever fires first.
+    let _idle_reaper = slm.clone().spawn_idle_reaper();
     let pipeline = Pipeline::new(cfg.clone(), state.ledger.clone(), sidecar, slm, app);
 
     let mut slot = state.pipeline.lock().unwrap();
