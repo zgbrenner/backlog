@@ -946,8 +946,31 @@ fn strip_trailing_dates(s: &str) -> Option<String> {
 /// "… - Effective" or "… shall recover". Trailing-position only — every one of
 /// these words is legitimate mid-subject.
 const DANGLING_TAIL_WORDS: [&str; 26] = [
-    "a", "an", "and", "at", "but", "by", "dated", "effective", "for", "from", "in", "is", "of",
-    "on", "or", "per", "re", "regarding", "shall", "the", "to", "was", "which", "will", "with",
+    "a",
+    "an",
+    "and",
+    "at",
+    "but",
+    "by",
+    "dated",
+    "effective",
+    "for",
+    "from",
+    "in",
+    "is",
+    "of",
+    "on",
+    "or",
+    "per",
+    "re",
+    "regarding",
+    "shall",
+    "the",
+    "to",
+    "was",
+    "which",
+    "will",
+    "with",
     "would",
 ];
 
@@ -2732,7 +2755,10 @@ mod tests {
     fn trailing_dates_and_years_are_stripped_from_subjects() {
         // The exact shape observed shipping in the 2026-08 E2E.
         assert_eq!(
-            strip_trailing_dates("Form 8829 - Marcus Alvarez - Globex Corporation - 2026-08-05 - 2026").as_deref(),
+            strip_trailing_dates(
+                "Form 8829 - Marcus Alvarez - Globex Corporation - 2026-08-05 - 2026"
+            )
+            .as_deref(),
             Some("Form 8829 - Marcus Alvarez - Globex Corporation")
         );
         assert_eq!(
@@ -2755,12 +2781,18 @@ mod tests {
             Some("Form 8829 - Initech - Globex Corporation")
         );
         assert_eq!(
-            strip_dangling_words("Form 8829 - Acme Industries - Umbrella Holdings - Effective", 2)
-                .as_deref(),
+            strip_dangling_words(
+                "Form 8829 - Acme Industries - Umbrella Holdings - Effective",
+                2
+            )
+            .as_deref(),
             Some("Form 8829 - Acme Industries - Umbrella Holdings")
         );
         // Trailing-position only: these words are legitimate mid-subject.
-        assert_eq!(strip_dangling_words("Notice of Termination - Smith", 2), None);
+        assert_eq!(
+            strip_dangling_words("Notice of Termination - Smith", 2),
+            None
+        );
         // Never strip below the minimum word count.
         assert_eq!(strip_dangling_words("Notice of", 2), None);
     }
