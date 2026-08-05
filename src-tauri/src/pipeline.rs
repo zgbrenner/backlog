@@ -9,7 +9,7 @@ use crate::ledger::{Job, JobState, Ledger};
 use crate::local_output::{self, DeliverResult};
 use crate::manifest::{write_manifest, Manifest, Pacer, MANIFEST_SCHEMA_VERSION};
 use crate::routing::{self, Route};
-use crate::sidecar::{ConvertResult, Sidecar};
+use crate::sidecar::{ocr_budget, ConvertResult, Sidecar};
 use crate::slm::{SlmLane, Tier};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -144,23 +144,49 @@ const CLAIM_STALE_MULTIPLE: u64 = 6;
 /// It has to sit above the sum of the stage timeouts it wraps, or it fires on
 /// perfectly healthy documents. The bare `per_file_wall_clock_secs * 3` it
 /// replaces was 270s by default, while the convert stage alone is permitted
-/// `sidecar_timeout_secs * max_stage_attempts` = 135s before the pdf probe,
-/// build_evidence's four sidecar round-trips and the naming ladder have run at
-/// all. That miscalibration used to cost one log line; now that the cap
-/// quarantines the file, ships a `flagged` manifest to SharePoint and freezes
-/// the row, it costs a document.
+/// the SUM of `ocr_budget(base, attempt)` over `attempt in
+/// 1..=max_stage_attempts` = 705s by default (135 + 270 + 300 — each retry
+/// attempt escalates the OCR multiplier before the ceiling catches the
+/// third) — and 930s across all sidecar work (`sidecar_timeout_secs * 5` for
+/// the pdf probe plus build_evidence's four round-trips at the base timeout,
+/// plus that same escalating sum) — before the naming ladder has run at all.
+/// That miscalibration used to cost one log line; now that the cap
+/// quarantines the file, ships a `flagged` manifest to SharePoint and
+/// freezes the row, it costs a document.
+///
+/// Every convert/OCR attempt is budgeted at `ocr_budget(base, attempt)`
+/// rather than a flat multiple of the base `sidecar_timeout_secs`: a Scanned
+/// route calls `sidecar.ocr` on every rung of `convert_with_retries`'s dpi
+/// ladder, and `Sidecar::ocr` passes that rung's own attempt number straight
+/// into [`ocr_budget`], capped at `OCR_TIMEOUT_CEIL` (see sidecar.rs).
+/// Summing the per-attempt budget here, rather than sizing off attempt 1
+/// alone, would otherwise make the cap smaller than what a full
+/// scanned-route retry ladder can now legitimately take, so the wall clock
+/// would kill exactly the slow-but-legible scans the per-call OCR budget
+/// exists to save.
 ///
 /// `per_file_wall_clock_secs` stands in for one naming request because the
 /// naming lane has no timeout knob of its own; its default (90s) is already
 /// above `SlmLane`'s 60s HTTP timeout, so the substitution is conservative and
 /// the knob keeps its meaning — raising it raises the backstop.
 fn wall_clock_cap(cfg: &Config) -> u64 {
-    let attempts = (cfg.max_stage_attempts.max(1)) as u64;
-    // pdf_probe (1) + one convert/OCR attempt per rung + build_evidence's
-    // langid, classify, salience and ettin round-trips (4).
-    let sidecar = cfg.sidecar_timeout_secs.saturating_mul(attempts + 5);
+    let attempts = cfg.max_stage_attempts.max(1) as u32;
+    let base = std::time::Duration::from_secs(cfg.sidecar_timeout_secs);
+    // Worst-case OCR cost across the whole retry ladder — a sum, not attempt
+    // 1's budget times the attempt count, because each attempt's own budget
+    // escalates (see `sidecar::ocr_budget` and the doc comment above).
+    let ocr_total: u64 = (1..=attempts).map(|a| ocr_budget(base, a).as_secs()).sum();
+    // pdf_probe (1) + build_evidence's langid, classify, salience and ettin
+    // round-trips (4), at the base timeout, plus one convert/OCR attempt per
+    // rung, each escalating per `ocr_budget`.
+    let sidecar = cfg
+        .sidecar_timeout_secs
+        .saturating_mul(5)
+        .saturating_add(ocr_total);
     // One naming request per rung, plus the span-mismatch re-prompt.
-    let naming = cfg.per_file_wall_clock_secs.saturating_mul(attempts + 1);
+    let naming = cfg
+        .per_file_wall_clock_secs
+        .saturating_mul(attempts as u64 + 1);
     sidecar.saturating_add(naming).max(1)
 }
 
@@ -1195,13 +1221,13 @@ impl Pipeline {
                         // Native path: MarkItDown; attempt 3 falls through to raw
                         // pdfium text dump / OCR inside the sidecar's fallback op.
                         (Route::Native, 1 | 2) => sidecar.convert(&p2, hp, tp),
-                        (Route::Native, _) => sidecar.ocr(&p2, 300, hp, tp),
+                        (Route::Native, _) => sidecar.ocr(&p2, 300, hp, tp, attempt as u32),
                         // Scanned path: 300 DPI, then 400 DPI, then an enhanced
                         // 600 DPI + grayscale/autocontrast classical OCR pass (the
                         // sidecar selects it via the dpi=0 sentinel).
-                        (Route::Scanned, 1) => sidecar.ocr(&p2, 300, hp, tp),
-                        (Route::Scanned, 2) => sidecar.ocr(&p2, 400, hp, tp),
-                        (Route::Scanned, _) => sidecar.ocr(&p2, 0, hp, tp), // 0 = enhanced OCR
+                        (Route::Scanned, 1) => sidecar.ocr(&p2, 300, hp, tp, attempt as u32),
+                        (Route::Scanned, 2) => sidecar.ocr(&p2, 400, hp, tp, attempt as u32),
+                        (Route::Scanned, _) => sidecar.ocr(&p2, 0, hp, tp, attempt as u32), // 0 = enhanced OCR
                         (Route::Flag, _) => unreachable!(),
                     }
                 })

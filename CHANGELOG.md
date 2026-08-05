@@ -15,6 +15,48 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.8.3] — the checker learns to smell fabrication
+
+### Fixed
+
+- The naming prompt's subject rules no longer contain concrete example
+  names (merged separately as #33, shipped here). The former example
+  `Form 8829 - Marcus Alvarez` was copied verbatim into 34 of 54 delivered
+  filenames in the 0.8.2 validation run — a well-formed, unfaithful
+  subject no gate could reject.
+- The checker now grounds each ` - `-separated subject segment against the
+  document's own text. A segment whose every eligible word is absent from
+  the evidence (a fabricated party or form, even padded with real ones)
+  raises the new `SUBJECT_SEGMENT_UNGROUNDED` soft flag, so parroted or
+  invented segments surface in review instead of shipping silently. The
+  whole-subject `SUBJECT_UNGROUNDED` check is unchanged.
+- OCR gets a real budget. All sidecar operations shared one
+  `sidecar_timeout_secs` (45 s); under a full batch — six conversion
+  workers plus the naming servers — a legible 3-page scan legitimately
+  exceeds it, and every retry rung ran into the same wall, dead-ending
+  the file as `UNREADABLE`. The `ocr` operation now gets three times the
+  base timeout per attempt — 3x, 6x, then 9x, each capped at 300 s — so
+  a slower, later rung of the dpi ladder gets proportionally more room
+  instead of hitting the identical wall three times running, and the
+  per-file wall-clock cap accounts for it on every route.
+- A `backlog.config.json` with a UTF-8 BOM (what PowerShell 5.1
+  `Set-Content -Encoding utf8` writes) no longer reads as corrupt: the
+  BOM is stripped before parsing. When a config file genuinely fails to
+  parse, the original is preserved as `backlog.config.json.invalid`
+  before anything else can overwrite it, and the failure is logged as an
+  error — previously the operator's folder setup could be silently
+  replaced with defaults.
+- Boot no longer un-configures a deliberate single-model lane. The
+  v0.4.4 collision repair rewrote `slm_escalation_gguf` to the canonical
+  1.7B path whenever it equalled the primary path; pointing both tiers at
+  the same existing custom model (the supported collapsed lane — one
+  server instead of two) was reverted on every start with no indication.
+  The repair now fires only on the actual damage signature (the canonical
+  primary model in both fields, or a dangling path), and preserves an
+  intentional collapse with a log line — including both fields already
+  pointing at the canonical 1.7B file itself, which is likewise preserved
+  as a deliberate 1.7B-only lane.
+
 ## [0.8.2] — the appliance behaves like one
 
 ### Changed

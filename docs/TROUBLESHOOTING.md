@@ -89,6 +89,7 @@ These do not stop anything. They ride along on the manifest and land in the
 | `DATE_SOURCE_CORRECTED:<claimed>-><actual>` | The model said the date came from one place and the checker proved it came from the other. The corrected value is what shipped. |
 | `DATE_PREFERRED_FROM_DOCUMENT:<value>` | The date BackLog proposed, `<value>`, was backed only by the document's own file properties (an embedded creation date, say) — but the document itself had an unambiguous date printed near the top, so that one was used instead. An automatic upgrade in provenance, not a problem. The displaced value is kept here so the swap can be audited. |
 | `SUBJECT_UNGROUNDED` | The subject is not a phrase that appears in the document. Not wrong by itself — a good summary often is not a quote — but the one to check first when a name looks off. |
+| `SUBJECT_SEGMENT_UNGROUNDED:<n>` | One or more `short form - party` pieces of the subject (`<n>` of them) have no words in common with the document at all, often while the subject as a whole still passes `SUBJECT_UNGROUNDED`. This is what catches a fabricated party padded out with real ones — real names elsewhere in the subject can hide a made-up one from the whole-subject check. **Worth a closer look than `SUBJECT_UNGROUNDED` alone.** |
 | `SUBJECT_DATE_STRIPPED` | A date was removed from the subject, because the filename already starts with one. |
 | `SUBJECT_EXT_STRIPPED` | A file extension (`.pdf`) was removed from the subject. |
 | `SUBJECT_TRAILING_DATE_STRIPPED` | A date or bare year was removed from the END of the subject, because the filename already starts with the validated date and a second copy is only noise. |
@@ -109,6 +110,7 @@ below is what a support call needs.
 |---|---|
 | `preflight_required` | No check has run yet since something changed. **Press Check this computer.** |
 | `config_invalid` | Two required folders are the same, one is inside another, or a required folder is not set. BackLog refuses this because Outbox or Local Output inside watched Processing would feed its own output back through the pipeline forever. **Pick three separate folders for the selected mode, none inside another.** |
+| `config_file_invalid` | `backlog.config.json` existed but could not be read, so this session is running on defaults (a backup if one existed, otherwise built-in defaults) instead of the real settings. The original was preserved next to it as `backlog.config.json.invalid`. **Open the `.invalid` file to see what went wrong, fix or delete `backlog.config.json`, then restart BackLog.** |
 | `processing_unset` | No Processing folder chosen. **Settings → Processing folder → Browse.** |
 | `processing_missing` | The Processing folder is not there. Usually a renamed OneDrive folder or a drive that is not connected. **Press Create this folder for me if BackLog offers it, or Browse to the right folder.** |
 | `processing_unreadable` | The folder exists but Windows would not let BackLog list it. **Ask IT to check the folder's permissions.** |

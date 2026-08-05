@@ -48,6 +48,37 @@ const MAX_LOGGED_STDERR_LINES: usize = 2000;
 /// to DEBUG.
 const STDERR_INFO_LINES: usize = 40;
 
+/// `ocr`'s timeout budget escalates per retry attempt: `base *
+/// OCR_TIMEOUT_MULTIPLIER * attempt`, capped at `OCR_TIMEOUT_CEIL` — see
+/// [`ocr_budget`]. Batch-contention measurement, 2026-08-05: a 3-page 300-DPI
+/// OCR exceeded the 45s base timeout under 6-worker load (convert workers
+/// plus llama servers contending for CPU), and every rung of
+/// `pipeline::convert_with_retries`'s dpi 300→400→enhanced ladder replayed
+/// the same page count into the same flat wall, so all three attempts hit an
+/// identical deadline and legible scans were flagged UNREADABLE. Escalating
+/// the budget by attempt gives the slower, later rungs (400 DPI, then the
+/// enhanced 600 DPI classical pass) proportionally more room instead of the
+/// same wall three times running. `convert` and every other op are
+/// unaffected. No floor: a tiny base timeout is a deliberate choice (an
+/// operator demanding fast failure, or a test pinning a tiny cap) and the
+/// multiplier only ever scales it, never overrides it.
+// `pub(crate)`: `pipeline::wall_clock_cap` derives the convert-stage budget
+// from these same numbers rather than re-deriving its own, so the two stay
+// in lockstep by construction instead of by two authors remembering to.
+pub(crate) const OCR_TIMEOUT_MULTIPLIER: u32 = 3;
+pub(crate) const OCR_TIMEOUT_CEIL: Duration = Duration::from_secs(300);
+
+/// `ocr`'s per-attempt timeout budget: `base * OCR_TIMEOUT_MULTIPLIER *
+/// attempt`, capped at `OCR_TIMEOUT_CEIL`. `attempt` is 1-based and floored
+/// at 1, so a caller passing 0 gets attempt 1's budget rather than a zero
+/// timeout. `pipeline::wall_clock_cap` sums this across the whole retry
+/// ladder instead of multiplying attempt 1's budget by the attempt count, so
+/// the cap and the real per-attempt budget stay in lockstep by construction.
+pub(crate) fn ocr_budget(base: Duration, attempt: u32) -> Duration {
+    base.saturating_mul(OCR_TIMEOUT_MULTIPLIER.saturating_mul(attempt.max(1)))
+        .min(OCR_TIMEOUT_CEIL)
+}
+
 #[cfg(not(windows))]
 fn terminate_pid(pid: u32) -> bool {
     const SIGKILL: i32 = 9;
@@ -780,7 +811,29 @@ impl Sidecar {
         Ok(proc)
     }
 
+    /// Per-op timeout budget. Every op but `ocr` uses `self.timeout` as-is;
+    /// `ocr` gets attempt 1's [`ocr_budget`] — see that function for why OCR
+    /// needs more room, and how later retry attempts get proportionally
+    /// more via `Sidecar::ocr`'s own `attempt` parameter, which bypasses
+    /// this method entirely. Pure in `op` and `self.timeout` (no I/O), so
+    /// the policy is testable without spawning a worker.
+    fn op_timeout(&self, op: &str) -> Duration {
+        if op == "ocr" {
+            ocr_budget(self.timeout, 1)
+        } else {
+            self.timeout
+        }
+    }
+
     pub fn call(&self, op: &str, args: Value) -> anyhow::Result<Value> {
+        let budget = self.op_timeout(op);
+        self.call_with_budget(op, args, budget)
+    }
+
+    /// Core of [`call`](Self::call), taking an explicit budget so
+    /// [`ocr`](Self::ocr) can pass its escalating per-attempt
+    /// [`ocr_budget`] instead of `op_timeout`'s flat attempt-1 default.
+    fn call_with_budget(&self, op: &str, args: Value, budget: Duration) -> anyhow::Result<Value> {
         let id = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -826,7 +879,7 @@ impl Sidecar {
             Closed,
         }
 
-        let deadline = std::time::Instant::now() + self.timeout;
+        let deadline = std::time::Instant::now() + budget;
         let wake = loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -863,7 +916,7 @@ impl Sidecar {
                 if self.shutting_down.load(Ordering::Acquire) {
                     anyhow::bail!("document processing is shutting down");
                 }
-                anyhow::bail!("sidecar '{op}' timed out after {:?}", self.timeout);
+                anyhow::bail!("sidecar '{op}' timed out after {:?}", budget);
             }
             Wake::ReadErr(e) => {
                 checkout.retire();
@@ -906,16 +959,23 @@ impl Sidecar {
         Ok(serde_json::from_value(v)?)
     }
 
+    /// `attempt` is 1-based (see `pipeline::convert_with_retries`'s retry
+    /// loop) and drives [`ocr_budget`] directly, bypassing `op_timeout`'s
+    /// flat attempt-1 default so a later, slower rung of the dpi ladder gets
+    /// proportionally more time instead of the same wall every attempt.
     pub fn ocr(
         &self,
         path: &str,
         dpi: u32,
         head_pages: usize,
         tail_pages: usize,
+        attempt: u32,
     ) -> anyhow::Result<ConvertResult> {
-        let v = self.call(
+        let budget = ocr_budget(self.timeout, attempt);
+        let v = self.call_with_budget(
             "ocr",
             serde_json::json!({ "path": path, "dpi": dpi, "head_pages": head_pages, "tail_pages": tail_pages }),
+            budget,
         )?;
         Ok(serde_json::from_value(v)?)
     }
@@ -1284,6 +1344,58 @@ mod semantic_payload_tests {
         let mut bad = good.clone();
         bad.spans[0].end_char = 200;
         assert!(validate_entity_result(&bad, &source).is_err());
+    }
+}
+
+#[cfg(test)]
+mod op_timeout_tests {
+    use super::*;
+
+    fn sidecar_with_base(secs: u64) -> Sidecar {
+        Sidecar::with_timeout(
+            std::path::PathBuf::from("unused"),
+            Duration::from_secs(secs),
+        )
+    }
+
+    #[test]
+    fn ocr_gets_a_multiple_of_the_default_base_timeout() {
+        let sidecar = sidecar_with_base(45);
+        assert_eq!(sidecar.op_timeout("ocr"), Duration::from_secs(135));
+        assert_eq!(sidecar.op_timeout("convert"), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn ocr_multiple_stays_tiny_for_a_tiny_base_timeout() {
+        let sidecar = sidecar_with_base(10);
+        assert_eq!(sidecar.op_timeout("ocr"), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn ocr_multiple_is_capped_for_a_large_base_timeout() {
+        let sidecar = sidecar_with_base(200);
+        assert_eq!(sidecar.op_timeout("ocr"), Duration::from_secs(300));
+    }
+
+    /// `Sidecar::ocr`'s escalating budget, at the production default: each
+    /// retry attempt gets proportionally more room than a flat multiple of
+    /// the base timeout would give it, until the ceiling catches it.
+    #[test]
+    fn ocr_budget_escalates_per_attempt_then_hits_the_ceiling() {
+        let base = Duration::from_secs(45);
+        assert_eq!(ocr_budget(base, 1), Duration::from_secs(135));
+        assert_eq!(ocr_budget(base, 2), Duration::from_secs(270));
+        assert_eq!(ocr_budget(base, 3), Duration::from_secs(300)); // ceiling
+    }
+
+    /// The same escalation at a tiny base timeout: no floor means these stay
+    /// honestly tiny at every attempt, not just the first.
+    #[test]
+    fn ocr_budget_escalation_stays_honest_for_a_tiny_base_timeout() {
+        let base = Duration::from_secs(1);
+        assert_eq!(ocr_budget(base, 1), Duration::from_secs(3));
+        assert_eq!(ocr_budget(base, 2), Duration::from_secs(6));
+        assert_eq!(ocr_budget(base, 3), Duration::from_secs(9));
     }
 }
 

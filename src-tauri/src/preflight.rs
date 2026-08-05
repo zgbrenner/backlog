@@ -264,6 +264,20 @@ pub async fn run_with(
     if let Err(message) = cfg.validate() {
         push_error(&mut problems, "config", "config_invalid", message);
     }
+    // `Config::validate` only ever sees the config `load` actually produced
+    // (a parsed file, a recovered backup, or defaults) — it cannot tell the
+    // operator their real settings were silently replaced. Surface that
+    // separately so a launch running on defaults never reads as "all clear".
+    if crate::config::config_parse_failure() {
+        push_error(
+            &mut problems,
+            "config",
+            "config_file_invalid",
+            "The settings file could not be read and BackLog is running on defaults. The \
+             original was preserved as backlog.config.json.invalid next to it — fix or delete \
+             it, then restart.",
+        );
+    }
 
     let processing = check_processing_dir(&mut problems, &cfg.processing_dir);
     let (outbox_writable, local_output_writable) = match cfg.output_mode {
@@ -910,6 +924,13 @@ mod tests {
         for sub in ["proc", "out", "quar", "cache"] {
             std::fs::create_dir_all(root.join(sub)).unwrap();
         }
+        // These tests build a `Config` directly rather than through
+        // `Config::load`, which is the only thing that resets
+        // `config_parse_failure()` — so without this, a config.rs test
+        // exercising the parse-failure path on another thread could leave
+        // this test observing a `config_file_invalid` problem it never
+        // caused. See `config::reset_config_parse_failure_for_tests`.
+        crate::config::reset_config_parse_failure_for_tests();
         Config {
             processing_dir: root.join("proc"),
             outbox_dir: root.join("out"),

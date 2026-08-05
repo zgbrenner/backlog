@@ -271,9 +271,87 @@ fn model_paths_collide(left: &Path, right: &Path) -> bool {
 /// Repair the v0.4.4 state where normalization persisted the installed
 /// primary path into both model fields. The desired optional-model path is
 /// always the canonical 1.7B destination, never the runtime fallback.
+///
+/// 2026-08-05: path equality alone is not damage. `SlmLane::escalation_collapsed`
+/// exists precisely so an operator can point both tiers at the same existing
+/// custom `.gguf` and run one server instead of two — that is a supported
+/// single-model lane, not a bug to silently revert on every boot. The actual
+/// v0.4.4 signature is specific: normalization accidentally wrote the
+/// *installed primary* path into the escalation field too. So repair fires
+/// only when the colliding path is recognizably that canonical primary — its
+/// filename is `model_download::PRIMARY_GGUF_NAME`, or under
+/// `model_paths_collide` it resolves to `models_dir.join(PRIMARY_GGUF_NAME)`
+/// — or when the colliding path does not exist on disk at all, since a
+/// dangling shared path cannot be an intentional collapse of a real file.
+/// Anything else is an operator's deliberate choice and is left alone.
+///
+/// The same logic preserves the mirror case: an operator pointing both
+/// fields at the canonical 1.7B escalation file itself
+/// (`models_dir.join(ESCALATION_GGUF_NAME)`) is likewise an intentional
+/// single-model collapse, not v0.4.4 damage, as long as that shared path
+/// exists — it is neither the canonical primary name nor the canonical
+/// primary path, so the early return above leaves it alone. The "everyday
+/// and optional model paths must be different" `Err` below is reachable only
+/// when that shared canonical-escalation path is dangling: with nothing on
+/// disk to collapse onto, `definitely_absent` forces the repair path, which
+/// then finds the primary field already sitting on the escalation
+/// destination and refuses rather than silently relocating it.
+///
+/// 2026-08-05: preserving that collapse is not enough on its own —
+/// `SlmLane::escalation_collapsed` compares the two fields by exact
+/// `PathBuf` equality, not by `model_paths_collide`'s case/separator-
+/// insensitive notion of "the same file". Leaving two differently-spelled
+/// but colliding paths in place (`C:\models\m.gguf` vs `C:/Models/m.gguf`)
+/// would satisfy this function's "leave it alone" while
+/// `escalation_collapsed()` still sees two distinct paths and starts a
+/// second server over the same GGUF. So the preserve branch normalizes: if
+/// the two fields collide but are not byte-identical, it persists the
+/// primary's exact spelling into the escalation field (still `Ok(true)`,
+/// still logged); only an already byte-identical pair is a true no-op.
 fn migrate_colliding_model_paths(cfg: &mut Config, models_dir: &Path) -> Result<bool, String> {
     if !model_paths_collide(&cfg.slm_primary_gguf, &cfg.slm_escalation_gguf) {
         return Ok(false);
+    }
+    let canonical_primary = models_dir.join(model_download::PRIMARY_GGUF_NAME);
+    // Case-insensitive to match `model_paths_collide`'s notion of identity on
+    // Windows; the two adjacent checks disagreeing about what counts as "the
+    // same file" is how the v0.4.4 bug class started.
+    let is_canonical_primary_name = cfg.slm_escalation_gguf.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .eq_ignore_ascii_case(model_download::PRIMARY_GGUF_NAME)
+    });
+    let is_canonical_primary_path =
+        model_paths_collide(&cfg.slm_escalation_gguf, &canonical_primary);
+    // `Path::exists()` reports false on permission denial or an unreachable
+    // network share, which would misclassify a real share-hosted model as
+    // dangling and rewrite the operator's config. Only a definite NotFound
+    // counts as dangling; "cannot tell" preserves the operator's choice.
+    let definitely_absent = matches!(
+        std::fs::symlink_metadata(&cfg.slm_escalation_gguf),
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    if !is_canonical_primary_name && !is_canonical_primary_path && !definitely_absent {
+        if cfg.slm_primary_gguf == cfg.slm_escalation_gguf {
+            log::info!(
+                "primary and optional model paths both resolve to {}; this is the single-model \
+                 lane, not v0.4.4 damage, so it is left in place",
+                cfg.slm_escalation_gguf.display()
+            );
+            return Ok(false);
+        }
+        // Collide but are not byte-identical: same file, different spelling.
+        // `escalation_collapsed()` must be handed byte-equal paths or the
+        // collapse silently doesn't engage — see the doc comment above.
+        log::info!(
+            "primary and optional model paths both resolve to {} under different spellings \
+             ({} vs {}); normalizing the optional path to the everyday path's exact spelling \
+             so the single-model lane actually engages",
+            cfg.slm_escalation_gguf.display(),
+            cfg.slm_primary_gguf.display(),
+            cfg.slm_escalation_gguf.display()
+        );
+        cfg.slm_escalation_gguf = cfg.slm_primary_gguf.clone();
+        return Ok(true);
     }
     let canonical_escalation = models_dir.join(model_download::ESCALATION_GGUF_NAME);
     if model_paths_collide(&cfg.slm_primary_gguf, &canonical_escalation) {
@@ -283,6 +361,20 @@ fn migrate_colliding_model_paths(cfg: &mut Config, models_dir: &Path) -> Result<
                 .into(),
         );
     }
+    // If the repair does change a path, log what changed and why: which
+    // damage signature fired, not just that a repair happened.
+    let signature = if is_canonical_primary_name {
+        "matched the canonical primary filename"
+    } else if is_canonical_primary_path {
+        "matched the canonical primary path"
+    } else {
+        "was dangling"
+    };
+    log::info!(
+        "repairing colliding model paths: optional model {} -> {} (the colliding path {signature})",
+        cfg.slm_escalation_gguf.display(),
+        canonical_escalation.display()
+    );
     cfg.slm_escalation_gguf = canonical_escalation;
     Ok(true)
 }
@@ -292,6 +384,13 @@ fn migrate_colliding_model_paths(cfg: &mut Config, models_dir: &Path) -> Result<
 /// The migration is persisted at this seam rather than waiting for the rest of
 /// startup. A later failure opening the ledger must not make the next launch
 /// rediscover the same broken configuration.
+///
+/// Persistence is skipped when this launch's `Config::load` found a config
+/// file that failed to parse (`config::config_parse_failure()`). The repair
+/// still runs and still applies in memory for this session, but the file on
+/// disk is the operator's rejected original (or whatever `load` fell back to
+/// instead of it) — saving over it here would finish the clobber the
+/// `.invalid` copy exists to prevent.
 fn repair_and_persist_startup_model_paths(
     cfg_path: &Path,
     cfg: &mut Config,
@@ -308,11 +407,19 @@ fn repair_and_persist_startup_model_paths(
         model_download::ESCALATION_GGUF_NAME,
     );
     if migrate_colliding_model_paths(cfg, models_dir)? {
-        cfg.save(cfg_path).map_err(|_| {
-            "BackLog could not save its repaired model settings. Check that its app-data folder \
-             is writable, then start BackLog again."
-                .to_string()
-        })?;
+        if config::config_parse_failure() {
+            log::warn!(
+                "model path repair computed for {} but not persisted: this launch's config \
+                 file failed to parse, so saving now would overwrite the preserved original",
+                cfg_path.display()
+            );
+        } else {
+            cfg.save(cfg_path).map_err(|_| {
+                "BackLog could not save its repaired model settings. Check that its app-data \
+                 folder is writable, then start BackLog again."
+                    .to_string()
+            })?;
+        }
     }
     Ok(())
 }
@@ -2137,7 +2244,11 @@ mod tests {
         for sub in ["proc", "out", "quar", "cache", "models"] {
             std::fs::create_dir_all(root.join(sub)).unwrap();
         }
-        let shared_primary = root.join("models").join("shared.gguf");
+        // Named the canonical primary filename, not an arbitrary custom name:
+        // that is what makes this the v0.4.4 damage signature rather than an
+        // operator's intentional single-model collapse (see
+        // `migrate_colliding_model_paths`'s doc comment).
+        let shared_primary = root.join("models").join(model_download::PRIMARY_GGUF_NAME);
         std::fs::write(&shared_primary, b"primary model").unwrap();
         let cfg_path = root.join("backlog.config.json");
         let cache = root.join("cache");
@@ -2234,6 +2345,11 @@ mod tests {
             ..Default::default()
         };
         cfg.save(&cfg_path).unwrap();
+        // This fixture is built via `save`, not `load` — nothing here resets
+        // `config_parse_failure()`, so a config.rs test exercising the
+        // parse-failure path on another thread could otherwise leave this
+        // read seeing a stale `true` and skip the save being tested here.
+        config::reset_config_parse_failure_for_tests();
 
         repair_and_persist_startup_model_paths(&cfg_path, &mut cfg, &models_dir).unwrap();
 
@@ -2244,6 +2360,162 @@ mod tests {
         assert_eq!(reloaded.slm_primary_gguf, shared_primary);
         assert_eq!(reloaded.slm_escalation_gguf, expected_escalation);
         assert_ne!(reloaded.slm_primary_gguf, reloaded.slm_escalation_gguf);
+    }
+
+    /// The exact v0.4.4 damage signature: both fields hold the canonical
+    /// primary filename. Repair must fire regardless of whether the file
+    /// happens to exist, since the name alone identifies it as the installed
+    /// primary path that leaked into the escalation field.
+    #[test]
+    fn migrate_colliding_model_paths_repairs_the_v044_canonical_primary_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let shared_primary = models_dir.join(model_download::PRIMARY_GGUF_NAME);
+        std::fs::write(&shared_primary, b"primary model").unwrap();
+        let mut cfg = Config {
+            slm_primary_gguf: shared_primary.clone(),
+            slm_escalation_gguf: shared_primary.clone(),
+            ..Default::default()
+        };
+
+        let repaired = migrate_colliding_model_paths(&mut cfg, &models_dir).unwrap();
+
+        assert!(repaired);
+        assert_eq!(cfg.slm_primary_gguf, shared_primary);
+        assert_eq!(
+            cfg.slm_escalation_gguf,
+            models_dir.join(model_download::ESCALATION_GGUF_NAME)
+        );
+    }
+
+    /// An operator who deliberately points both tiers at the same existing
+    /// custom `.gguf` is running `SlmLane::escalation_collapsed`'s
+    /// single-model lane on purpose. Equal paths that are not the canonical
+    /// primary name must be left alone, not silently split apart on every
+    /// boot.
+    #[test]
+    fn migrate_colliding_model_paths_preserves_an_intentional_custom_collapse() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let custom = dir.path().join("custom-model.gguf");
+        std::fs::write(&custom, b"custom model").unwrap();
+        let mut cfg = Config {
+            slm_primary_gguf: custom.clone(),
+            slm_escalation_gguf: custom.clone(),
+            ..Default::default()
+        };
+
+        let repaired = migrate_colliding_model_paths(&mut cfg, &models_dir).unwrap();
+
+        assert!(!repaired);
+        assert_eq!(cfg.slm_primary_gguf, custom);
+        assert_eq!(cfg.slm_escalation_gguf, custom);
+    }
+
+    /// The mirror of the intentional-custom-collapse case: an operator who
+    /// points both tiers at the canonical 1.7B escalation file itself (not a
+    /// custom `.gguf`) is still running the single-model lane on purpose, as
+    /// long as that shared file actually exists on disk. It is neither the
+    /// canonical primary's name nor its resolved path, so it must be left
+    /// alone rather than treated as v0.4.4 damage.
+    #[test]
+    fn migrate_colliding_model_paths_preserves_the_canonical_escalation_collapse() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let shared_escalation = models_dir.join(model_download::ESCALATION_GGUF_NAME);
+        std::fs::write(&shared_escalation, b"escalation model").unwrap();
+        let mut cfg = Config {
+            slm_primary_gguf: shared_escalation.clone(),
+            slm_escalation_gguf: shared_escalation.clone(),
+            ..Default::default()
+        };
+
+        let repaired = migrate_colliding_model_paths(&mut cfg, &models_dir).unwrap();
+
+        assert!(!repaired);
+        assert_eq!(cfg.slm_primary_gguf, shared_escalation);
+        assert_eq!(cfg.slm_escalation_gguf, shared_escalation);
+    }
+
+    /// An intentional collapse that survives with a different spelling per
+    /// field (case, here — `model_paths_collide` treats it as the same file
+    /// on Windows) must still come out byte-identical, or
+    /// `SlmLane::escalation_collapsed`'s exact `PathBuf` comparison would see
+    /// two different paths and start a second server over the one GGUF.
+    /// Windows-only: case-insensitive collision detection is behind
+    /// `#[cfg(windows)]` in `model_paths_collide`.
+    #[cfg(windows)]
+    #[test]
+    fn migrate_colliding_model_paths_normalizes_a_case_variant_intentional_collapse() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let custom = dir.path().join("Custom-Model.gguf");
+        std::fs::write(&custom, b"custom model").unwrap();
+        let variant = PathBuf::from(custom.to_string_lossy().to_uppercase());
+        let mut cfg = Config {
+            slm_primary_gguf: custom.clone(),
+            slm_escalation_gguf: variant,
+            ..Default::default()
+        };
+
+        let repaired = migrate_colliding_model_paths(&mut cfg, &models_dir).unwrap();
+
+        assert!(repaired);
+        assert_eq!(cfg.slm_primary_gguf, custom);
+        assert_eq!(
+            cfg.slm_escalation_gguf, cfg.slm_primary_gguf,
+            "escalation must be byte-equal to primary so escalation_collapsed() actually sees a collapse"
+        );
+    }
+
+    /// A shared path that names no file on disk cannot be an intentional
+    /// collapse of a real custom model, so it is repaired like any other
+    /// damage even though its name is not the canonical primary's.
+    #[test]
+    fn migrate_colliding_model_paths_repairs_a_dangling_shared_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let gone = dir.path().join("gone.gguf");
+        let mut cfg = Config {
+            slm_primary_gguf: gone.clone(),
+            slm_escalation_gguf: gone.clone(),
+            ..Default::default()
+        };
+
+        let repaired = migrate_colliding_model_paths(&mut cfg, &models_dir).unwrap();
+
+        assert!(repaired);
+        assert_eq!(cfg.slm_primary_gguf, gone);
+        assert_eq!(
+            cfg.slm_escalation_gguf,
+            models_dir.join(model_download::ESCALATION_GGUF_NAME)
+        );
+    }
+
+    /// Distinct paths never collide in the first place, so the function must
+    /// leave them untouched and report nothing to save.
+    #[test]
+    fn migrate_colliding_model_paths_leaves_distinct_paths_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let primary = models_dir.join(model_download::PRIMARY_GGUF_NAME);
+        let escalation = dir.path().join("custom-escalation.gguf");
+        let mut cfg = Config {
+            slm_primary_gguf: primary.clone(),
+            slm_escalation_gguf: escalation.clone(),
+            ..Default::default()
+        };
+
+        let repaired = migrate_colliding_model_paths(&mut cfg, &models_dir).unwrap();
+
+        assert!(!repaired);
+        assert_eq!(cfg.slm_primary_gguf, primary);
+        assert_eq!(cfg.slm_escalation_gguf, escalation);
     }
 
     #[test]

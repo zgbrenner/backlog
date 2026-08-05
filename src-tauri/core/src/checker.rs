@@ -479,8 +479,21 @@ impl Checker {
         // ---- subject -------------------------------------------------------
         let (subject, subject_flags) = self.sanitize_subject_inner(&out.subject, source)?;
         soft_flags.extend(subject_flags);
-        if source == Source::Model && subject_grounded(&subject, harvest) == Some(false) {
-            soft_flags.push("SUBJECT_UNGROUNDED".into());
+        if source == Source::Model {
+            // One build, two verdicts — the set is the expensive part.
+            let evidence_text_owned = evidence_text(harvest);
+            let evidence_set = evidence_token_set(&evidence_text_owned);
+            if subject_grounded_with_evidence(&subject, &evidence_set) == Some(false) {
+                soft_flags.push("SUBJECT_UNGROUNDED".into());
+            }
+            // Additive to the check above: a fabricated segment can hide behind
+            // real ones padded in from elsewhere in the document, which dilutes
+            // it below the whole-subject majority threshold without this.
+            if let Some(n) = ungrounded_segment_count_with_evidence(&subject, &evidence_set) {
+                if n > 0 {
+                    soft_flags.push(format!("SUBJECT_SEGMENT_UNGROUNDED:{n}"));
+                }
+            }
         }
 
         // ---- description ---------------------------------------------------
@@ -1039,6 +1052,27 @@ fn evidence_text(h: &Harvest) -> String {
     parts.join("\n").to_lowercase()
 }
 
+/// The whole-token evidence set an already-lowercased evidence text offers.
+fn evidence_token_set(text: &str) -> std::collections::HashSet<&str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// The tokens of `s` eligible to ground (or fail to ground) it: alphanumeric
+/// runs of 3+ characters, not a bare number, and not one of the doc-type words
+/// every document has regardless of what it is. Shared by the whole-subject
+/// check and the per-segment check below so the two can never drift apart on
+/// what counts as content.
+fn eligible_tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|t| t.chars().count() >= 3)
+        .filter(|t| !t.chars().all(|c| c.is_ascii_digit()))
+        .filter(|t| !UNGROUNDING_TOKENS.contains(&t.as_str()))
+        .collect()
+}
+
 /// Does the proposed subject actually come from the document?
 ///
 /// `None` when the question cannot be answered — no evidence text at all, or a
@@ -1054,20 +1088,21 @@ fn evidence_text(h: &Harvest) -> String {
 /// a half-invented "…for Jane Smith" still clears the majority.
 pub fn subject_grounded(subject: &str, harvest: &Harvest) -> Option<bool> {
     let text = evidence_text(harvest);
-    let evidence: std::collections::HashSet<&str> = text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .collect();
+    let evidence = evidence_token_set(&text);
+    subject_grounded_with_evidence(subject, &evidence)
+}
+
+/// Core of [`subject_grounded`], taking an already-built evidence set so a
+/// caller checking both this and [`ungrounded_segment_count`] on the same
+/// subject can build the set once and hand it to both.
+fn subject_grounded_with_evidence(
+    subject: &str,
+    evidence: &std::collections::HashSet<&str>,
+) -> Option<bool> {
     if evidence.is_empty() {
         return None;
     }
-    let tokens: Vec<String> = subject
-        .split(|c: char| !c.is_alphanumeric())
-        .map(str::to_lowercase)
-        .filter(|t| t.chars().count() >= 3)
-        .filter(|t| !t.chars().all(|c| c.is_ascii_digit()))
-        .filter(|t| !UNGROUNDING_TOKENS.contains(&t.as_str()))
-        .collect();
+    let tokens = eligible_tokens(subject);
     if tokens.is_empty() {
         return None;
     }
@@ -1076,6 +1111,59 @@ pub fn subject_grounded(subject: &str, harvest: &Harvest) -> Option<bool> {
         .filter(|t| evidence.contains(t.as_str()))
         .count();
     Some(found * 2 >= tokens.len())
+}
+
+/// Segment-wise grounding for the `<short form> - <party>` convention a
+/// model subject typically follows.
+///
+/// `subject_grounded` averages across the whole subject, so a fabricated party
+/// can hide behind real ones padded on from elsewhere in the same document —
+/// measured in production as `"Form 8829 - Marcus Alvarez - Hooli Inc. -
+/// Soylent Foods Co."`, where a name parroted from a prompt example survived
+/// because the two real parties dragged the missing-token ratio back under the
+/// 50% threshold. Splitting on the segment separator and requiring each
+/// segment to ground on its own catches that regardless of how many real
+/// segments surround it.
+///
+/// `None` mirrors `subject_grounded`: no evidence text at all makes the
+/// question unanswerable. Otherwise, the count of segments that carry at
+/// least one eligible token and find none of them in the evidence — a segment
+/// with no eligible tokens at all (e.g. "Form 8829", once "form" is filtered
+/// as a doc-type word and "8829" as a bare number) is not evidence of
+/// anything and never counts as fabricated.
+// Production goes through `check_with`, which builds the evidence set once
+// and calls the `_with_evidence` core directly; this convenience wrapper
+// exists for the table-driven tests below.
+#[cfg(test)]
+fn ungrounded_segment_count(subject: &str, harvest: &Harvest) -> Option<usize> {
+    let text = evidence_text(harvest);
+    let evidence = evidence_token_set(&text);
+    ungrounded_segment_count_with_evidence(subject, &evidence)
+}
+
+/// Core of [`ungrounded_segment_count`], taking an already-built evidence set;
+/// see [`subject_grounded_with_evidence`].
+fn ungrounded_segment_count_with_evidence(
+    subject: &str,
+    evidence: &std::collections::HashSet<&str>,
+) -> Option<usize> {
+    if evidence.is_empty() {
+        return None;
+    }
+    // Model punctuation drift must not collapse the subject into one segment
+    // and dodge the per-segment check: a spaced en dash or em dash is the
+    // same "<short form> - <party>" separator in everything but keystroke,
+    // so fold it to the plain hyphen form before splitting.
+    let normalized = subject.replace(" – ", " - ").replace(" — ", " - ");
+    Some(
+        normalized
+            .split(" - ")
+            .filter(|segment| {
+                let tokens = eligible_tokens(segment);
+                !tokens.is_empty() && tokens.iter().all(|t| !evidence.contains(t.as_str()))
+            })
+            .count(),
+    )
 }
 
 /// Replace the periods that are not sentence ends with '-', preserving length
@@ -2409,6 +2497,163 @@ mod tests {
         );
         // A subject made only of doc-type words grounds nothing either way.
         assert_eq!(subject_grounded("Letter Agreement", &h), None);
+    }
+
+    /// The production failure `SUBJECT_SEGMENT_UNGROUNDED` exists for: the
+    /// model parroted a prompt example's name into the subject, then padded
+    /// it with real parties pulled from the document. The real parties drag
+    /// the whole-subject miss ratio back under `subject_grounded`'s 50%
+    /// threshold, so that check alone lets it through — the per-segment
+    /// check catches the fabricated segment on its own.
+    #[test]
+    fn subject_segment_grounding_catches_a_parroted_name_padded_with_real_parties() {
+        let c = Checker::new(160);
+        let mut h = harvest_with(&["2026-07-20"]);
+        h.head_excerpt = "Prepared for Hooli Inc. by their accountant.".into();
+
+        let mut o = ok_out();
+        o.subject = "Form 8829 - Marcus Alvarez - Hooli Inc.".into();
+        o.description = "Home office expense worksheet filed with the return.".into();
+        let v = c.check(&o, &h, &[], "2026-07-21", None).unwrap();
+
+        // The whole-subject check is fooled: "hooli" and "inc" are real, and
+        // that alone clears the 50% majority once "form" (an ungrounding
+        // token) and "8829" (all-digit) are filtered out of the denominator.
+        assert!(
+            !v.soft_flags.contains(&"SUBJECT_UNGROUNDED".to_string()),
+            "whole-subject check should have been diluted by the real parties: {:?}",
+            v.soft_flags
+        );
+        let segment_flag = v
+            .soft_flags
+            .iter()
+            .find(|f| f.starts_with("SUBJECT_SEGMENT_UNGROUNDED:"));
+        assert!(
+            segment_flag.is_some(),
+            "expected a segment flag: {:?}",
+            v.soft_flags
+        );
+        let n: usize = segment_flag
+            .unwrap()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(n, 1, "only the parroted segment should count as fabricated");
+    }
+
+    #[test]
+    fn subject_segment_grounding_is_silent_on_a_clean_subject() {
+        let c = Checker::new(160);
+        let mut h = harvest_with(&["2026-07-20"]);
+        h.head_excerpt =
+            "This Master Services Agreement is entered into with Nakatomi Trading LLC.".into();
+
+        let mut o = ok_out();
+        o.subject = "Master Services Agreement - Nakatomi Trading LLC".into();
+        o.description = "Services agreement executed with the vendor named above.".into();
+        let v = c.check(&o, &h, &[], "2026-07-21", None).unwrap();
+        assert!(
+            !v.soft_flags
+                .iter()
+                .any(|f| f.starts_with("SUBJECT_SEGMENT_UNGROUNDED")),
+            "{:?}",
+            v.soft_flags
+        );
+    }
+
+    #[test]
+    fn subject_segment_grounding_is_silent_with_no_evidence_text() {
+        // Grounding is indeterminate with nothing to check against, exactly
+        // like `subject_grounded`'s own `None` case — a flag we cannot
+        // justify is worse than no flag.
+        assert_eq!(
+            ungrounded_segment_count(
+                "Form 8829 - Marcus Alvarez - Hooli Inc.",
+                &Harvest::default()
+            ),
+            None
+        );
+    }
+
+    /// Table-driven coverage of how `ungrounded_segment_count` splits a
+    /// subject on `" - "`: no separator at all (the whole subject is one
+    /// segment), more than one fabricated segment, a doubled separator that
+    /// produces an empty middle segment, a leading/trailing separator that
+    /// produces an empty edge segment, and a spaced em dash the model wrote
+    /// instead of a hyphen. An empty segment must never itself count as
+    /// fabricated — `tokens.iter().all(..)` on an empty iterator is
+    /// vacuously `true`, so the `!tokens.is_empty()` guard is the only thing
+    /// standing between an empty segment and a false positive. A dash the
+    /// model spelled differently must not collapse the subject into one
+    /// segment and dodge the per-segment check entirely.
+    #[test]
+    fn ungrounded_segment_count_segment_splitting_cases() {
+        let mut h = harvest_with(&["2026-07-20"]);
+        h.head_excerpt = "Prepared for Hooli Inc. by their accountant.".into();
+
+        let cases: &[(&str, &str, Option<usize>)] = &[
+            (
+                "no ' - ' separator: the whole subject is one segment, and \
+                 every eligible token is missing",
+                "Quarterly Bonus Schedule",
+                Some(1),
+            ),
+            (
+                "two segments, both fabricated",
+                "Marcus Alvarez - Wonka Industries",
+                Some(2),
+            ),
+            (
+                "doubled separator produces an empty middle segment, which is \
+                 ignored rather than counted",
+                "Hooli Inc. -  - Marcus Alvarez",
+                Some(1),
+            ),
+            (
+                "leading and trailing separators produce empty edge segments, \
+                 which are ignored rather than counted",
+                " - Marcus Alvarez - ",
+                Some(1),
+            ),
+            (
+                "a spaced em dash is folded to the hyphen separator before \
+                 splitting, so the fabricated segment still gets caught on \
+                 its own",
+                "Hooli Inc. — Marcus Alvarez",
+                Some(1),
+            ),
+        ];
+
+        for (description, subject, expected) in cases {
+            assert_eq!(
+                ungrounded_segment_count(subject, &h),
+                *expected,
+                "{description}: {subject:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subject_segment_grounding_never_fires_for_a_human_subject() {
+        let c = Checker::new(160);
+        let mut h = harvest_with(&["2026-07-20"]);
+        h.head_excerpt = "Prepared for Hooli Inc. by their accountant.".into();
+
+        let mut o = ok_out();
+        o.date = "2026-07-20".into();
+        o.subject = "Form 8829 - Marcus Alvarez - Hooli Inc.".into();
+        let v = c
+            .check_human(&o, &h, &["2026-07-20".to_string()], "2026-07-21", None)
+            .unwrap();
+        assert!(
+            !v.soft_flags
+                .iter()
+                .any(|f| f.starts_with("SUBJECT_SEGMENT_UNGROUNDED")),
+            "a human-typed subject must never be flagged: {:?}",
+            v.soft_flags
+        );
     }
 
     // ---- PII rules ------------------------------------------------------
