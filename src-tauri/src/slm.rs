@@ -204,6 +204,7 @@ fn reserve_port(preferred: u16) -> anyhow::Result<u16> {
 }
 
 impl SlmLane {
+    #[allow(clippy::too_many_arguments)] // same shape as filter.rs/ledger.rs precedents
     pub fn new(
         llama_server_exe: PathBuf,
         grammar: String,
@@ -807,12 +808,12 @@ impl SlmLane {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn primary_child_pid(&self) -> Option<u32> {
         self.primary.lock().unwrap().as_ref().map(|s| s.child.id())
     }
 
-    #[cfg(test)]
+    #[cfg(test)] // used by the platform-agnostic collapsed-reap test too
     pub(crate) fn escalation_child_pid(&self) -> Option<u32> {
         self.escalation
             .lock()
@@ -821,7 +822,7 @@ impl SlmLane {
             .map(|s| s.child.id())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn primary_inflight(&self) -> u64 {
         self.primary_inflight.load(Ordering::SeqCst)
     }

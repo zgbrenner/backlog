@@ -153,10 +153,10 @@ fn is_reparse_point(path: &Path) -> bool {
             return false;
         }
         // Attribute set: the tag decides. An unreadable tag fails closed.
-        return match reparse_tag(path) {
+        match reparse_tag(path) {
             Some(tag) => !is_cloud_files_tag(tag),
             None => true,
-        };
+        }
     }
     #[cfg(not(windows))]
     false

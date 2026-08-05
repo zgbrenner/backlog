@@ -340,7 +340,9 @@ impl Pipeline {
         })
     }
 
-    #[cfg(test)]
+    /// Consumed only by the `#[cfg(unix)]` fake-server tests; on a Windows
+    /// test build it would be dead code, which clippy denies.
+    #[cfg(all(test, unix))]
     pub(crate) fn escalation_slots_available(&self) -> usize {
         self.escalation_slots.available_permits()
     }
@@ -1289,6 +1291,7 @@ impl Pipeline {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // same shape as filter.rs/ledger.rs precedents
     async fn name_with_retries(
         &self,
         sha: &str,
