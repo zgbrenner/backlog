@@ -35,8 +35,10 @@ field of `latest.json` should quote it.
   workers plus the naming servers — a legible 3-page scan legitimately
   exceeds it, and every retry rung ran into the same wall, dead-ending
   the file as `UNREADABLE`. The `ocr` operation now gets three times the
-  base timeout (clamped to 90–300 s) and the per-file wall-clock cap
-  accounts for it on scanned routes.
+  base timeout per attempt — 3x, 6x, then 9x, each capped at 300 s — so
+  a slower, later rung of the dpi ladder gets proportionally more room
+  instead of hitting the identical wall three times running, and the
+  per-file wall-clock cap accounts for it on every route.
 - A `backlog.config.json` with a UTF-8 BOM (what PowerShell 5.1
   `Set-Content -Encoding utf8` writes) no longer reads as corrupt: the
   BOM is stripped before parsing. When a config file genuinely fails to
@@ -51,7 +53,9 @@ field of `latest.json` should quote it.
   server instead of two) was reverted on every start with no indication.
   The repair now fires only on the actual damage signature (the canonical
   primary model in both fields, or a dangling path), and preserves an
-  intentional collapse with a log line.
+  intentional collapse with a log line — including both fields already
+  pointing at the canonical 1.7B file itself, which is likewise preserved
+  as a deliberate 1.7B-only lane.
 
 ## [0.8.2] — the appliance behaves like one
 

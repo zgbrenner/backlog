@@ -339,6 +339,7 @@ const SOFT_FLAG_COPY: Record<string, string> = {
   DATE_IN_FUTURE: "The date on this document is in the future.",
   DATE_SOURCE_CORRECTED: "BackLog corrected where it said the date came from.",
   SUBJECT_UNGROUNDED: "The subject is not a phrase that appears in the document.",
+  SUBJECT_SEGMENT_UNGROUNDED: "Part of the subject — a name or party — does not appear anywhere in the document.",
   SUBJECT_DATE_STRIPPED: "A date was removed from the subject — it is already in the file name.",
   SUBJECT_EXT_STRIPPED: "A file extension was removed from the subject.",
   HUMAN_CORRECTED: "A person corrected this file's name by hand.",

@@ -479,14 +479,17 @@ impl Checker {
         // ---- subject -------------------------------------------------------
         let (subject, subject_flags) = self.sanitize_subject_inner(&out.subject, source)?;
         soft_flags.extend(subject_flags);
-        if source == Source::Model && subject_grounded(&subject, harvest) == Some(false) {
-            soft_flags.push("SUBJECT_UNGROUNDED".into());
-        }
-        // Additive to the check above: a fabricated segment can hide behind
-        // real ones padded in from elsewhere in the document, which dilutes
-        // it below the whole-subject majority threshold without this.
         if source == Source::Model {
-            if let Some(n) = ungrounded_segment_count(&subject, harvest) {
+            // One build, two verdicts — the set is the expensive part.
+            let evidence_text_owned = evidence_text(harvest);
+            let evidence_set = evidence_token_set(&evidence_text_owned);
+            if subject_grounded_with_evidence(&subject, &evidence_set) == Some(false) {
+                soft_flags.push("SUBJECT_UNGROUNDED".into());
+            }
+            // Additive to the check above: a fabricated segment can hide behind
+            // real ones padded in from elsewhere in the document, which dilutes
+            // it below the whole-subject majority threshold without this.
+            if let Some(n) = ungrounded_segment_count_with_evidence(&subject, &evidence_set) {
                 if n > 0 {
                     soft_flags.push(format!("SUBJECT_SEGMENT_UNGROUNDED:{n}"));
                 }
@@ -1086,6 +1089,16 @@ fn eligible_tokens(s: &str) -> Vec<String> {
 pub fn subject_grounded(subject: &str, harvest: &Harvest) -> Option<bool> {
     let text = evidence_text(harvest);
     let evidence = evidence_token_set(&text);
+    subject_grounded_with_evidence(subject, &evidence)
+}
+
+/// Core of [`subject_grounded`], taking an already-built evidence set so a
+/// caller checking both this and [`ungrounded_segment_count`] on the same
+/// subject can build the set once and hand it to both.
+fn subject_grounded_with_evidence(
+    subject: &str,
+    evidence: &std::collections::HashSet<&str>,
+) -> Option<bool> {
     if evidence.is_empty() {
         return None;
     }
@@ -1118,14 +1131,32 @@ pub fn subject_grounded(subject: &str, harvest: &Harvest) -> Option<bool> {
 /// with no eligible tokens at all (e.g. "Form 8829", once "form" is filtered
 /// as a doc-type word and "8829" as a bare number) is not evidence of
 /// anything and never counts as fabricated.
+// Production goes through `check_with`, which builds the evidence set once
+// and calls the `_with_evidence` core directly; this convenience wrapper
+// exists for the table-driven tests below.
+#[cfg(test)]
 fn ungrounded_segment_count(subject: &str, harvest: &Harvest) -> Option<usize> {
     let text = evidence_text(harvest);
     let evidence = evidence_token_set(&text);
+    ungrounded_segment_count_with_evidence(subject, &evidence)
+}
+
+/// Core of [`ungrounded_segment_count`], taking an already-built evidence set;
+/// see [`subject_grounded_with_evidence`].
+fn ungrounded_segment_count_with_evidence(
+    subject: &str,
+    evidence: &std::collections::HashSet<&str>,
+) -> Option<usize> {
     if evidence.is_empty() {
         return None;
     }
+    // Model punctuation drift must not collapse the subject into one segment
+    // and dodge the per-segment check: a spaced en dash or em dash is the
+    // same "<short form> - <party>" separator in everything but keystroke,
+    // so fold it to the plain hyphen form before splitting.
+    let normalized = subject.replace(" – ", " - ").replace(" — ", " - ");
     Some(
-        subject
+        normalized
             .split(" - ")
             .filter(|segment| {
                 let tokens = eligible_tokens(segment);
@@ -2509,7 +2540,7 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        assert!(n >= 1, "expected at least one fabricated segment, got {n}");
+        assert_eq!(n, 1, "only the parroted segment should count as fabricated");
     }
 
     #[test]
@@ -2544,6 +2575,64 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Table-driven coverage of how `ungrounded_segment_count` splits a
+    /// subject on `" - "`: no separator at all (the whole subject is one
+    /// segment), more than one fabricated segment, a doubled separator that
+    /// produces an empty middle segment, a leading/trailing separator that
+    /// produces an empty edge segment, and a spaced em dash the model wrote
+    /// instead of a hyphen. An empty segment must never itself count as
+    /// fabricated — `tokens.iter().all(..)` on an empty iterator is
+    /// vacuously `true`, so the `!tokens.is_empty()` guard is the only thing
+    /// standing between an empty segment and a false positive. A dash the
+    /// model spelled differently must not collapse the subject into one
+    /// segment and dodge the per-segment check entirely.
+    #[test]
+    fn ungrounded_segment_count_segment_splitting_cases() {
+        let mut h = harvest_with(&["2026-07-20"]);
+        h.head_excerpt = "Prepared for Hooli Inc. by their accountant.".into();
+
+        let cases: &[(&str, &str, Option<usize>)] = &[
+            (
+                "no ' - ' separator: the whole subject is one segment, and \
+                 every eligible token is missing",
+                "Quarterly Bonus Schedule",
+                Some(1),
+            ),
+            (
+                "two segments, both fabricated",
+                "Marcus Alvarez - Wonka Industries",
+                Some(2),
+            ),
+            (
+                "doubled separator produces an empty middle segment, which is \
+                 ignored rather than counted",
+                "Hooli Inc. -  - Marcus Alvarez",
+                Some(1),
+            ),
+            (
+                "leading and trailing separators produce empty edge segments, \
+                 which are ignored rather than counted",
+                " - Marcus Alvarez - ",
+                Some(1),
+            ),
+            (
+                "a spaced em dash is folded to the hyphen separator before \
+                 splitting, so the fabricated segment still gets caught on \
+                 its own",
+                "Hooli Inc. — Marcus Alvarez",
+                Some(1),
+            ),
+        ];
+
+        for (description, subject, expected) in cases {
+            assert_eq!(
+                ungrounded_segment_count(subject, &h),
+                *expected,
+                "{description}: {subject:?}"
+            );
+        }
     }
 
     #[test]

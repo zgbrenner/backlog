@@ -5,6 +5,32 @@
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set by `Config::load` when a `backlog.config.json` existed but failed to
+/// parse, so this launch is running on a backup or on defaults instead of the
+/// operator's actual settings. Read by `preflight::run_with` to surface a
+/// readiness problem — without this, the operator would only ever discover a
+/// silently-defaulted config by noticing their settings looked wrong.
+static CONFIG_PARSE_FAILURE: AtomicBool = AtomicBool::new(false);
+
+/// Did the most recent `Config::load` fall back because the on-disk config
+/// failed to parse? Reset at the top of every `load` call, so this reflects
+/// only the latest launch's outcome, not any earlier one in the same process.
+pub fn config_parse_failure() -> bool {
+    CONFIG_PARSE_FAILURE.load(Ordering::Relaxed)
+}
+
+/// Test-only escape hatch. `cargo test` runs every test in a crate in one
+/// process, and most `preflight::run_with` tests build a `Config` directly
+/// rather than through `load` — nothing resets this flag for them. Without
+/// an explicit reset, a config.rs test exercising the parse-failure path on
+/// one thread could leave `config_parse_failure()` reading `true` for an
+/// unrelated preflight test asserting `configured` on another.
+#[cfg(test)]
+pub(crate) fn reset_config_parse_failure_for_tests() {
+    CONFIG_PARSE_FAILURE.store(false, Ordering::Relaxed);
+}
 
 /// Where a validated document is delivered.  The default intentionally keeps
 /// every existing config and Power Automate installation byte-compatible.
@@ -80,7 +106,9 @@ pub struct Config {
     pub convert_idle_reap_secs: u64,
 
     /// Maximum wait for one convertd request. A timed-out process is killed
-    /// and lazily respawned on the next request.
+    /// and lazily respawned on the next request. The `ocr` operation gets
+    /// three times this, capped at 300 s (see
+    /// `sidecar.rs::OCR_TIMEOUT_MULTIPLIER`).
     pub sidecar_timeout_secs: u64,
 
     /// Pace manifest emission (per minute, 0 = unlimited) to stay under
@@ -419,7 +447,19 @@ fn slm_escalation_parallel_for_ram(gib: Option<u64>) -> u8 {
 impl Config {
     pub fn load(path: &Path) -> Self {
         let parse = |candidate: &Path| -> Option<Self> {
-            let contents = std::fs::read_to_string(candidate).ok()?;
+            // A read failure (permission denial, sharing violation, UTF-16
+            // content) is not a parse failure — telling the operator their
+            // file "failed to parse" when it could not be read sends them
+            // debugging the wrong thing.
+            let contents = match std::fs::read_to_string(candidate) {
+                Ok(text) => text,
+                Err(error) => {
+                    if candidate.exists() {
+                        log::warn!("config read failed for {} ({error})", candidate.display());
+                    }
+                    return None;
+                }
+            };
             // Windows editors and PowerShell 5.1's `Set-Content -Encoding utf8`
             // default write a leading UTF-8 BOM that serde_json rejects
             // outright; a BOM alone must never be treated as a parse failure.
@@ -436,6 +476,10 @@ impl Config {
         let main_exists = path.exists();
         let main_parse = parse(path);
         let main_parse_failed = main_exists && main_parse.is_none();
+        // Set regardless of what happens to the `.invalid` copy below — the
+        // operator's settings failed to parse either way, and preflight must
+        // surface that even if the preservation copy itself also failed.
+        CONFIG_PARSE_FAILURE.store(main_parse_failed, Ordering::Relaxed);
         let (mut cfg, recovered_from_backup) = match main_parse {
             Some(cfg) => (cfg, false),
             None => match parse(&backup) {
@@ -457,12 +501,22 @@ impl Config {
             // `path` — copy it aside first so the operator's original bytes
             // are never silently lost.
             let invalid = invalid_path(path);
-            log::error!(
-                "config file {} failed to parse; preserving the original at {} before it is replaced",
-                path.display(),
-                invalid.display()
-            );
-            let _ = std::fs::copy(path, &invalid);
+            // The whole point of the copy is that the original is about to
+            // be replaceable; a silent copy failure would leave the operator
+            // with no signal that preservation did not happen — so the log
+            // reports what the copy actually did, not what it was meant to.
+            match std::fs::copy(path, &invalid) {
+                Ok(_) => log::error!(
+                    "config file {} failed to parse; original preserved at {}",
+                    path.display(),
+                    invalid.display()
+                ),
+                Err(error) => log::error!(
+                    "config file {} failed to parse and could NOT be preserved at {} ({error}); do not overwrite it",
+                    path.display(),
+                    invalid.display()
+                ),
+            }
         }
         if recovered_from_backup {
             let _ = std::fs::rename(&backup, path);
