@@ -48,6 +48,21 @@ const MAX_LOGGED_STDERR_LINES: usize = 2000;
 /// to DEBUG.
 const STDERR_INFO_LINES: usize = 40;
 
+/// `ocr`'s timeout budget is `self.timeout * OCR_TIMEOUT_MULTIPLIER`, clamped
+/// to `[OCR_TIMEOUT_FLOOR, OCR_TIMEOUT_CEIL]`. Batch-contention measurement,
+/// 2026-08-05: a 3-page 300-DPI OCR exceeded the 45s base timeout under
+/// 6-worker load (convert workers plus llama servers contending for CPU),
+/// and every rung of `pipeline::convert_with_retries`'s dpi 300→400→enhanced
+/// ladder replays the same page count into the same wall, so all three
+/// attempts hit the identical deadline and legible scans were flagged
+/// UNREADABLE. `convert` and every other op are unaffected.
+// `pub(crate)`: `pipeline::wall_clock_cap` derives the convert-stage budget
+// from these same numbers rather than re-deriving its own, so the two stay
+// in lockstep by construction instead of by two authors remembering to.
+pub(crate) const OCR_TIMEOUT_MULTIPLIER: u32 = 3;
+pub(crate) const OCR_TIMEOUT_FLOOR: Duration = Duration::from_secs(90);
+pub(crate) const OCR_TIMEOUT_CEIL: Duration = Duration::from_secs(300);
+
 #[cfg(not(windows))]
 fn terminate_pid(pid: u32) -> bool {
     const SIGKILL: i32 = 9;
@@ -780,6 +795,18 @@ impl Sidecar {
         Ok(proc)
     }
 
+    /// Per-op timeout budget. Every op but `ocr` uses `self.timeout` as-is;
+    /// see `OCR_TIMEOUT_MULTIPLIER` for why OCR needs more room. A free
+    /// function of `op` and `self.timeout` (no I/O) so the policy is
+    /// testable without spawning a worker.
+    fn op_timeout(&self, op: &str) -> Duration {
+        if op == "ocr" {
+            (self.timeout * OCR_TIMEOUT_MULTIPLIER).clamp(OCR_TIMEOUT_FLOOR, OCR_TIMEOUT_CEIL)
+        } else {
+            self.timeout
+        }
+    }
+
     pub fn call(&self, op: &str, args: Value) -> anyhow::Result<Value> {
         let id = self
             .counter
@@ -826,7 +853,8 @@ impl Sidecar {
             Closed,
         }
 
-        let deadline = std::time::Instant::now() + self.timeout;
+        let budget = self.op_timeout(op);
+        let deadline = std::time::Instant::now() + budget;
         let wake = loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -863,7 +891,7 @@ impl Sidecar {
                 if self.shutting_down.load(Ordering::Acquire) {
                     anyhow::bail!("document processing is shutting down");
                 }
-                anyhow::bail!("sidecar '{op}' timed out after {:?}", self.timeout);
+                anyhow::bail!("sidecar '{op}' timed out after {:?}", budget);
             }
             Wake::ReadErr(e) => {
                 checkout.retire();
@@ -1284,6 +1312,37 @@ mod semantic_payload_tests {
         let mut bad = good.clone();
         bad.spans[0].end_char = 200;
         assert!(validate_entity_result(&bad, &source).is_err());
+    }
+}
+
+#[cfg(test)]
+mod op_timeout_tests {
+    use super::*;
+
+    fn sidecar_with_base(secs: u64) -> Sidecar {
+        Sidecar::with_timeout(
+            std::path::PathBuf::from("unused"),
+            Duration::from_secs(secs),
+        )
+    }
+
+    #[test]
+    fn ocr_gets_a_multiple_of_the_default_base_timeout() {
+        let sidecar = sidecar_with_base(45);
+        assert_eq!(sidecar.op_timeout("ocr"), Duration::from_secs(135));
+        assert_eq!(sidecar.op_timeout("convert"), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn ocr_multiple_is_floored_for_a_small_base_timeout() {
+        let sidecar = sidecar_with_base(10);
+        assert_eq!(sidecar.op_timeout("ocr"), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn ocr_multiple_is_capped_for_a_large_base_timeout() {
+        let sidecar = sidecar_with_base(200);
+        assert_eq!(sidecar.op_timeout("ocr"), Duration::from_secs(300));
     }
 }
 

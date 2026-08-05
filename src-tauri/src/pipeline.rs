@@ -9,7 +9,9 @@ use crate::ledger::{Job, JobState, Ledger};
 use crate::local_output::{self, DeliverResult};
 use crate::manifest::{write_manifest, Manifest, Pacer, MANIFEST_SCHEMA_VERSION};
 use crate::routing::{self, Route};
-use crate::sidecar::{ConvertResult, Sidecar};
+use crate::sidecar::{
+    ConvertResult, Sidecar, OCR_TIMEOUT_CEIL, OCR_TIMEOUT_FLOOR, OCR_TIMEOUT_MULTIPLIER,
+};
 use crate::slm::{SlmLane, Tier};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -144,11 +146,21 @@ const CLAIM_STALE_MULTIPLE: u64 = 6;
 /// It has to sit above the sum of the stage timeouts it wraps, or it fires on
 /// perfectly healthy documents. The bare `per_file_wall_clock_secs * 3` it
 /// replaces was 270s by default, while the convert stage alone is permitted
-/// `sidecar_timeout_secs * max_stage_attempts` = 135s before the pdf probe,
-/// build_evidence's four sidecar round-trips and the naming ladder have run at
-/// all. That miscalibration used to cost one log line; now that the cap
-/// quarantines the file, ships a `flagged` manifest to SharePoint and freezes
-/// the row, it costs a document.
+/// `sidecar_timeout_secs * 5 + ocr_budget * max_stage_attempts` = 630s by
+/// default before the pdf probe, build_evidence's four sidecar round-trips
+/// and the naming ladder have run at all. That miscalibration used to cost
+/// one log line; now that the cap quarantines the file, ships a `flagged`
+/// manifest to SharePoint and freezes the row, it costs a document.
+///
+/// Every convert/OCR attempt (one per rung) is budgeted at `ocr_budget`
+/// rather than the base `sidecar_timeout_secs`: a Scanned route calls
+/// `sidecar.ocr` on every rung of `convert_with_retries`'s dpi ladder, and
+/// `Sidecar::op_timeout` grants `ocr` up to `OCR_TIMEOUT_MULTIPLIER` times
+/// the base timeout, clamped to `[OCR_TIMEOUT_FLOOR, OCR_TIMEOUT_CEIL]` (see
+/// sidecar.rs). Sizing this cap off the base timeout instead would make it
+/// smaller than what a full scanned-route retry ladder can now legitimately
+/// take, so the wall clock would kill exactly the slow-but-legible scans the
+/// per-call OCR budget exists to save.
 ///
 /// `per_file_wall_clock_secs` stands in for one naming request because the
 /// naming lane has no timeout knob of its own; its default (90s) is already
@@ -156,9 +168,19 @@ const CLAIM_STALE_MULTIPLE: u64 = 6;
 /// the knob keeps its meaning — raising it raises the backstop.
 fn wall_clock_cap(cfg: &Config) -> u64 {
     let attempts = (cfg.max_stage_attempts.max(1)) as u64;
-    // pdf_probe (1) + one convert/OCR attempt per rung + build_evidence's
-    // langid, classify, salience and ettin round-trips (4).
-    let sidecar = cfg.sidecar_timeout_secs.saturating_mul(attempts + 5);
+    // Worst-case per-attempt convert/OCR cost, not the base timeout — see
+    // the doc comment above.
+    let ocr_budget = cfg
+        .sidecar_timeout_secs
+        .saturating_mul(OCR_TIMEOUT_MULTIPLIER as u64)
+        .clamp(OCR_TIMEOUT_FLOOR.as_secs(), OCR_TIMEOUT_CEIL.as_secs());
+    // pdf_probe (1) + build_evidence's langid, classify, salience and ettin
+    // round-trips (4), at the base timeout, plus one convert/OCR attempt per
+    // rung at ocr_budget.
+    let sidecar = cfg
+        .sidecar_timeout_secs
+        .saturating_mul(5)
+        .saturating_add(ocr_budget.saturating_mul(attempts));
     // One naming request per rung, plus the span-mismatch re-prompt.
     let naming = cfg.per_file_wall_clock_secs.saturating_mul(attempts + 1);
     sidecar.saturating_add(naming).max(1)
