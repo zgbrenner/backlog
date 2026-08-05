@@ -131,6 +131,13 @@ fn is_candidate(p: &Path) -> bool {
 /// Symlinks and Windows junctions are not documents. Checking metadata without
 /// following links is important: `Path::is_file` and `Path::is_dir` both follow
 /// them, which can make a recursive watcher ingest an unrelated tree.
+///
+/// The check is by reparse TAG, not by the attribute bit alone. OneDrive
+/// Files On-Demand implements every synced item — hydrated or not — as a
+/// reparse point owned by the Cloud Files filter, and the Processing root
+/// this watcher exists for is documented as a OneDrive-synced folder. The
+/// old attribute-bit test therefore classified every legitimate document on
+/// a Files-On-Demand machine as "not a document" and silently dropped it.
 fn is_reparse_point(path: &Path) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return true;
@@ -142,10 +149,47 @@ fn is_reparse_point(path: &Path) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            return false;
+        }
+        // Attribute set: the tag decides. An unreadable tag fails closed.
+        return match reparse_tag(path) {
+            Some(tag) => !is_cloud_files_tag(tag),
+            None => true,
+        };
     }
     #[cfg(not(windows))]
     false
+}
+
+/// The reparse tag `path` carries, if any. `symlink_metadata` exposes only
+/// the attribute BIT; the tag — which is what distinguishes a OneDrive
+/// placeholder from a symlink — rides in `WIN32_FIND_DATAW.dwReserved0`.
+#[cfg(windows)]
+fn reparse_tag(path: &Path) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        FindClose, FindFirstFileW, FILE_ATTRIBUTE_REPARSE_POINT, WIN32_FIND_DATAW,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut data = WIN32_FIND_DATAW::default();
+    let handle = unsafe { FindFirstFileW(PCWSTR(wide.as_ptr()), &mut data) }.ok()?;
+    let _ = unsafe { FindClose(handle) };
+    (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0).then_some(data.dwReserved0)
+}
+
+/// Microsoft's Cloud Files tag family (OneDrive Files On-Demand and other
+/// sync engines built on the same filter). `IO_REPARSE_TAG_CLOUD` is
+/// 0x9000001A; the `_1` through `_F` variants differ only in the 0x0000F000
+/// nibble, so the family test masks that nibble out.
+#[cfg(windows)]
+fn is_cloud_files_tag(tag: u32) -> bool {
+    (tag & 0xFFFF_0FFF) == 0x9000_001A
 }
 
 /// Validate a path at every watcher boundary, not only when the notify event
@@ -191,7 +235,14 @@ fn contains_reparse_component(path: &Path) -> bool {
             use std::os::windows::fs::MetadataExt;
             const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
             if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return true;
+                // Same tag discrimination as `is_reparse_point`: every
+                // directory under a OneDrive sync root carries a Cloud Files
+                // tag, so the attribute bit alone would reject the whole
+                // Processing tree on a Files-On-Demand machine.
+                match reparse_tag(&current) {
+                    Some(tag) if is_cloud_files_tag(tag) => {}
+                    _ => return true,
+                }
             }
         }
     }
@@ -355,5 +406,33 @@ mod tests {
 
         let files = walk(dir.path());
         assert!(!files.iter().any(|path| path == &outside_file));
+    }
+
+    /// OneDrive Files On-Demand marks every synced item with a Cloud Files
+    /// tag; symlinks and junctions must still be rejected.
+    #[cfg(windows)]
+    #[test]
+    fn cloud_files_tags_are_documents_and_link_tags_are_not() {
+        const IO_REPARSE_TAG_CLOUD: u32 = 0x9000_001A;
+        const IO_REPARSE_TAG_CLOUD_6: u32 = 0x9000_601A;
+        const IO_REPARSE_TAG_CLOUD_F: u32 = 0x9000_F01A;
+        const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+        const IO_REPARSE_TAG_APPEXECLINK: u32 = 0x8000_001B;
+
+        for cloud in [
+            IO_REPARSE_TAG_CLOUD,
+            IO_REPARSE_TAG_CLOUD_6,
+            IO_REPARSE_TAG_CLOUD_F,
+        ] {
+            assert!(is_cloud_files_tag(cloud), "{cloud:#010x} is Cloud Files");
+        }
+        for link in [
+            IO_REPARSE_TAG_SYMLINK,
+            IO_REPARSE_TAG_MOUNT_POINT,
+            IO_REPARSE_TAG_APPEXECLINK,
+        ] {
+            assert!(!is_cloud_files_tag(link), "{link:#010x} is not a document");
+        }
     }
 }
