@@ -478,7 +478,15 @@ impl Checker {
         }
 
         // ---- description ---------------------------------------------------
-        let description = Self::validate_description(&out.description, &subject, &mut soft_flags)?;
+        // Model prose habitually opens with "The document is a …"; the index
+        // wants register style, so strip that deterministically rather than
+        // hoping the prompt sticks. Human-typed descriptions pass untouched.
+        let described = if source == Source::Model {
+            strip_document_preamble(&out.description)
+        } else {
+            out.description.clone()
+        };
+        let description = Self::validate_description(&described, &subject, &mut soft_flags)?;
 
         // ---- compose -------------------------------------------------------
         let base_name = format!("{date_iso} {subject}");
@@ -1165,6 +1173,52 @@ fn dedup_dates(mut dates: Vec<String>) -> Vec<String> {
     dates.sort();
     dates.dedup();
     dates
+}
+
+/// Strip the "The document is a …" preamble a small model habitually opens
+/// its one-sentence description with, so the index reads in register style —
+/// "Shareholder's register transferring 40,000 shares to John Smith." — not
+/// "The document is a shareholder's register transferring 40,000 shares…".
+///
+/// Deliberately narrow: only a leading "The/This document/file", optionally
+/// followed by "is/was" and an article, is removed. A mid-sentence mention or
+/// "The documentation …" is left alone (the prefixes carry their own trailing
+/// space, which is the word boundary). If what remains would fall under the
+/// 15-character floor `validate_description` enforces, the original is kept —
+/// a stripped-too-short description would be rejected outright, a worse
+/// outcome than a wordy preamble.
+pub fn strip_document_preamble(description: &str) -> String {
+    let lower = description.to_lowercase();
+    let Some(mut rest) = ["the document ", "this document ", "the file ", "this file "]
+        .iter()
+        .find_map(|p| lower.starts_with(p).then(|| &description[p.len()..]))
+    else {
+        return description.to_string();
+    };
+    // Optional linking verb, then an optional article: "is a", "was the", …
+    let lower_rest = rest.to_lowercase();
+    for link in ["is ", "was "] {
+        if lower_rest.starts_with(link) {
+            rest = &rest[link.len()..];
+            let after_link = rest.to_lowercase();
+            for article in ["an ", "a ", "the "] {
+                if after_link.starts_with(article) {
+                    rest = &rest[article.len()..];
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    let rest = rest.trim_start();
+    if rest.chars().count() < 15 {
+        return description.to_string();
+    }
+    let mut chars = rest.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => description.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1911,10 +1965,9 @@ mod tests {
         let v = c
             .check(&out, &h, &[], "2026-07-21", None)
             .expect("a trailing fragment must not quarantine the document");
-        assert_eq!(
-            v.description,
-            "This document contains the payroll worksheets."
-        );
+        // The "This document" preamble is stripped first, then the trailing
+        // fragment is trimmed to the one complete sentence.
+        assert_eq!(v.description, "Contains the payroll worksheets.");
         assert!(
             v.soft_flags
                 .contains(&"DESCRIPTION_TRIMMED_TO_ONE_SENTENCE".to_string()),
@@ -2572,5 +2625,48 @@ mod tests {
             modified_iso,
             Local::now().date_naive().format("%Y-%m-%d").to_string()
         );
+    }
+
+    #[test]
+    fn document_preamble_is_stripped_from_model_descriptions() {
+        // The register style: jump straight into what the thing is.
+        assert_eq!(
+            strip_document_preamble(
+                "The document is a shareholder's register transferring 40,000 shares to John Smith."
+            ),
+            "Shareholder's register transferring 40,000 shares to John Smith."
+        );
+        // A verb after the preamble survives as the opening word.
+        assert_eq!(
+            strip_document_preamble(
+                "This document confirms termination of employment effective April 11, 2026."
+            ),
+            "Confirms termination of employment effective April 11, 2026."
+        );
+        assert_eq!(
+            strip_document_preamble("The file was an invoice for services rendered in June."),
+            "Invoice for services rendered in June."
+        );
+        // "the" as article after the linking verb.
+        assert_eq!(
+            strip_document_preamble("The document is the annual report of Acme Industries."),
+            "Annual report of Acme Industries."
+        );
+    }
+
+    #[test]
+    fn preamble_stripping_leaves_everything_else_alone() {
+        // Already in register style.
+        let clean = "Shareholder's register transferring 40,000 shares to John Smith.";
+        assert_eq!(strip_document_preamble(clean), clean);
+        // "documentation" is not "document " — word boundary matters.
+        let docs = "The documentation covers deployment and rollback procedures.";
+        assert_eq!(strip_document_preamble(docs), docs);
+        // Stripping below the checker's 15-char floor keeps the original.
+        let short = "The document is a note.";
+        assert_eq!(strip_document_preamble(short), short);
+        // Mid-sentence mentions are untouched.
+        let mid = "Annexes to the document list all parties.";
+        assert_eq!(strip_document_preamble(mid), mid);
     }
 }

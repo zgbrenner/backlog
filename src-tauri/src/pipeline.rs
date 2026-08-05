@@ -463,14 +463,26 @@ impl Pipeline {
                             .await;
                     } else {
                         // A watcher may report the second physical copy only
-                        // once. Keep a bounded in-process retry alive until
-                        // the original resolves, then emit its own duplicate
+                        // once. Keep an in-process retry alive until the
+                        // original resolves, then emit its own duplicate
                         // row; never let it claim or delete under the first
                         // content-key row.
-                        let deadline = tokio::time::Instant::now()
+                        //
+                        // The wait is bounded by the ORIGINAL's lifecycle,
+                        // not by a deadline of this copy's own: the original
+                        // always reaches a terminal state — its wall clock
+                        // flags it if nothing else does — while a fixed
+                        // deadline here counted queue time the original's
+                        // clock deliberately excludes. Any batch that queued
+                        // longer than the window therefore orphaned its
+                        // copies in Processing with no ledger row, no flag,
+                        // and no UI count. The window now only paces a
+                        // diagnostic, never an abandonment.
+                        let warn_after = tokio::time::Instant::now()
                             + deferred_duplicate_retry_window(&self.cfg);
                         let retry_interval = deferred_duplicate_retry_interval();
                         let mut next_retry = tokio::time::Instant::now();
+                        let mut warned = false;
                         loop {
                             if self.ingest_slots.is_closed() {
                                 log::debug!(
@@ -479,8 +491,11 @@ impl Pipeline {
                                 return;
                             }
                             let now = tokio::time::Instant::now();
-                            if now >= deadline {
-                                break;
+                            if !warned && now >= warn_after {
+                                log::warn!(
+                                    "deferred same-content physical copy is still waiting past its terminal window; keeping it parked until the original resolves"
+                                );
+                                warned = true;
                             }
                             if now >= next_retry {
                                 let Ok(Some(current)) = self.ledger.get(&sha) else {
@@ -502,13 +517,9 @@ impl Pipeline {
                             // This wait is exclusively for another delivery's
                             // terminal transition. Do not spend this copy's
                             // own wall-clock work budget on it.
-                            let wait = (next_retry.min(deadline) - now)
-                                .min(DEFERRED_DUPLICATE_SHUTDOWN_POLL);
+                            let wait = (next_retry - now).min(DEFERRED_DUPLICATE_SHUTDOWN_POLL);
                             clock.parked(tokio::time::sleep(wait)).await;
                         }
-                        log::warn!(
-                            "deferred same-content physical copy did not resolve within its configured terminal window"
-                        );
                     }
                     return;
                 }
@@ -1221,7 +1232,40 @@ impl Pipeline {
             .ledger
             .log_event(sha, "ingest", "duplicate content detected");
         if existing.state != JobState::Emitted {
-            return; // duplicate of a flagged file: nothing sane to emit
+            // A duplicate of a flagged or dismissed original has nothing sane
+            // to emit — but the physical copy must not rot invisibly in
+            // Processing. Every zero-byte file shares one sha, so "the second
+            // empty file" was exactly this path: no count, no flag, no row.
+            // Park the copy in quarantine beside its original so the operator
+            // sees one story and Processing stays clean.
+            let rel = relpath(&self.cfg.processing_dir, path);
+            let dup_key = manifest_id(sha, &rel);
+            let _ = std::fs::create_dir_all(&self.cfg.quarantine_dir);
+            if crate::watcher::is_safe_path_under_root(&self.cfg.processing_dir, path)
+                && path.is_file()
+            {
+                let dest = self.quarantine_dest(&dup_key, path);
+                let moved = std::fs::rename(path, &dest).is_ok()
+                    || match copy_then_remove(path, &dest) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::error!("failed to quarantine a duplicate of a reviewed file: {e}");
+                            let _ =
+                                self.ledger
+                                    .log_event(sha, "ingest", "DUPLICATE_QUARANTINE_FAILED");
+                            false
+                        }
+                    };
+                if moved {
+                    log::warn!("quarantined a same-content copy of a file already under review");
+                    let _ = self.ledger.log_event(
+                        sha,
+                        "ingest",
+                        "duplicate of a reviewed file quarantined",
+                    );
+                }
+            }
+            return;
         }
         let Some(orig_final) = existing.final_filename.clone() else {
             return;
@@ -5012,6 +5056,93 @@ mod tests {
         assert!(
             copy.exists(),
             "PA duplicate delivery never deletes the physical copy"
+        );
+    }
+
+    /// A batch can keep the original queued for longer than the configured
+    /// terminal window. The parked copy must keep waiting for the original's
+    /// terminal transition — the original always reaches one, because its own
+    /// wall clock flags it — instead of abandoning the copy invisibly in
+    /// Processing (the v0.8.0 silent-drop bug).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_content_copy_outlives_the_terminal_window_and_still_delivers() {
+        let h = Harness::new();
+        let (sha, original) = h.seed("a/original.pdf", "same content, slow original");
+        let copy = h.pipeline.cfg.processing_dir.join("b/copy.pdf");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::copy(&original, &copy).unwrap();
+        let duplicate_id = manifest_id(&sha, "b/copy.pdf");
+
+        let deferred = tokio::spawn(h.pipeline.clone().process_file(copy.clone()));
+        // Test timing maps one configured second to 10 ms, so the terminal
+        // window here is per_file_wall_clock_secs * 10 ms (900 ms on the
+        // default config). Resolve the original only after that window has
+        // fully elapsed.
+        let window = deferred_duplicate_retry_window(&h.pipeline.cfg);
+        tokio::time::sleep(window + std::time::Duration::from_millis(250)).await;
+        assert!(
+            h.pipeline.ledger.get(&duplicate_id).unwrap().is_none(),
+            "the copy must not resolve before its original"
+        );
+
+        h.pipeline
+            .ledger
+            .update_fields(
+                &sha,
+                &[
+                    ("final_filename", Some("original.pdf".into())),
+                    (
+                        "description",
+                        Some("Original duplicate fixture document.".into()),
+                    ),
+                    ("proposed_date", Some("2026-08-04".into())),
+                    ("date_source", Some("document".into())),
+                    ("doc_type", Some("document".into())),
+                    ("language", Some("en".into())),
+                ],
+            )
+            .unwrap();
+        h.pipeline
+            .ledger
+            .set_state(&sha, JobState::Emitted)
+            .unwrap();
+        deferred.await.unwrap();
+        let duplicate = h.pipeline.ledger.get(&duplicate_id).unwrap().unwrap();
+        assert_eq!(
+            duplicate.state,
+            JobState::Emitted,
+            "a copy that outlived the window must still get its own delivery"
+        );
+        assert!(copy.exists());
+    }
+
+    /// A duplicate of a flagged original has nothing sane to emit, but the
+    /// physical copy must not rot invisibly in Processing (the v0.8.0
+    /// zero-byte silent-drop bug: every empty file shares one sha, so the
+    /// second one vanished forever). Park the copy in quarantine beside its
+    /// original so an operator sees exactly one story.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_of_a_flagged_original_is_quarantined_not_abandoned() {
+        let h = Harness::new();
+        let (sha, _original) = h.seed("a/original.pdf", "content that got flagged");
+        h.pipeline
+            .ledger
+            .set_state(&sha, JobState::Flagged)
+            .unwrap();
+
+        let copy = h.pipeline.cfg.processing_dir.join("b/copy.pdf");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::write(&copy, "content that got flagged").unwrap();
+        h.pipeline.clone().process_file(copy.clone()).await;
+
+        assert!(
+            !copy.exists(),
+            "the copy must leave Processing instead of rotting there invisibly"
+        );
+        let entries = h.quarantine_entries();
+        assert!(
+            entries.iter().any(|n| n.ends_with("__copy.pdf")),
+            "the copy must be visible in quarantine, got: {entries:?}"
         );
     }
 
