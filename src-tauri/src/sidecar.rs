@@ -1643,22 +1643,24 @@ mod pool_tests {
         assert_eq!(sidecar.lock_pool().live, 3);
         drop((a, b, c)); // all three go idle at roughly the same instant
 
+        // Poll BOTH counters to one deadline. `live` is decremented under the
+        // pool lock, but the retired children are dropped — and therefore
+        // unregistered — only after that lock is released (the same
+        // outside-the-pool-lock discipline Checkout::drop uses), so the
+        // registry legitimately lags `live` by a beat. Asserting the registry
+        // the instant `live` hits 1 is a race this test lost on a Linux
+        // runner while winning on Windows.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            if sidecar.lock_pool().live == 1 {
+            if sidecar.lock_pool().live == 1 && sidecar.tracked_children().len() == 1 {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the reaper must shrink the pool down to min_idle_workers"
+                "the reaper must shrink the pool to min_idle_workers and unregister the retired children"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(
-            sidecar.tracked_children().len(),
-            1,
-            "two workers must have been retired and unregistered, one kept warm"
-        );
     }
 
     /// The floor is a floor, not a target passed through on the way to zero.
