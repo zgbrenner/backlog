@@ -48,6 +48,16 @@ pub struct Config {
     pub slm_primary_gguf: PathBuf,
     pub slm_escalation_gguf: PathBuf,
     pub slm_parallel: u8,
+    pub slm_escalation_parallel: u8,
+    /// Requests a primary llama-server serves before being killed and
+    /// respawned — llama.cpp Windows RSS growth is unfixed upstream
+    /// (ggml-org/llama.cpp#24356; measured 3.45->4.45 GB over 21 files).
+    /// 0 disables recycling.
+    pub slm_recycle_after_requests: u32,
+    /// Seconds since the escalation server's last request COMPLETED (never
+    /// mid-request — see `SlmLane::reap_idle_escalation`) before it is
+    /// dropped. 0 disables idle-reaping (resident for the process lifetime).
+    pub slm_escalation_idle_secs: u64,
     /// Max evidence tokens (approximate, chars/4) sent to the SLM.
     pub evidence_token_budget: usize,
 
@@ -56,10 +66,18 @@ pub struct Config {
     pub ettin_model_dir: String,
 
     /// How many `convertd` processes to run, and therefore how many documents
-    /// can be converted at once. Each worker is a separate Python process at
-    /// roughly 195 MB resident, so this is a memory knob as well as a
+    /// can be converted at once. Each worker is a separate Python process that
+    /// converges toward `CONVERTD_WORKER_RSS_MB` resident once it has serviced
+    /// any OCR or langid work, so this is a memory knob as well as a
     /// throughput one — see `convert_workers_ram_ceiling`.
     pub convert_workers: usize,
+    /// Idle convertd workers beyond this floor are eligible for reaping by
+    /// `Sidecar::spawn_idle_reaper`. Default 1: always keep one warm so the
+    /// next request after a lull skips the ~1s cold spawn.
+    pub convert_min_idle_workers: usize,
+    /// Seconds an idle convertd worker may sit before the reaper retires it.
+    /// 0 disables reaping (pre-feature behavior: workers only ever grow).
+    pub convert_idle_reap_secs: u64,
 
     /// Maximum wait for one convertd request. A timed-out process is killed
     /// and lazily respawned on the next request.
@@ -106,9 +124,14 @@ impl Default for Config {
             slm_primary_gguf: PathBuf::from("models/Qwen3-0.6B-Q8_0.gguf"),
             slm_escalation_gguf: PathBuf::from("models/Qwen3-1.7B-Q8_0.gguf"),
             slm_parallel: default_slm_parallel(),
+            slm_escalation_parallel: default_slm_escalation_parallel(),
+            slm_recycle_after_requests: 64,
+            slm_escalation_idle_secs: 600,
             evidence_token_budget: 1500,
             ettin_model_dir: String::new(),
             convert_workers: default_convert_workers(),
+            convert_min_idle_workers: 1,
+            convert_idle_reap_secs: 300,
             sidecar_timeout_secs: 45,
             manifest_emit_per_min: 0,
             max_head_pages: 10,
@@ -242,29 +265,45 @@ impl Config {
     }
 }
 
+/// RSS per convertd worker once its heaviest lazily-loaded component
+/// (RapidOCR) and lingua are both live. Measured 450-530 MB in production;
+/// 550 sits above that band deliberately. Replaces the ~195 MB figure this
+/// ceiling used before OCR+lingua were measured together — MarkItDown alone
+/// is close to the old number, but `convertd.py`'s loaders (`_get`,
+/// `convertd.py:95-140`) are memoized per-process with no unload path, and
+/// any worker that ever services an `ocr` op or a `langid` op (run on
+/// effectively every document) keeps that component loaded for the rest of
+/// its life. A long-running pool converges toward the worse number.
+const CONVERTD_WORKER_RSS_MB: u64 = 550;
+
 /// How many `convertd` workers installed RAM can hold.
 ///
 /// This became a real constraint the moment `Sidecar` grew a process pool.
 /// Before that, `convert_workers` only sized a semaphore and every request
 /// funnelled through one child, so the value cost nothing in memory however
-/// large it was. Now each worker is its own Python process — measured at
-/// ~195 MB resident once MarkItDown and RapidOCR are loaded, plus a ~10 MB
-/// PyInstaller bootstrap stub — so six of them is roughly 1.2 GB.
+/// large it was. Now each worker is its own Python process at
+/// `CONVERTD_WORKER_RSS_MB` resident once it has served any real document.
 ///
-/// On an 8 GB machine that does not fit: Windows takes ~3 GB, the two model
-/// servers take ~3.4 GB at `slm_parallel: 1`, and the app and WebView2 another
-/// ~0.4 GB, which leaves about 1.4 GB. Two workers fit inside that with room to
-/// spare; six do not, and the failure mode is the whole batch thrashing rather
-/// than any single thing reporting an error.
+/// On an 8 GB machine, two workers at the corrected figure (1.1 GB) leaves
+/// well under 150 MB of margin after the OS, the app, and the model servers
+/// at `slm_parallel: 1` — no room for real work, exactly the thrash mode this
+/// module exists to avoid. One worker leaves real slack, so that tier drops
+/// from 2 to 1.
 ///
 /// A CPU-derived value below the ceiling still wins — this only caps.
 fn convert_workers_ram_ceiling(gib: Option<u64>) -> usize {
     match gib {
-        Some(g) if g <= 9 => 2,  // 8 GB class: ~400 MB of sidecars
-        Some(g) if g <= 17 => 4, // 16 GB class
+        // 8 GB class: ~1.2 GB left after OS/app/SLM@1. One worker (550 MB)
+        // leaves real slack; two (1.1 GB) leaves under 150 MB — no margin.
+        // This tier drops from 2 to 1.
+        Some(g) if g <= 9 => 1,
+        // 16 GB class: ~8.3 GB left after OS/app/SLM@2. Four workers
+        // (2.2 GB) unchanged — wide margin at the corrected figure.
+        Some(g) if g <= 17 => 4,
+        // >16 GB: CPU-derived by_cpu (capped 6) binds first, not RAM.
         Some(_) => 6,
-        // Unknown RAM is not a reason to gamble on behalf of the smaller machine.
-        None => 2,
+        // Match the smallest tier: don't gamble on the smaller machine's behalf.
+        None => 1,
     }
 }
 
@@ -352,6 +391,21 @@ fn slm_parallel_for_ram(gib: Option<u64>) -> u8 {
     }
 }
 
+fn default_slm_escalation_parallel() -> u8 {
+    slm_escalation_parallel_for_ram(total_ram_gib())
+}
+
+/// Deliberately never inherits `slm_parallel_for_ram`'s 4 — the whole point
+/// of a separate knob is decoupling escalation's KV cost from primary's.
+/// `docs/SIZING.md` measures 2,262 MB (parallel 1) vs 3,609 MB (parallel 4)
+/// for the 1.7B; this keeps it at the low end always.
+fn slm_escalation_parallel_for_ram(gib: Option<u64>) -> u8 {
+    match gib {
+        Some(g) if g <= 9 => 1,
+        _ => 2, // >9 GiB and unknown RAM both get the small ceiling
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Self {
         let parse = |candidate: &Path| -> Option<Self> {
@@ -410,9 +464,22 @@ impl Config {
         }
     }
 
+    /// Same one-directional contract as `clamp_slm_parallel_for_test`, for
+    /// the escalation tier's own ceiling.
+    #[cfg(test)]
+    fn clamp_slm_escalation_parallel_for_test(&mut self, gib: Option<u64>) {
+        let ceiling = slm_escalation_parallel_for_ram(gib);
+        if self.slm_escalation_parallel > ceiling {
+            self.slm_escalation_parallel = ceiling;
+        }
+    }
+
     #[cfg(test)]
     fn clamp_resources_for_test(&mut self, gib: Option<u64>) {
         self.slm_parallel = self.slm_parallel.min(slm_parallel_for_ram(gib));
+        self.slm_escalation_parallel = self
+            .slm_escalation_parallel
+            .min(slm_escalation_parallel_for_ram(gib));
         self.convert_workers = self
             .convert_workers
             .min(convert_workers_ram_ceiling(gib))
@@ -437,16 +504,34 @@ impl Config {
             );
             self.slm_parallel = slm_ceiling;
         }
+        let slm_escalation_ceiling = slm_escalation_parallel_for_ram(gib);
+        if self.slm_escalation_parallel > slm_escalation_ceiling {
+            log::warn!(
+                "slm_escalation_parallel {} exceeds what {} GiB of RAM supports; using {} for this run \
+                 (set it explicitly lower to silence this, or see docs/SIZING.md)",
+                self.slm_escalation_parallel,
+                gib.map(|g| g.to_string())
+                    .unwrap_or_else(|| "an unknown amount of".into()),
+                slm_escalation_ceiling
+            );
+            self.slm_escalation_parallel = slm_escalation_ceiling;
+        }
         let convert_ceiling = convert_workers_ram_ceiling(gib);
         if self.convert_workers > convert_ceiling {
             log::warn!(
-                "convert_workers {} exceeds this machine's safe memory budget; using {}",
+                "convert_workers {} exceeds this machine's safe memory budget \
+                 (~{CONVERTD_WORKER_RSS_MB} MB/worker); using {}",
                 self.convert_workers,
                 convert_ceiling
             );
             self.convert_workers = convert_ceiling;
         }
         self.convert_workers = self.convert_workers.max(1);
+        // `min_idle_workers >= max_workers` makes `spawn_idle_reaper` inert
+        // (see `sidecar.rs`), so there is nothing to clamp here beyond the
+        // floor `validate` already enforces on both fields — the reaper
+        // simply does not run on a machine whose convert_workers ceiling
+        // dropped to 1, e.g. the corrected 8 GB tier.
     }
 
     /// Clean every operator-supplied value in place. Called on load and again
@@ -643,6 +728,24 @@ impl Config {
                 self.slm_parallel
             ));
         }
+        if !(1..=4).contains(&self.slm_escalation_parallel) {
+            return Err(format!(
+                "slm_escalation_parallel must be between 1 and 4; got {}.",
+                self.slm_escalation_parallel
+            ));
+        }
+        if self.slm_recycle_after_requests > 100_000 {
+            return Err(format!(
+                "slm_recycle_after_requests must be 0 or at most 100000; got {}.",
+                self.slm_recycle_after_requests
+            ));
+        }
+        if self.slm_escalation_idle_secs > 86_400 {
+            return Err(format!(
+                "slm_escalation_idle_secs must be 0 or at most 86400; got {}.",
+                self.slm_escalation_idle_secs
+            ));
+        }
         if self.evidence_token_budget == 0 || self.evidence_token_budget > 16_384 {
             return Err(format!(
                 "evidence_token_budget must be between 1 and 16384; got {}.",
@@ -653,6 +756,18 @@ impl Config {
             return Err(format!(
                 "convert_workers must be between 1 and 8; got {}.",
                 self.convert_workers
+            ));
+        }
+        if !(1..=8).contains(&self.convert_min_idle_workers) {
+            return Err(format!(
+                "convert_min_idle_workers must be between 1 and 8; got {}.",
+                self.convert_min_idle_workers
+            ));
+        }
+        if self.convert_idle_reap_secs > 3_600 {
+            return Err(format!(
+                "convert_idle_reap_secs must be 0 or at most 3600; got {}.",
+                self.convert_idle_reap_secs
             ));
         }
         if self.sidecar_timeout_secs == 0 || self.sidecar_timeout_secs > 300 {
@@ -800,12 +915,40 @@ mod tests {
         cases.push((c, "slm_parallel"));
 
         let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.slm_escalation_parallel = 0;
+        cases.push((c, "slm_escalation_parallel"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.slm_escalation_parallel = 5;
+        cases.push((c, "slm_escalation_parallel"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.slm_recycle_after_requests = 100_001;
+        cases.push((c, "slm_recycle_after_requests"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.slm_escalation_idle_secs = 86_401;
+        cases.push((c, "slm_escalation_idle_secs"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
         c.evidence_token_budget = 0;
         cases.push((c, "evidence_token_budget"));
 
         let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
         c.convert_workers = 0;
         cases.push((c, "convert_workers"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.convert_min_idle_workers = 0;
+        cases.push((c, "convert_min_idle_workers"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.convert_min_idle_workers = 9;
+        cases.push((c, "convert_min_idle_workers"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.convert_idle_reap_secs = 3_601;
+        cases.push((c, "convert_idle_reap_secs"));
 
         let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
         c.sidecar_timeout_secs = 0;
@@ -840,6 +983,16 @@ mod tests {
         c.manifest_emit_per_min = u32::MAX;
         let error = c.validate().expect_err("manifest_emit_per_min");
         assert!(error.contains("manifest_emit_per_min"), "{error}");
+    }
+
+    /// Unlike every other duration/count knob above, 0 is a legal value here
+    /// on purpose: it is how idle reaping is turned off, matching the
+    /// pre-feature behavior where the pool only ever grew.
+    #[test]
+    fn convert_idle_reap_secs_zero_disables_reaping_and_is_valid() {
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.convert_idle_reap_secs = 0;
+        assert!(c.validate().is_ok());
     }
 
     #[cfg(unix)]
@@ -992,19 +1145,45 @@ mod tests {
         assert_eq!(slm_parallel_for_ram(None), 2);
     }
 
-    /// Each `convertd` worker is a ~195 MB Python process now that `Sidecar`
-    /// pools them, so six of them is ~1.2 GB and does not fit on 8 GB beside
-    /// Windows, the two model servers and the app.
+    /// The escalation tier deliberately never inherits `slm_parallel_for_ram`'s
+    /// 4 — it stays at the low end (1 or 2) on every machine, because its
+    /// whole point is decoupling escalation's KV cost from primary's.
+    #[test]
+    fn slm_escalation_parallel_is_chosen_from_installed_ram() {
+        for (gib, expected) in [
+            (4u64, 1u8),
+            (8, 1),
+            (9, 1),
+            (12, 2),
+            (16, 2),
+            (17, 2),
+            (32, 2),
+        ] {
+            assert_eq!(
+                slm_escalation_parallel_for_ram(Some(gib)),
+                expected,
+                "{gib} GiB should give {expected}"
+            );
+        }
+        // Unknown RAM must not gamble on behalf of the smaller machine.
+        assert_eq!(slm_escalation_parallel_for_ram(None), 2);
+    }
+
+    /// Each `convertd` worker converges toward `CONVERTD_WORKER_RSS_MB`
+    /// (550 MB, measured with OCR+lingua both loaded) now that `Sidecar`
+    /// pools them, so two of them is 1.1 GB and leaves under 150 MB of
+    /// margin on an 8 GB machine beside Windows, the model servers and the
+    /// app — the 8 GB tier drops from 2 workers to 1 for exactly that reason.
     #[test]
     fn convert_workers_are_capped_by_installed_ram() {
-        for (gib, expected) in [(4u64, 2usize), (8, 2), (9, 2), (12, 4), (17, 4), (32, 6)] {
+        for (gib, expected) in [(4u64, 1usize), (8, 1), (9, 1), (12, 4), (17, 4), (32, 6)] {
             assert_eq!(
                 convert_workers_ram_ceiling(Some(gib)),
                 expected,
                 "{gib} GiB should cap at {expected}"
             );
         }
-        assert_eq!(convert_workers_ram_ceiling(None), 2);
+        assert_eq!(convert_workers_ram_ceiling(None), 1);
         // The live default must never exceed the ceiling for this machine.
         assert!(default_convert_workers() <= convert_workers_ram_ceiling(total_ram_gib()));
         assert!(default_convert_workers() >= 1, "one worker is the floor");
@@ -1032,16 +1211,40 @@ mod tests {
         assert_eq!(cfg.slm_parallel, 1, "a deliberate 1 must survive on 64 GB");
     }
 
+    /// Same one-directional contract for the escalation tier's own knob.
+    #[test]
+    fn a_persisted_slm_escalation_parallel_is_clamped_down_but_never_up() {
+        let mut cfg = Config {
+            slm_escalation_parallel: 2,
+            ..Default::default()
+        };
+        cfg.clamp_slm_escalation_parallel_for_test(Some(8));
+        assert_eq!(cfg.slm_escalation_parallel, 1, "8 GB must not inherit 2");
+
+        // One-directional: someone who lowered it knows their machine.
+        let mut cfg = Config {
+            slm_escalation_parallel: 1,
+            ..Default::default()
+        };
+        cfg.clamp_slm_escalation_parallel_for_test(Some(64));
+        assert_eq!(
+            cfg.slm_escalation_parallel, 1,
+            "a deliberate 1 must survive on 64 GB"
+        );
+    }
+
     #[test]
     fn an_eight_gib_machine_clamps_every_process_pool() {
         let mut cfg = Config {
             slm_parallel: 4,
+            slm_escalation_parallel: 2,
             convert_workers: 6,
             ..Default::default()
         };
         cfg.clamp_resources_for_test(Some(8));
         assert_eq!(cfg.slm_parallel, 1);
-        assert_eq!(cfg.convert_workers, 2);
+        assert_eq!(cfg.slm_escalation_parallel, 1);
+        assert_eq!(cfg.convert_workers, 1);
     }
 
     #[test]

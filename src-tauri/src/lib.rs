@@ -24,7 +24,7 @@ use ledger::Ledger;
 use pipeline::Pipeline;
 use preflight::RuntimeStatus;
 use sidecar::Sidecar;
-use slm::SlmLane;
+use slm::{SlmLane, SlmTuning};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1035,7 +1035,12 @@ fn redacted_config(cfg: &Config) -> serde_json::Value {
         "escalation_model": cfg.slm_escalation_gguf.file_name().map(|n| n.to_string_lossy().into_owned()),
         "llama_port": cfg.llama_port,
         "slm_parallel": cfg.slm_parallel,
+        "slm_escalation_parallel": cfg.slm_escalation_parallel,
+        "slm_recycle_after_requests": cfg.slm_recycle_after_requests,
+        "slm_escalation_idle_secs": cfg.slm_escalation_idle_secs,
         "convert_workers": cfg.convert_workers,
+        "convert_min_idle_workers": cfg.convert_min_idle_workers,
+        "convert_idle_reap_secs": cfg.convert_idle_reap_secs,
         "sidecar_timeout_secs": cfg.sidecar_timeout_secs,
         "manifest_emit_per_min": cfg.manifest_emit_per_min,
         "max_stage_attempts": cfg.max_stage_attempts,
@@ -1129,7 +1134,16 @@ async fn review_only_pipeline(
             cfg.llama_port.min(u16::MAX - 1),
             cfg.slm_parallel,
             cfg.slm_threads(),
+            SlmTuning {
+                escalation_parallel: cfg.slm_escalation_parallel,
+                recycle_after_requests: cfg.slm_recycle_after_requests,
+                escalation_idle_secs: cfg.slm_escalation_idle_secs,
+            },
         ));
+        // No idle reaper here on purpose: this pipeline is throwaway (one
+        // resubmit, then dropped), and its `Arc<SlmLane>`'s natural `Drop`
+        // (this path exits normally, unlike the real app's
+        // `std::process::exit`) already runs `begin_shutdown`.
         Pipeline::new(cfg, ledger, sidecar, slm, app)
     })
     .await
@@ -1208,8 +1222,19 @@ async fn start_pipeline(
         // to the convert stage and the number of processes that can serve them
         // are the same number. They were not before: one process served every
         // document while the semaphore cheerfully admitted six.
-        .with_workers(cfg.convert_workers),
+        .with_workers(cfg.convert_workers)
+        .with_idle_reap(
+            cfg.convert_min_idle_workers,
+            Duration::from_secs(cfg.convert_idle_reap_secs),
+        ),
     );
+    // No-op unless `.with_idle_reap` above set a nonzero timeout with room
+    // under `max_workers` (e.g. inert on the corrected 8 GB tier, where
+    // convert_workers is clamped to 1 and min_idle(1) == max_workers(1)).
+    // The other five short-lived `Sidecar`s built elsewhere in this file
+    // never call `.with_idle_reap`, so this is unreachable behavior change
+    // for them by construction.
+    sidecar.spawn_idle_reaper();
     let slm = Arc::new(SlmLane::new(
         binary(&app, "llama-server")?,
         grammar,
@@ -1218,7 +1243,19 @@ async fn start_pipeline(
         cfg.llama_port,
         cfg.slm_parallel,
         cfg.slm_threads(),
+        SlmTuning {
+            escalation_parallel: cfg.slm_escalation_parallel,
+            recycle_after_requests: cfg.slm_recycle_after_requests,
+            escalation_idle_secs: cfg.slm_escalation_idle_secs,
+        },
     ));
+    // `start_pipeline` is itself `async fn` and calls this directly (not
+    // `spawn_blocking`), so the reaper's `tokio::spawn` has a live reactor to
+    // land on. `_idle_reaper`'s `JoinHandle` is intentionally dropped
+    // (detached) — the task self-terminates via `Weak::upgrade` once every
+    // `Arc<SlmLane>` clone is gone, or via the `shutting_down` latch that
+    // `stop_pipeline_inner` sets, whichever fires first.
+    let _idle_reaper = slm.clone().spawn_idle_reaper();
     let pipeline = Pipeline::new(cfg.clone(), state.ledger.clone(), sidecar, slm, app);
 
     let mut slot = state.pipeline.lock().unwrap();

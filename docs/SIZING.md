@@ -38,7 +38,16 @@ Measured on Windows 11, `llama-server` b10091, Q8_0 weights:
 | Qwen3-0.6B | 2 | 8,192 | 1,572 MB | 1,040 MB |
 | Qwen3-0.6B | 4 | 16,384 | 2,469 MB | 1,938 MB |
 | Qwen3-1.7B | 1 | 4,096 | 2,262 MB | 617 MB |
+| Qwen3-1.7B | 2 (calculated) | 8,192 | ~2,710 MB | not measured |
 | Qwen3-1.7B | 4 | 16,384 | 3,609 MB | 1,966 MB |
+
+The `slm_escalation_parallel: 2` row is **calculated, not measured**: it
+interpolates the 448 MiB/slot formula above onto the 1.7B's own parallel-1
+baseline (2,262 + 448 ≈ 2,710 MB) rather than a fresh capture, because
+`slm_escalation_parallel` defaults to 2 only above 9 GiB of installed RAM and
+the build machine that produces this table is the one machine that can never
+land on the 8 GB branch either — see the note on `slm_parallel_is_chosen_from_installed_ram`
+below for the same limitation. Treat it as an estimate until it is measured.
 
 **Both tiers are resident at once on any real batch.** `SlmLane` holds `primary`
 and `escalation` in separate slots, and once a document needs a third naming
@@ -58,8 +67,18 @@ convertd all live:
 |---|---|
 | llama-server (escalation, 1.7B) | 2,477 MB |
 | llama-server (primary, 0.6B) | 1,715 MB |
-| convertd (worker + PyInstaller bootstrap stub) | 204 MB |
+| convertd (worker + PyInstaller bootstrap stub) | 204 MB[^convertd-rss] |
 | **total model + sidecar layer** | **4,396 MB** |
+
+[^convertd-rss]: This 204 MB is a snapshot of a worker that has only run
+    MarkItDown conversions. It is not the number `convert_workers_ram_ceiling`
+    plans against: `convertd.py`'s loaders memoize each lazily-loaded
+    component per-process with no unload path, so a worker that has ever
+    serviced an `ocr` op or a `langid` op (effectively every document, once a
+    batch runs long enough) keeps RapidOCR and lingua resident for the rest of
+    its life. Measured with both loaded: 450–530 MB, which is the figure
+    `config.rs`'s `CONVERTD_WORKER_RSS_MB` (550) budgets against. A
+    long-running pool converges toward that worse number, not this one.
 
 Add the app and WebView2 (~400 MB) and Windows itself (2.5–3 GB) and an 8 GB
 machine is at roughly 7.8 GB — inside the box, but without much room. It

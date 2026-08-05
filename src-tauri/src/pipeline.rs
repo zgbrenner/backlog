@@ -11,6 +11,7 @@ use crate::manifest::{write_manifest, Manifest, Pacer, MANIFEST_SCHEMA_VERSION};
 use crate::routing::{self, Route};
 use crate::sidecar::{ConvertResult, Sidecar};
 use crate::slm::{SlmLane, Tier};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::io::Write;
@@ -33,6 +34,11 @@ pub struct Pipeline {
     pub paused: Arc<AtomicBool>,
     convert_slots: Arc<Semaphore>,
     slm_slots: Arc<Semaphore>,
+    /// Gates concurrent Tier::Escalation HTTP calls independently of
+    /// `slm_slots`. Never acquired when `slm.escalation_collapsed()` — a
+    /// collapsed (single-server) install has no second server to protect,
+    /// so gating it here would only over-throttle it for no memory benefit.
+    escalation_slots: Arc<Semaphore>,
     /// Global cap on files being hashed / stability-probed / processed at once,
     /// so a large backfill applies backpressure instead of spawning thousands
     /// of concurrent blocking probes.
@@ -47,6 +53,58 @@ pub struct Pipeline {
 
 const PDF_TEXT_MEDIAN_CHARS: u64 = 200;
 const OCR_CONF_FLOOR: f64 = 0.55;
+
+/// Version stamped into every `{sha}.convert-meta.json`. Bump this whenever
+/// the artifact's shape changes, so an old cache written by a previous
+/// release is a clean miss (`Pipeline::try_resume_convert` returns `None`)
+/// instead of a deserialize error masquerading as corruption.
+const CONVERT_CACHE_SCHEMA_VERSION: u8 = 1;
+
+/// Provenance for a cached `{sha}.md`, written atomically alongside it right
+/// after CONVERT succeeds. `Pipeline::try_resume_convert` compares every
+/// field against this run's own knobs before trusting the cached markdown;
+/// any mismatch (including a parse failure) is a normal cache miss, never a
+/// flag. See docs/superpowers/specs/2026-08-05-resume-from-cache-design.md
+/// §2-3 — Phase 1 (CONVERT-skip only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConvertCacheMeta {
+    schema_version: u8,
+    /// "native" | "scanned" — must match this run's routing decision; a
+    /// different route is a different sidecar op entirely. See
+    /// `route_label`.
+    route: String,
+    max_head_pages: usize,
+    max_tail_pages: usize,
+    /// `model_versions["convertd"]` at write time. `None` if the sidecar
+    /// never answered `versions` for the session that wrote this cache (see
+    /// `Pipeline::new`'s probe) — a session with unknown provenance is
+    /// treated as a hard mismatch on read, the same as a real version bump.
+    convertd_version: Option<String>,
+    doc_meta_dates: Vec<String>,
+    letterhead_resets: u32,
+}
+
+/// A validated CONVERT-stage cache hit, ready to stand in for a fresh
+/// convert/OCR round-trip. See `Pipeline::try_resume_convert`.
+struct CachedConvert {
+    markdown: String,
+    doc_meta_dates: Vec<String>,
+    letterhead_resets: u32,
+}
+
+/// Spelled out rather than `format!("{route:?}").to_lowercase()`: a renamed
+/// `Route` variant would otherwise silently change a string embedded in both
+/// the ledger's `route` column and `{sha}.convert-meta.json`, with no
+/// compiler error. Shared by the ledger write in `process_inner` and the
+/// cache validity gate in `try_resume_convert` so the two can never disagree
+/// about what a route is called.
+fn route_label(route: Route) -> &'static str {
+    match route {
+        Route::Native => "native",
+        Route::Scanned => "scanned",
+        Route::Flag => "flag",
+    }
+}
 
 /// Physical duplicate rows are keyed by their per-path delivery id rather
 /// than by the shared content hash. Manifests still describe the bytes, so a
@@ -266,6 +324,7 @@ impl Pipeline {
         Arc::new(Self {
             convert_slots: Arc::new(Semaphore::new(cfg.convert_workers.max(1))),
             slm_slots: Arc::new(Semaphore::new(cfg.slm_parallel.max(1) as usize)),
+            escalation_slots: Arc::new(Semaphore::new(cfg.slm_escalation_parallel.max(1) as usize)),
             ingest_slots: Arc::new(Semaphore::new(
                 (cfg.convert_workers.max(1) * 4).clamp(8, 64),
             )),
@@ -279,6 +338,13 @@ impl Pipeline {
             paused: Arc::new(AtomicBool::new(false)),
             model_versions,
         })
+    }
+
+    /// Consumed only by the `#[cfg(unix)]` fake-server tests; on a Windows
+    /// test build it would be dead code, which clippy denies.
+    #[cfg(all(test, unix))]
+    pub(crate) fn escalation_slots_available(&self) -> usize {
+        self.escalation_slots.available_permits()
     }
 
     fn emit_update(&self, sha: &str) {
@@ -681,26 +747,48 @@ impl Pipeline {
         // renaming a variant would silently change what is already stored with no
         // compiler error. It also allocated twice per file for three fixed
         // strings.
-        let route_name = match route {
-            Route::Native => "native",
-            Route::Scanned => "scanned",
-            Route::Flag => "flag",
-        };
+        let route_name = route_label(route);
         let _ = self
             .ledger
             .update_fields(&sha, &[("route", Some(route_name.to_string()))]);
 
         // ---- Convert (retry ladder row 1-2) --------------------------------
         let _ = self.ledger.mark_stage(&sha, "convert");
-        let conv = {
+        // A job resumed mid-flight (anything past Ingested) may already have
+        // a durable convert-stage cache from an earlier attempt on this same
+        // content. `try_resume_convert` is tolerant by construction: every
+        // failure — missing artifact, corrupt JSON, a knob that no longer
+        // matches this run — is `None`, exactly as normal as a cold cache,
+        // and falls straight through to the real convert/OCR round-trip
+        // below. A hit never touches `convert_slots`: no queue time charged,
+        // no convert budget consumed. See docs/superpowers/specs/
+        // 2026-08-05-resume-from-cache-design.md §4-5.
+        let cached = if resume_state != JobState::Ingested {
+            self.try_resume_convert(&sha, route)
+        } else {
+            None
+        };
+        let conv = if let Some(cached) = cached {
+            let _ = self
+                .ledger
+                .log_event(&sha, "convert", "cache hit: skipped convert/OCR");
+            log::info!("convert cache hit for {sha}");
+            ConvertResult {
+                markdown: cached.markdown,
+                doc_meta_dates: cached.doc_meta_dates,
+                ocr_used: false,
+                ocr_mean_conf: 0.0,
+                encrypted: false,
+                letterhead_resets: cached.letterhead_resets,
+            }
+        } else {
             // Queueing for a convert slot is backpressure, not this file's
             // work: `parked` credits the wait back to the deadline.
             let _permit = clock.parked(self.convert_slots.acquire()).await.unwrap();
-            self.convert_with_retries(&sha, &path, route, &clock).await
-        };
-        let conv = match conv {
-            Some(c) => c,
-            None => return, // already flagged inside
+            match self.convert_with_retries(&sha, &path, route, &clock).await {
+                Some(c) => c,
+                None => return, // already flagged inside
+            }
         };
         if conv.encrypted {
             self.flag(&sha, &path, "ENCRYPTED:password protected".into(), &clock)
@@ -717,15 +805,40 @@ impl Pipeline {
         if conv.letterhead_resets >= 2 {
             extra_soft.push("POSSIBLE_MULTIDOC".into());
         }
+
+        // Cache markdown (and its convert-meta provenance) for the review
+        // pane, Ettin training, and a future resume — written BEFORE
+        // advance(Converted) so a crash between the two never leaves
+        // state=converted with no cache file on disk (design §1: this used
+        // to be backwards). A write failure here does not cost this run —
+        // the document converted fine and can still be filtered/named/
+        // emitted — it only costs a future resume its cache hit, so it is
+        // logged and swallowed rather than flagging an otherwise-healthy
+        // document.
+        if let Err(error) = write_markdown_cache(&self.cfg.cache_dir, &sha, &conv.markdown) {
+            log::warn!("could not persist convert cache for {sha}: {error:#}");
+        }
+        let convert_meta = ConvertCacheMeta {
+            schema_version: CONVERT_CACHE_SCHEMA_VERSION,
+            route: route_name.to_string(),
+            max_head_pages: self.cfg.max_head_pages,
+            max_tail_pages: self.cfg.max_tail_pages,
+            convertd_version: self
+                .model_versions
+                .get("convertd")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            doc_meta_dates: conv.doc_meta_dates.clone(),
+            letterhead_resets: conv.letterhead_resets,
+        };
+        if let Err(error) = write_convert_meta(&self.cfg.cache_dir, &sha, &convert_meta) {
+            log::warn!("could not persist convert cache metadata for {sha}: {error:#}");
+        }
+
         if !self.advance(&sha, JobState::Converted) {
             return;
         }
         self.emit_update(&sha);
-
-        // Cache markdown for the review pane and Ettin training.
-        let cache = self.cfg.cache_dir.join(format!("{sha}.md"));
-        let _ = std::fs::create_dir_all(&self.cfg.cache_dir);
-        let _ = std::fs::write(&cache, &conv.markdown);
 
         // ---- Filter --------------------------------------------------------
         // build_evidence itself makes several blocking sidecar round-trips
@@ -857,6 +970,7 @@ impl Pipeline {
                 &meta_dates,
                 &modified_iso,
                 ettin_date.as_deref(),
+                &clock,
             )
             .await
         };
@@ -991,6 +1105,70 @@ impl Pipeline {
         self.emit_update(&sha);
     }
 
+    /// Attempt to reuse a previous CONVERT-stage result instead of paying for
+    /// convert/OCR again. Every failure mode — no cached markdown, no meta
+    /// file, a meta file that doesn't parse, or any knob that no longer
+    /// matches this run — collapses to `None`; the caller falls through to a
+    /// normal convert exactly as if the cache directory were empty. Never
+    /// returns `Err`, never flags: a miss here is precisely as ordinary as a
+    /// cold cache. See docs/superpowers/specs/
+    /// 2026-08-05-resume-from-cache-design.md §3 (validity gate) and §6
+    /// (corruption safety — this follows the same tolerant-read idiom as
+    /// `local_output::durable_transaction_exists`).
+    fn try_resume_convert(&self, sha: &str, route: Route) -> Option<CachedConvert> {
+        let markdown =
+            std::fs::read_to_string(convert_cache_path(&self.cfg.cache_dir, sha)).ok()?;
+        // Same floor `process_inner` applies to a just-converted document —
+        // a second, content-shaped defense against a torn `.md` that
+        // happened to read back without an IO error.
+        if markdown.trim().len() < 30 {
+            log::debug!("convert cache miss for {sha}: cached markdown below the 30-char floor");
+            return None;
+        }
+
+        let meta_bytes = std::fs::read(convert_meta_path(&self.cfg.cache_dir, sha)).ok()?;
+        let meta: ConvertCacheMeta = match serde_json::from_slice(&meta_bytes) {
+            Ok(m) => m,
+            Err(_) => {
+                log::debug!("convert cache miss for {sha}: convert-meta.json did not parse");
+                return None;
+            }
+        };
+
+        if meta.schema_version != CONVERT_CACHE_SCHEMA_VERSION {
+            log::debug!(
+                "convert cache miss for {sha}: schema version {} != {CONVERT_CACHE_SCHEMA_VERSION}",
+                meta.schema_version
+            );
+            return None;
+        }
+        let current_route = route_label(route);
+        if meta.route != current_route {
+            log::debug!(
+                "convert cache miss for {sha}: cached route {} != current route {current_route}",
+                meta.route
+            );
+            return None;
+        }
+        if meta.max_head_pages != self.cfg.max_head_pages
+            || meta.max_tail_pages != self.cfg.max_tail_pages
+        {
+            log::debug!("convert cache miss for {sha}: max_head_pages/max_tail_pages changed");
+            return None;
+        }
+        let current_convertd = self.model_versions.get("convertd").and_then(|v| v.as_str());
+        if meta.convertd_version.as_deref() != current_convertd {
+            log::debug!("convert cache miss for {sha}: convertd version changed");
+            return None;
+        }
+
+        Some(CachedConvert {
+            markdown,
+            doc_meta_dates: meta.doc_meta_dates,
+            letterhead_resets: meta.letterhead_resets,
+        })
+    }
+
     async fn convert_with_retries(
         &self,
         sha: &str,
@@ -1113,6 +1291,7 @@ impl Pipeline {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // same shape as filter.rs/ledger.rs precedents
     async fn name_with_retries(
         &self,
         sha: &str,
@@ -1121,6 +1300,7 @@ impl Pipeline {
         meta_dates: &[String],
         modified_iso: &str,
         ettin_date: Option<&str>,
+        clock: &WorkClock,
         // `Err` carries the code of the last rule that rejected, so the flag
         // reason can name it. `None` inside the `Err` means the ladder never got
         // a parseable proposal at all — a model or transport failure rather than
@@ -1133,6 +1313,18 @@ impl Pipeline {
         let doc_type_hint = ev.doc_type.as_deref().unwrap_or("unknown");
         for attempt in 1..=self.cfg.max_stage_attempts.max(1) {
             let (tier, bundle) = self.rung(attempt, ev);
+            // Gates concurrent Tier::Escalation HTTP calls independently of
+            // `slm_slots` (§7.3 of the lifecycle design). Held across both
+            // this attempt's call AND the span-mismatch re-prompt below,
+            // which reuses the same `tier` — released at the end of this
+            // loop iteration, before the next attempt acquires it again.
+            // Off the wall-clock cap, same as `slm_slots.acquire()` above.
+            let _escalation_permit = if tier == Tier::Escalation && !self.slm.escalation_collapsed()
+            {
+                Some(clock.parked(self.escalation_slots.acquire()).await.unwrap())
+            } else {
+                None
+            };
             let out = self
                 .slm
                 .name_document(
@@ -2330,36 +2522,52 @@ fn evidence_trace_path(cache_dir: &Path, sha: &str) -> PathBuf {
     cache_dir.join(format!("{sha}.evidence.json"))
 }
 
-/// Persist the reversible evidence-selection trace without ever exposing it to
-/// a partially written final path. The trace contains exact source text, so it
-/// follows the same retention lifecycle as the cached Markdown.
-fn write_evidence_trace(
+fn convert_cache_path(cache_dir: &Path, sha: &str) -> PathBuf {
+    cache_dir.join(format!("{sha}.md"))
+}
+
+fn convert_meta_path(cache_dir: &Path, sha: &str) -> PathBuf {
+    cache_dir.join(format!("{sha}.convert-meta.json"))
+}
+
+/// Persist `bytes` at `final_path` without ever exposing a partially written
+/// file there. `tag` names only this call's temp/backup files — it never
+/// appears in `final_path` itself — and must stay unique per artifact kind
+/// and sha so two concurrent writes for the same document cannot collide.
+///
+/// Windows `rename` does not replace an existing file, so a previous
+/// complete artifact is moved aside first and restored if the final rename
+/// fails. This is `write_evidence_trace`'s original dance, factored out so
+/// the cached markdown and its convert-meta sidecar share the exact same
+/// crash-safe write instead of a second, potentially-diverging copy of it.
+fn write_cache_file_atomic(
     cache_dir: &Path,
-    sha: &str,
-    trace: &filter::EvidenceTrace,
-) -> anyhow::Result<PathBuf> {
+    final_path: &Path,
+    tag: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(cache_dir)?;
 
-    let final_path = evidence_trace_path(cache_dir, sha);
-    let backup_path = cache_dir.join(format!("{sha}.evidence.json.bak"));
+    let mut backup_name = final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(tag)
+        .to_string();
+    backup_name.push_str(".bak");
+    let backup_path = cache_dir.join(backup_name);
+
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let temp_path = cache_dir.join(format!(
-        ".{sha}.evidence.{}.{}.tmp",
-        std::process::id(),
-        nonce
-    ));
+    let temp_path = cache_dir.join(format!(".{tag}.{}.{}.tmp", std::process::id(), nonce));
 
-    let mut encoded = serde_json::to_vec_pretty(trace)?;
-    encoded.push(b'\n');
     let write_result = (|| -> anyhow::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp_path)?;
-        file.write_all(&encoded)?;
+        file.write_all(bytes)?;
         file.flush()?;
         file.sync_all()?;
         Ok(())
@@ -2370,19 +2578,20 @@ fn write_evidence_trace(
     }
 
     // Windows rename does not replace an existing file. Move the previous
-    // complete trace aside first, then restore it if the final rename fails.
+    // complete artifact aside first, then restore it if the final rename
+    // fails.
     let had_previous = final_path.exists();
     if had_previous {
         let _ = std::fs::remove_file(&backup_path);
-        if let Err(error) = std::fs::rename(&final_path, &backup_path) {
+        if let Err(error) = std::fs::rename(final_path, &backup_path) {
             let _ = std::fs::remove_file(&temp_path);
             return Err(error.into());
         }
     }
 
-    if let Err(error) = std::fs::rename(&temp_path, &final_path) {
+    if let Err(error) = std::fs::rename(&temp_path, final_path) {
         if had_previous {
-            let _ = std::fs::rename(&backup_path, &final_path);
+            let _ = std::fs::rename(&backup_path, final_path);
         }
         let _ = std::fs::remove_file(&temp_path);
         return Err(error.into());
@@ -2390,6 +2599,56 @@ fn write_evidence_trace(
     if had_previous {
         let _ = std::fs::remove_file(&backup_path);
     }
+    Ok(())
+}
+
+/// Persist the reversible evidence-selection trace without ever exposing it to
+/// a partially written final path. The trace contains exact source text, so it
+/// follows the same retention lifecycle as the cached Markdown.
+fn write_evidence_trace(
+    cache_dir: &Path,
+    sha: &str,
+    trace: &filter::EvidenceTrace,
+) -> anyhow::Result<PathBuf> {
+    let final_path = evidence_trace_path(cache_dir, sha);
+    let mut encoded = serde_json::to_vec_pretty(trace)?;
+    encoded.push(b'\n');
+    write_cache_file_atomic(cache_dir, &final_path, &format!("{sha}.evidence"), &encoded)?;
+    Ok(final_path)
+}
+
+/// Cache the converted markdown for the review pane, Ettin training, and a
+/// future `Pipeline::try_resume_convert` — atomically, so a crash never
+/// leaves a torn file indistinguishable from a complete one. Called BEFORE
+/// `advance(&sha, JobState::Converted)`; see the ordering note at that call
+/// site.
+fn write_markdown_cache(cache_dir: &Path, sha: &str, markdown: &str) -> anyhow::Result<PathBuf> {
+    let final_path = convert_cache_path(cache_dir, sha);
+    write_cache_file_atomic(
+        cache_dir,
+        &final_path,
+        &format!("{sha}.md"),
+        markdown.as_bytes(),
+    )?;
+    Ok(final_path)
+}
+
+/// Persist CONVERT's cache provenance beside the markdown it describes. See
+/// `ConvertCacheMeta` and `Pipeline::try_resume_convert`.
+fn write_convert_meta(
+    cache_dir: &Path,
+    sha: &str,
+    meta: &ConvertCacheMeta,
+) -> anyhow::Result<PathBuf> {
+    let final_path = convert_meta_path(cache_dir, sha);
+    let mut encoded = serde_json::to_vec_pretty(meta)?;
+    encoded.push(b'\n');
+    write_cache_file_atomic(
+        cache_dir,
+        &final_path,
+        &format!("{sha}.convert-meta"),
+        &encoded,
+    )?;
     Ok(final_path)
 }
 
@@ -2423,8 +2682,11 @@ fn evidence_metric_detail(trace: &filter::EvidenceTrace) -> String {
 fn purge_cache_artifacts(cache_dir: &Path, sha: &str) {
     for path in [
         cache_dir.join(format!("{sha}.md")),
+        cache_dir.join(format!("{sha}.md.bak")),
         evidence_trace_path(cache_dir, sha),
         cache_dir.join(format!("{sha}.evidence.json.bak")),
+        convert_meta_path(cache_dir, sha),
+        cache_dir.join(format!("{sha}.convert-meta.json.bak")),
     ] {
         if let Err(error) = std::fs::remove_file(&path) {
             if error.kind() != std::io::ErrorKind::NotFound {
@@ -2440,6 +2702,7 @@ fn purge_cache_artifacts(cache_dir: &Path, sha: &str) {
 fn cache_artifact_sha(path: &Path) -> Option<&str> {
     let name = path.file_name()?.to_str()?;
     name.strip_suffix(".evidence.json")
+        .or_else(|| name.strip_suffix(".convert-meta.json"))
         .or_else(|| name.strip_suffix(".md"))
 }
 
@@ -2993,6 +3256,7 @@ pub fn sweep_cache_with_ledger(cache_dir: &Path, ttl_days: u64, ledger: &Ledger)
         let artifacts = [
             cache_dir.join(format!("{sha}.md")),
             evidence_trace_path(cache_dir, &sha),
+            convert_meta_path(cache_dir, &sha),
         ];
         let any_fresh = artifacts.iter().any(|path| {
             path.metadata()
@@ -3219,6 +3483,7 @@ fn manifest_id(content_sha: &str, relpath: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::slm::SlmTuning;
 
     #[test]
     fn manifest_id_is_fs_safe_and_path_case_insensitive() {
@@ -3358,10 +3623,12 @@ mod tests {
                 18137,
                 1,
                 2,
+                SlmTuning::default(),
             ));
             let pipeline = Arc::new(Pipeline {
                 convert_slots: Arc::new(Semaphore::new(1)),
                 slm_slots: Arc::new(Semaphore::new(1)),
+                escalation_slots: Arc::new(Semaphore::new(1)),
                 ingest_slots: Arc::new(Semaphore::new(8)),
                 inflight: Arc::new(Mutex::new(HashSet::new())),
                 pacer: Arc::new(Pacer::new(0)),
@@ -3386,6 +3653,7 @@ mod tests {
             Arc::new(Pipeline {
                 convert_slots: self.pipeline.convert_slots.clone(),
                 slm_slots: self.pipeline.slm_slots.clone(),
+                escalation_slots: self.pipeline.escalation_slots.clone(),
                 ingest_slots: self.pipeline.ingest_slots.clone(),
                 inflight: self.pipeline.inflight.clone(),
                 pacer: self.pipeline.pacer.clone(),
@@ -5207,6 +5475,11 @@ mod tests {
             cfg.llama_port,
             cfg.slm_parallel,
             cfg.slm_threads(),
+            SlmTuning {
+                escalation_parallel: cfg.slm_escalation_parallel,
+                recycle_after_requests: cfg.slm_recycle_after_requests,
+                escalation_idle_secs: cfg.slm_escalation_idle_secs,
+            },
         );
         let checker = crate::checker::Checker::new(cfg.max_filename_len);
 
@@ -5394,6 +5667,11 @@ mod tests {
             cfg.llama_port,
             cfg.slm_parallel,
             cfg.slm_threads(),
+            SlmTuning {
+                escalation_parallel: cfg.slm_escalation_parallel,
+                recycle_after_requests: cfg.slm_recycle_after_requests,
+                escalation_idle_secs: cfg.slm_escalation_idle_secs,
+            },
         ));
         let model_versions = sidecar.versions().unwrap_or_else(|_| json!({}));
         assert!(
@@ -5404,6 +5682,7 @@ mod tests {
         let pipeline = Arc::new(Pipeline {
             convert_slots: Arc::new(Semaphore::new(cfg.convert_workers.max(1))),
             slm_slots: Arc::new(Semaphore::new(cfg.slm_parallel.max(1) as usize)),
+            escalation_slots: Arc::new(Semaphore::new(cfg.slm_escalation_parallel.max(1) as usize)),
             ingest_slots: Arc::new(Semaphore::new(
                 (cfg.convert_workers.max(1) * 4).clamp(8, 64),
             )),
@@ -5685,6 +5964,7 @@ server.serve_forever()
                 18937,
                 1,
                 2,
+                SlmTuning::default(),
             )),
             cfg: h.pipeline.cfg.clone(),
             ledger: h.pipeline.ledger.clone(),
@@ -5692,6 +5972,7 @@ server.serve_forever()
             paused: h.pipeline.paused.clone(),
             convert_slots: convert_slots.clone(),
             slm_slots: Arc::new(Semaphore::new(1)),
+            escalation_slots: Arc::new(Semaphore::new(1)),
             ingest_slots: Arc::new(Semaphore::new(8)),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             pacer: Arc::new(Pacer::new(0)),
@@ -5766,6 +6047,7 @@ server.serve_forever()
             paused: h.pipeline.paused.clone(),
             convert_slots: Arc::new(Semaphore::new(1)),
             slm_slots: Arc::new(Semaphore::new(1)),
+            escalation_slots: Arc::new(Semaphore::new(1)),
             ingest_slots: Arc::new(Semaphore::new(8)),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             pacer: Arc::new(Pacer::new(0)),
@@ -5825,6 +6107,293 @@ server.serve_forever()
             .unwrap()
             .claimed_at
             .is_none());
+    }
+
+    /// Stands in for llama-server, tiered by which port it was started on:
+    /// the primary port always rejects (a date not present in the evidence),
+    /// the escalation port always accepts. `rung()` only escalates on the
+    /// 3rd attempt, so a file driven through this always burns two primary
+    /// attempts before landing on the escalation server — exactly the
+    /// "forced to escalate" shape `escalation_slots` needs a test for. The
+    /// escalation reply sleeps briefly to widen the window in which two
+    /// files' escalation attempts can genuinely overlap.
+    #[cfg(unix)]
+    fn fake_llama_server_tiered(primary_port: u16) -> String {
+        format!(
+            r##"#!/usr/bin/env python3
+import json, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PRIMARY_PORT = {primary_port}
+BAD = {{
+    "date": "1999-01-01",
+    "date_source": "document",
+    "subject": "Acme Corporation Invoice March",
+    "description": "Invoice from Acme Corporation covering March consulting services.",
+}}
+OK = {{
+    "date": "2024-03-05",
+    "date_source": "document",
+    "subject": "Acme Corporation Invoice March",
+    "description": "Invoice from Acme Corporation covering March consulting services.",
+}}
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def reply(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.reply({{"status": "ok"}})
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        name = BAD
+        if PORT != PRIMARY_PORT:
+            time.sleep(0.15)
+            name = OK
+        self.reply({{"choices": [{{"message": {{"content": json.dumps(name)}}}}]}})
+
+    def log_message(self, *args):
+        pass
+
+PORT = int(sys.argv[sys.argv.index("--port") + 1])
+server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+server.daemon_threads = True
+server.serve_forever()
+"##,
+            primary_port = primary_port
+        )
+    }
+
+    /// Stands in for llama-server: always proposes a date absent from the
+    /// evidence, so every naming attempt is a hard `DATE_NOT_IN_EVIDENCE`
+    /// rejection regardless of tier. Used for the collapsed-install test,
+    /// where a single physical server answers both tiers.
+    #[cfg(unix)]
+    const FAKE_LLAMA_SERVER_ALWAYS_REJECTS: &str = r##"#!/usr/bin/env python3
+import json, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BAD = {
+    "date": "1999-01-01",
+    "date_source": "document",
+    "subject": "Acme Corporation Invoice March",
+    "description": "Invoice from Acme Corporation covering March consulting services.",
+}
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def reply(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.reply({"status": "ok"})
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        time.sleep(0.08)
+        self.reply({"choices": [{"message": {"content": json.dumps(BAD)}}]})
+
+    def log_message(self, *args):
+        pass
+
+port = int(sys.argv[sys.argv.index("--port") + 1])
+server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+server.daemon_threads = True
+server.serve_forever()
+"##;
+
+    /// §7.3: `escalation_slots` (cap 1) must not deadlock against `slm_slots`
+    /// (cap 2) when two files hold a naming permit at once and both need to
+    /// escalate. Acquisition is one-directional — `slm_slots` before
+    /// `escalation_slots`, never the reverse (§5 rule 4) — so the excess
+    /// escalation attempt queues rather than hangs.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn escalation_slots_bounds_concurrency_without_deadlocking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = Harness::new();
+        let script = |name: &str, body: &str| {
+            let p = h.dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let convertd = script("fake-convertd-escalation-bound", FAKE_CONVERTD);
+        let primary_port: u16 = 18_957;
+        let llama = script(
+            "fake-llama-server-tiered",
+            &fake_llama_server_tiered(primary_port),
+        );
+        let primary_gguf = h.dir.path().join("primary-bound.gguf");
+        let escalation_gguf = h.dir.path().join("escalation-bound.gguf");
+        for gguf in [&primary_gguf, &escalation_gguf] {
+            std::fs::write(gguf, b"").unwrap();
+        }
+
+        let slm = Arc::new(SlmLane::new(
+            llama,
+            String::new(),
+            primary_gguf,
+            escalation_gguf,
+            primary_port,
+            1,
+            2,
+            SlmTuning::default(),
+        ));
+        let pipeline = Arc::new(Pipeline {
+            sidecar: Arc::new(Sidecar::with_timeout(
+                convertd,
+                std::time::Duration::from_secs(30),
+            )),
+            slm,
+            cfg: h.pipeline.cfg.clone(),
+            ledger: h.pipeline.ledger.clone(),
+            app: None,
+            paused: h.pipeline.paused.clone(),
+            convert_slots: Arc::new(Semaphore::new(2)),
+            slm_slots: Arc::new(Semaphore::new(2)),
+            escalation_slots: Arc::new(Semaphore::new(1)),
+            ingest_slots: Arc::new(Semaphore::new(8)),
+            inflight: Arc::new(Mutex::new(HashSet::new())),
+            pacer: Arc::new(Pacer::new(0)),
+            model_versions: json!({ "convertd": "test" }),
+        });
+
+        let (sha_a, path_a) = h.seed("vendor/a.txt", QUEUED_DOCUMENT);
+        let (sha_b, path_b) = h.seed("vendor/b.txt", QUEUED_DOCUMENT);
+
+        let run = async {
+            tokio::join!(
+                pipeline.clone().process_file(path_a.clone()),
+                pipeline.clone().process_file(path_b.clone())
+            );
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("two escalating files must not deadlock on the escalation cap");
+
+        for sha in [&sha_a, &sha_b] {
+            let job = pipeline
+                .ledger
+                .get(sha)
+                .unwrap()
+                .expect("the job must exist");
+            assert_eq!(
+                job.state,
+                JobState::Emitted,
+                "both files must reach a terminal state (reason: {:?})",
+                job.flag_reason
+            );
+        }
+    }
+
+    /// §7.4 regression: a collapsed install (escalation resolves onto the
+    /// same physical server as primary) must never touch `escalation_slots`
+    /// — if the `!self.slm.escalation_collapsed()` guard in
+    /// `name_with_retries` were ever dropped, this would observe the permit
+    /// count fall below its starting value while attempt 3 (Tier::Escalation)
+    /// is in flight.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn escalation_slots_not_acquired_when_collapsed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = Harness::new();
+        let script = |name: &str, body: &str| {
+            let p = h.dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let convertd = script("fake-convertd-collapsed", FAKE_CONVERTD);
+        let llama = script(
+            "fake-llama-server-collapsed",
+            FAKE_LLAMA_SERVER_ALWAYS_REJECTS,
+        );
+        let shared_gguf = h.dir.path().join("shared.gguf");
+        std::fs::write(&shared_gguf, b"").unwrap();
+
+        let slm = Arc::new(SlmLane::new(
+            llama,
+            String::new(),
+            shared_gguf.clone(),
+            shared_gguf,
+            18_967,
+            1,
+            2,
+            SlmTuning::default(),
+        ));
+        assert!(slm.escalation_collapsed());
+
+        let pipeline = Arc::new(Pipeline {
+            sidecar: Arc::new(Sidecar::with_timeout(
+                convertd,
+                std::time::Duration::from_secs(30),
+            )),
+            slm,
+            cfg: h.pipeline.cfg.clone(),
+            ledger: h.pipeline.ledger.clone(),
+            app: None,
+            paused: h.pipeline.paused.clone(),
+            convert_slots: Arc::new(Semaphore::new(1)),
+            slm_slots: Arc::new(Semaphore::new(1)),
+            escalation_slots: Arc::new(Semaphore::new(1)),
+            ingest_slots: Arc::new(Semaphore::new(8)),
+            inflight: Arc::new(Mutex::new(HashSet::new())),
+            pacer: Arc::new(Pacer::new(0)),
+            model_versions: json!({ "convertd": "test" }),
+        });
+
+        let (sha, path) = h.seed("vendor/collapsed.txt", QUEUED_DOCUMENT);
+
+        let min_seen = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let monitor_pipeline = pipeline.clone();
+        let monitor_min = min_seen.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let monitor_stop = stop.clone();
+        let monitor = tokio::spawn(async move {
+            while !monitor_stop.load(Ordering::Relaxed) {
+                let available = monitor_pipeline.escalation_slots_available();
+                monitor_min.fetch_min(available, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        pipeline.clone().process_file(path.clone()).await;
+        stop.store(true, Ordering::Relaxed);
+        monitor.await.unwrap();
+
+        assert_eq!(
+            min_seen.load(Ordering::Relaxed),
+            1,
+            "a collapsed install must never acquire escalation_slots"
+        );
+
+        let job = pipeline
+            .ledger
+            .get(&sha)
+            .unwrap()
+            .expect("the job must exist");
+        assert_eq!(
+            job.state,
+            JobState::Flagged,
+            "every attempt rejects in this fixture, so the file must be flagged, not stuck"
+        );
     }
 
     /// P3: two flagged documents sharing a leaf name must both survive. The
@@ -6014,6 +6583,352 @@ server.serve_forever()
         assert!(
             !destination.exists(),
             "a failed move must not leave a quarantine duplicate"
+        );
+    }
+
+    // ---- resume-from-cache (CONVERT-skip, Phase 1) -------------------------
+    // docs/superpowers/specs/2026-08-05-resume-from-cache-design.md
+
+    /// Write a `{sha}.md` + `{sha}.convert-meta.json` pair that
+    /// `try_resume_convert` will accept as-is for `h`'s own config and
+    /// `model_versions`. `tweak` runs after the matching defaults are built,
+    /// so a single knob can be pushed out of alignment to prove the gate
+    /// actually inspects it.
+    fn write_valid_convert_cache_with(
+        h: &Harness,
+        sha: &str,
+        route: Route,
+        tweak: impl FnOnce(&mut ConvertCacheMeta),
+    ) {
+        std::fs::create_dir_all(&h.pipeline.cfg.cache_dir).unwrap();
+        write_markdown_cache(
+            &h.pipeline.cfg.cache_dir,
+            sha,
+            "# Cached Document\n\nThis markdown stands in for a previous convert/OCR pass.",
+        )
+        .unwrap();
+        let mut meta = ConvertCacheMeta {
+            schema_version: CONVERT_CACHE_SCHEMA_VERSION,
+            route: route_label(route).to_string(),
+            max_head_pages: h.pipeline.cfg.max_head_pages,
+            max_tail_pages: h.pipeline.cfg.max_tail_pages,
+            convertd_version: h
+                .pipeline
+                .model_versions
+                .get("convertd")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            doc_meta_dates: vec!["2024-03-05".to_string()],
+            letterhead_resets: 0,
+        };
+        tweak(&mut meta);
+        write_convert_meta(&h.pipeline.cfg.cache_dir, sha, &meta).unwrap();
+    }
+
+    fn write_valid_convert_cache(h: &Harness, sha: &str, route: Route) {
+        write_valid_convert_cache_with(h, sha, route, |_| {});
+    }
+
+    #[test]
+    fn try_resume_convert_hits_on_a_fully_matching_cache_pair() {
+        let h = Harness::new();
+        write_valid_convert_cache(&h, "match1", Route::Native);
+
+        let cached = h
+            .pipeline
+            .try_resume_convert("match1", Route::Native)
+            .expect("every knob matches; this must be a hit");
+        assert_eq!(
+            cached.markdown,
+            "# Cached Document\n\nThis markdown stands in for a previous convert/OCR pass."
+        );
+        assert_eq!(cached.doc_meta_dates, vec!["2024-03-05".to_string()]);
+        assert_eq!(cached.letterhead_resets, 0);
+    }
+
+    #[test]
+    fn try_resume_convert_never_touches_the_sidecar_on_a_hit() {
+        let h = Harness::new();
+        write_valid_convert_cache(&h, "quiet", Route::Native);
+
+        let before = h.pipeline.sidecar.call_count();
+        assert!(h
+            .pipeline
+            .try_resume_convert("quiet", Route::Native)
+            .is_some());
+        assert_eq!(
+            h.pipeline.sidecar.call_count(),
+            before,
+            "a cache hit must never call the sidecar for convert/OCR"
+        );
+    }
+
+    #[test]
+    fn try_resume_convert_misses_without_cached_markdown() {
+        let h = Harness::new();
+        std::fs::create_dir_all(&h.pipeline.cfg.cache_dir).unwrap();
+        write_convert_meta(
+            &h.pipeline.cfg.cache_dir,
+            "nomd",
+            &ConvertCacheMeta {
+                schema_version: CONVERT_CACHE_SCHEMA_VERSION,
+                route: "native".into(),
+                max_head_pages: h.pipeline.cfg.max_head_pages,
+                max_tail_pages: h.pipeline.cfg.max_tail_pages,
+                convertd_version: Some("test".into()),
+                doc_meta_dates: vec![],
+                letterhead_resets: 0,
+            },
+        )
+        .unwrap();
+
+        assert!(h
+            .pipeline
+            .try_resume_convert("nomd", Route::Native)
+            .is_none());
+    }
+
+    #[test]
+    fn try_resume_convert_misses_without_meta() {
+        let h = Harness::new();
+        std::fs::create_dir_all(&h.pipeline.cfg.cache_dir).unwrap();
+        write_markdown_cache(
+            &h.pipeline.cfg.cache_dir,
+            "nometa",
+            "a cached document body well past the thirty character floor",
+        )
+        .unwrap();
+
+        assert!(h
+            .pipeline
+            .try_resume_convert("nometa", Route::Native)
+            .is_none());
+    }
+
+    #[test]
+    fn try_resume_convert_misses_below_the_thirty_char_floor() {
+        let h = Harness::new();
+        write_valid_convert_cache(&h, "short", Route::Native);
+        // Overwrite with a torn/short body after the valid pair was written.
+        write_markdown_cache(&h.pipeline.cfg.cache_dir, "short", "too short").unwrap();
+
+        assert!(h
+            .pipeline
+            .try_resume_convert("short", Route::Native)
+            .is_none());
+    }
+
+    #[test]
+    fn try_resume_convert_misses_on_garbage_meta_without_panicking() {
+        let h = Harness::new();
+        std::fs::create_dir_all(&h.pipeline.cfg.cache_dir).unwrap();
+        write_markdown_cache(
+            &h.pipeline.cfg.cache_dir,
+            "garbage",
+            "a cached document body well past the thirty character floor",
+        )
+        .unwrap();
+        std::fs::write(
+            convert_meta_path(&h.pipeline.cfg.cache_dir, "garbage"),
+            b"{ this is not json",
+        )
+        .unwrap();
+
+        assert!(h
+            .pipeline
+            .try_resume_convert("garbage", Route::Native)
+            .is_none());
+    }
+
+    #[test]
+    fn try_resume_convert_misses_on_each_mismatched_knob_individually() {
+        let h = Harness::new();
+
+        write_valid_convert_cache_with(&h, "schema", Route::Native, |m| {
+            m.schema_version = CONVERT_CACHE_SCHEMA_VERSION + 1;
+        });
+        assert!(
+            h.pipeline
+                .try_resume_convert("schema", Route::Native)
+                .is_none(),
+            "a schema version bump must be a miss"
+        );
+
+        write_valid_convert_cache(&h, "route", Route::Native);
+        assert!(
+            h.pipeline
+                .try_resume_convert("route", Route::Scanned)
+                .is_none(),
+            "a route computed differently this run must be a miss"
+        );
+
+        write_valid_convert_cache_with(&h, "head", Route::Native, |m| {
+            m.max_head_pages += 1;
+        });
+        assert!(
+            h.pipeline
+                .try_resume_convert("head", Route::Native)
+                .is_none(),
+            "a changed max_head_pages must be a miss"
+        );
+
+        write_valid_convert_cache_with(&h, "tail", Route::Native, |m| {
+            m.max_tail_pages += 1;
+        });
+        assert!(
+            h.pipeline
+                .try_resume_convert("tail", Route::Native)
+                .is_none(),
+            "a changed max_tail_pages must be a miss"
+        );
+
+        write_valid_convert_cache_with(&h, "convertd", Route::Native, |m| {
+            m.convertd_version = Some("stale-version".into());
+        });
+        assert!(
+            h.pipeline
+                .try_resume_convert("convertd", Route::Native)
+                .is_none(),
+            "an upgraded convertd must be a miss"
+        );
+    }
+
+    #[test]
+    fn try_resume_convert_hits_when_every_knob_matches() {
+        let h = Harness::new();
+        write_valid_convert_cache(&h, "allgood", Route::Scanned);
+        assert!(h
+            .pipeline
+            .try_resume_convert("allgood", Route::Scanned)
+            .is_some());
+    }
+
+    /// The realistic kill-mid-name shape: CONVERT and FILTER already paid
+    /// for, then the process died before NAME finished. Seeding at
+    /// `Filtered` is the honest restart point (§8.2 of the design doc) —
+    /// `Named` is only a few instructions wide, covered separately below for
+    /// completeness. FILTER's own sidecar calls are individually
+    /// fallback-tolerant (`filter::build_evidence` never hard-fails on a
+    /// missing sidecar), so this run legitimately proceeds past FILTER and
+    /// only flags once NAME's ladder exhausts against the harness's
+    /// nonexistent llama-server — the point of this test is entirely about
+    /// what happened (or didn't) at the CONVERT stage before that.
+    #[tokio::test]
+    async fn resume_from_cache_skips_convert_when_seeded_at_filtered() {
+        let h = Harness::new();
+        let rel = "resume/invoice.pdf";
+        let (sha, path) = h.seed(rel, "source bytes only used to compute the content hash");
+        h.pipeline
+            .ledger
+            .set_state(&sha, JobState::Filtered)
+            .unwrap();
+        write_valid_convert_cache(&h, &sha, Route::Native);
+
+        h.pipeline.clone().process_file(path).await;
+
+        let events = h.pipeline.ledger.events_for(&sha, 50).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.stage == "convert" && e.detail.contains("cache hit")),
+            "expected a convert-stage cache-hit event: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.stage == "convert"
+                && e.detail.contains("attempt")
+                && e.detail.contains("failed")),
+            "a cache hit must never attempt a real convert/OCR round-trip: {events:?}"
+        );
+    }
+
+    /// Narrow variant of the above: `Named` is set only after a validated
+    /// attempt, a few instructions before `Validated` — the design calls it
+    /// out separately because it is easy to assume the gate only ever fires
+    /// from `Filtered`. Same two assertions; the gate cares only that the
+    /// resume state is not `Ingested`.
+    #[tokio::test]
+    async fn resume_from_cache_skips_convert_when_seeded_at_named() {
+        let h = Harness::new();
+        let rel = "resume/named.pdf";
+        let (sha, path) = h.seed(rel, "source bytes only used to compute the content hash");
+        h.pipeline.ledger.set_state(&sha, JobState::Named).unwrap();
+        write_valid_convert_cache(&h, &sha, Route::Native);
+
+        h.pipeline.clone().process_file(path).await;
+
+        let events = h.pipeline.ledger.events_for(&sha, 50).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.stage == "convert" && e.detail.contains("cache hit")),
+            "expected a convert-stage cache-hit event: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.stage == "convert"
+                && e.detail.contains("attempt")
+                && e.detail.contains("failed")),
+            "a cache hit must never attempt a real convert/OCR round-trip: {events:?}"
+        );
+    }
+
+    /// A corrupt (or merely absent) cache must fall through to a real
+    /// convert rather than getting the job stuck: `try_resume_convert`
+    /// returns `None`, `convert_slots` is acquired normally, and
+    /// `convert_with_retries` runs its full ladder against the harness's
+    /// nonexistent convertd exe — the same "attempt N failed" trail (and
+    /// eventual CONVERT_FAIL/UNREADABLE flag) any cold job gets. Proves the
+    /// resume path is tolerant, not just optimistic.
+    #[tokio::test]
+    async fn resume_from_cache_falls_back_to_a_real_convert_on_corrupt_cache() {
+        let h = Harness::new();
+        let rel = "resume/corrupt.pdf";
+        let (sha, path) = h.seed(rel, "source bytes only used to compute the content hash");
+        h.pipeline
+            .ledger
+            .set_state(&sha, JobState::Filtered)
+            .unwrap();
+        std::fs::create_dir_all(&h.pipeline.cfg.cache_dir).unwrap();
+        write_markdown_cache(
+            &h.pipeline.cfg.cache_dir,
+            &sha,
+            "a cached document body well past the thirty character floor",
+        )
+        .unwrap();
+        std::fs::write(
+            convert_meta_path(&h.pipeline.cfg.cache_dir, &sha),
+            b"{ this is not json",
+        )
+        .unwrap();
+
+        let before = h.pipeline.sidecar.call_count();
+        h.pipeline.clone().process_file(path).await;
+        let after = h.pipeline.sidecar.call_count();
+
+        assert!(
+            after > before,
+            "a corrupt cache must fall through to real convert/OCR attempts"
+        );
+        let events = h.pipeline.ledger.events_for(&sha, 50).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.stage == "convert" && e.detail.contains("attempt 1 failed")),
+            "expected a real first convert attempt to fail: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.stage == "convert" && e.detail.contains("cache hit")),
+            "a corrupt cache must never be reported as a hit: {events:?}"
+        );
+        let job = h.pipeline.ledger.get(&sha).unwrap().unwrap();
+        assert_eq!(job.state, JobState::Flagged);
+        assert!(
+            job.flag_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("CONVERT_FAIL") || r.starts_with("UNREADABLE")),
+            "expected a convert-stage flag reason, got {:?}",
+            job.flag_reason
         );
     }
 
@@ -7023,6 +7938,52 @@ server.serve_forever()
         );
     }
 
+    /// The crash-safety fix at the heart of the design: the cached markdown
+    /// (and its convert-meta sidecar) must be a full temp+rename replacement
+    /// like `write_evidence_trace`, never a plain in-place `std::fs::write` —
+    /// and a successful replacement must not leave its `.bak` behind.
+    #[test]
+    fn markdown_cache_and_convert_meta_are_atomic_replacements() {
+        let dir = tempfile::tempdir().unwrap();
+
+        write_markdown_cache(dir.path(), "sha1", "first body over thirty characters long").unwrap();
+        write_markdown_cache(
+            dir.path(),
+            "sha1",
+            "second body over thirty characters long",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sha1.md")).unwrap(),
+            "second body over thirty characters long"
+        );
+        assert!(
+            !dir.path().join("sha1.md.bak").exists(),
+            "a successful replacement must not retain a second copy"
+        );
+
+        let meta = ConvertCacheMeta {
+            schema_version: CONVERT_CACHE_SCHEMA_VERSION,
+            route: "native".into(),
+            max_head_pages: 10,
+            max_tail_pages: 3,
+            convertd_version: Some("test".into()),
+            doc_meta_dates: vec![],
+            letterhead_resets: 0,
+        };
+        write_convert_meta(dir.path(), "sha1", &meta).unwrap();
+        let mut replacement = meta.clone();
+        replacement.letterhead_resets = 3;
+        write_convert_meta(dir.path(), "sha1", &replacement).unwrap();
+
+        let stored: ConvertCacheMeta = serde_json::from_slice(
+            &std::fs::read(dir.path().join("sha1.convert-meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.letterhead_resets, 3);
+        assert!(!dir.path().join("sha1.convert-meta.json.bak").exists());
+    }
+
     #[test]
     fn cache_purge_removes_markdown_and_trace_together() {
         let dir = tempfile::tempdir().unwrap();
@@ -7033,6 +7994,23 @@ server.serve_forever()
 
         assert!(!dir.path().join("abc.md").exists());
         assert!(!dir.path().join("abc.evidence.json").exists());
+    }
+
+    /// §8.4 of the resume-from-cache design: `.convert-meta.json` is a third
+    /// cache artifact and must be purged alongside the markdown and trace it
+    /// was written beside, or it leaks forever on a resolved job.
+    #[test]
+    fn cache_purge_removes_convert_meta_alongside_markdown_and_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("abc.md"), "raw document text").unwrap();
+        std::fs::write(dir.path().join("abc.evidence.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("abc.convert-meta.json"), "{}").unwrap();
+
+        purge_cache_artifacts(dir.path(), "abc");
+
+        assert!(!dir.path().join("abc.md").exists());
+        assert!(!dir.path().join("abc.evidence.json").exists());
+        assert!(!dir.path().join("abc.convert-meta.json").exists());
     }
 
     #[test]
@@ -7092,6 +8070,52 @@ server.serve_forever()
         assert!(
             !cache.join("4444.md").exists() && !cache.join("4444.evidence.json").exists(),
             "a genuine orphan's text and trace must go"
+        );
+    }
+
+    /// Same shape as the sweep test above, isolated to `.convert-meta.json`
+    /// so a regression there can't hide behind the `.md`/`.evidence.json`
+    /// assertions passing. §8.4 of the design: missing this wiring means the
+    /// new artifact leaks forever on every resolved job.
+    #[test]
+    fn the_cache_sweep_purges_convert_meta_for_resolved_jobs_and_orphans() {
+        let h = Harness::new();
+        let cache = &h.pipeline.cfg.cache_dir;
+        let ledger = &h.pipeline.ledger;
+
+        for (sha, state) in [
+            ("aaaa", Some(JobState::Flagged)),
+            ("bbbb", Some(JobState::Converted)),
+            ("cccc", Some(JobState::Emitted)),
+            ("dddd", None), // orphan: no ledger row at all
+        ] {
+            std::fs::write(cache.join(format!("{sha}.md")), "# cached document text").unwrap();
+            std::fs::write(cache.join(format!("{sha}.convert-meta.json")), "{}").unwrap();
+            if let Some(state) = state {
+                ledger
+                    .ingest(sha, "C:/P/x.pdf", "x.pdf", "x.pdf", "pdf")
+                    .unwrap();
+                ledger.set_state(sha, state).unwrap();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        sweep_cache_with_ledger(cache, 0, ledger);
+
+        assert!(
+            cache.join("aaaa.convert-meta.json").exists(),
+            "a flagged job's convert cache metadata must survive its TTL"
+        );
+        assert!(
+            cache.join("bbbb.convert-meta.json").exists(),
+            "an in-flight job's convert cache metadata must survive"
+        );
+        assert!(
+            !cache.join("cccc.convert-meta.json").exists(),
+            "a delivered job's convert cache metadata must go"
+        );
+        assert!(
+            !cache.join("dddd.convert-meta.json").exists(),
+            "an orphaned convert cache metadata file must go"
         );
     }
 
