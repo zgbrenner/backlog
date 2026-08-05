@@ -40,6 +40,12 @@ const MAX_STDERR_LINE_BYTES: usize = 16 * 1024;
 /// per-process cap keeps exactly the part that explains a failure.
 const MAX_LOGGED_STDERR_LINES: usize = 2000;
 
+/// Of those, how many stay at INFO. Startup output — the banner, a port
+/// conflict, a traceback — arrives first and is the part worth keeping in
+/// the default log; after this the stream is per-request narration and drops
+/// to DEBUG.
+const STDERR_INFO_LINES: usize = 40;
+
 #[cfg(not(windows))]
 fn terminate_pid(pid: u32) -> bool {
     const SIGKILL: i32 = 9;
@@ -181,8 +187,18 @@ pub fn log_child_stderr(
                             continue;
                         }
                         logged += 1;
+                        // Startup diagnostics (the port conflict, the bad
+                        // GGUF, the traceback) land in the first few dozen
+                        // lines and stay at INFO. Everything after is request
+                        // narration — llama-server prints several lines per
+                        // slot per request — which at INFO drowned genuine
+                        // pipeline milestones in the rotating log. It stays
+                        // reachable with RUST_LOG=debug.
                         match logged.cmp(&max_lines) {
-                            std::cmp::Ordering::Less => log::info!("{label}: {line}"),
+                            std::cmp::Ordering::Less if logged <= STDERR_INFO_LINES => {
+                                log::info!("{label}: {line}")
+                            }
+                            std::cmp::Ordering::Less => log::debug!("{label}: {line}"),
                             std::cmp::Ordering::Equal => log::info!(
                                 "{label}: {line} (further output from this process suppressed)"
                             ),

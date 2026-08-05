@@ -25,12 +25,20 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
-/// Rotate at 4 MB and keep one previous generation: enough to hold a whole
+/// Rotate at 16 MB and keep one previous generation: enough to hold a whole
 /// multi-thousand-file backfill's warnings, small enough to paste into an
-/// email if it comes to that.
-const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
+/// email if it comes to that. (4 MB until 0.8.1; child-process narration now
+/// lands at DEBUG, so the extra headroom goes to pipeline milestones.)
+const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Log lines queued for the writer thread before callers start dropping
+/// instead of blocking. Sized for a burst (a whole batch flagging at once),
+/// not for sustained narration — that lives at DEBUG now.
+const LOG_QUEUE_LINES: usize = 4096;
 
 /// Folders whose *names* are the sensitive part: the OneDrive Processing root
 /// ("2024 Terminations"), Quarantine, Outbox, the cache, and the app-data dir
@@ -249,8 +257,25 @@ impl Write for RotatingFile {
 /// Buffering also fixes the UTF-8 half of the same bug: `from_utf8_lossy` on a
 /// one-byte slice turns every byte of a multi-byte character into U+FFFD, so
 /// non-ASCII filenames were being mangled on the way in.
+enum LogMsg {
+    Line(Vec<u8>),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+/// The caller side never touches the file. Until 0.8.1 every `log::` call in
+/// the app wrote to `RotatingFile` synchronously under one shared Mutex — so
+/// one `write()` syscall stalled by an antivirus scan or a backup filter on
+/// `%APPDATA%` held the lock forever, and every other thread's next log call
+/// blocked behind it. The app kept processing; logging silently froze
+/// app-wide until the next restart. That is exactly the observed "log died
+/// mid-run at 30 KB while the pipeline kept working."
+///
+/// Now a caller only line-buffers, and hands complete lines to a bounded
+/// channel with `try_send`: a stalled writer costs dropped lines (counted and
+/// reported once the writer recovers), never a blocked caller.
 struct SharedSink {
-    file: Arc<Mutex<RotatingFile>>,
+    tx: std::sync::mpsc::SyncSender<LogMsg>,
+    dropped: Arc<AtomicU64>,
     /// Bytes since the last newline. Held back until the line is complete, so
     /// `scrub` always sees a whole record and never a split character.
     pending: Vec<u8>,
@@ -258,21 +283,51 @@ struct SharedSink {
 
 impl SharedSink {
     fn new(file: Arc<Mutex<RotatingFile>>) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LogMsg>(LOG_QUEUE_LINES);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let drops = dropped.clone();
+        // A panic anywhere in the app poisons the file lock and the panic
+        // hook then wants to log — recover through the poison rather than
+        // take the process down for a log line.
+        let _ = std::thread::Builder::new()
+            .name("backlog-log-writer".into())
+            .spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        LogMsg::Line(bytes) => {
+                            let lost = drops.swap(0, Ordering::Relaxed);
+                            let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
+                            if lost > 0 {
+                                let _ = writeln!(
+                                    file,
+                                    "[logging] dropped {lost} lines while the log writer was stalled"
+                                );
+                            }
+                            // Scrub here, off every caller's path.
+                            let scrubbed = scrub(&String::from_utf8_lossy(&bytes));
+                            let _ = file.write_all(scrubbed.as_bytes());
+                        }
+                        LogMsg::Flush(ack) => {
+                            let _ = file.lock().unwrap_or_else(|e| e.into_inner()).flush();
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            });
         Self {
-            file,
+            tx,
+            dropped,
             pending: Vec::new(),
         }
     }
 
-    /// Scrub `bytes` and put them in the file. A panic anywhere in the app
-    /// poisons this lock and the panic hook then wants to log — recover
-    /// through the poison rather than take the process down for a log line.
-    fn emit(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        let scrubbed = scrub(&String::from_utf8_lossy(bytes));
-        self.file
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .write_all(scrubbed.as_bytes())
+    /// Queue one complete record for the writer. Never blocks: a full queue
+    /// means the writer is stalled on disk, and waiting here would recreate
+    /// the app-wide logging freeze this design exists to prevent.
+    fn emit(&mut self, bytes: Vec<u8>) {
+        if self.tx.try_send(LogMsg::Line(bytes)).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -281,7 +336,7 @@ impl Write for SharedSink {
         self.pending.extend_from_slice(buf);
         if let Some(last) = self.pending.iter().rposition(|b| *b == b'\n') {
             let complete: Vec<u8> = self.pending.drain(..=last).collect();
-            self.emit(&complete)?;
+            self.emit(complete);
         }
         // Report the caller's byte count, not the redacted one: a short write
         // would send `write_all` round again with an offset into a buffer that
@@ -294,9 +349,17 @@ impl Write for SharedSink {
         // the last line before shutdown — must still reach the file, scrubbed.
         if !self.pending.is_empty() {
             let rest = std::mem::take(&mut self.pending);
-            self.emit(&rest)?;
+            self.emit(rest);
         }
-        self.file.lock().unwrap_or_else(|e| e.into_inner()).flush()
+        // Wait (bounded) for the writer to drain what was queued above, so a
+        // panic hook's last words and a test's assertions see a durable file.
+        // If the writer is genuinely stuck on disk, give up rather than hang
+        // whoever is flushing — that is the old deadlock wearing a new hat.
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        if self.tx.try_send(LogMsg::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+        }
+        Ok(())
     }
 }
 
