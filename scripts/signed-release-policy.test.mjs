@@ -80,46 +80,20 @@ test("the normal release workflow is structurally signed-only", () => {
   assert.match(String(publish.run), /--latest/);
 });
 
-test("v0.8.0 has a one-time exact-tag signed repair workflow", () => {
+test("the retired v0.8.0 repair workflow stays retired", () => {
+  // The repair workflow rebuilt the immutable v0.8.0 tag and verified its
+  // updater signature against the public key EMBEDDED IN THAT TAG'S BUILD
+  // (F6BB6D5A6C3954C6). The private half of that key was lost and the
+  // updater key was rotated for 0.8.1 (199849F4EB9588F7), so the repair can
+  // never verify again -- it would only burn a Windows runner on every main
+  // push and end red. Existing v0.8.0 installations upgrade by one manual
+  // download, as CHANGELOG.md's 0.8.1 Security note records.
   const relativePath = ".github/workflows/repair-v0.8.0.yml";
-  assert.equal(existsSync(path.join(root, relativePath)), true, `${relativePath} must exist`);
-  const source = read(relativePath);
-  const workflow = parse(source);
-
-  assert.ok(workflow?.jobs?.preflight, "repair preflight job must exist");
-  assert.ok(workflow?.jobs?.repair, "repair build job must exist");
-  assert.equal(workflow.jobs.repair["runs-on"], "windows-2022");
-  assert.equal(workflow.jobs.repair?.permissions?.contents, "write");
-  assert.equal(workflow.env.REPAIR_TAG, "v0.8.0");
   assert.equal(
-    workflow.env.REPAIR_SHA,
-    "74e31fbd2b31ad99ceaf5390bb27fb197fc706a7",
+    existsSync(path.join(root, relativePath)),
+    false,
+    `${relativePath} is retired; a repair against a lost key cannot succeed`,
   );
-
-  const steps = Array.isArray(workflow.jobs.repair.steps)
-    ? workflow.jobs.repair.steps
-    : [];
-  const byName = namedSteps(workflow.jobs.repair);
-  const requireKey = byName.get("Require the established updater private key");
-  const signatureCheck = byName.get(
-    "Verify updater signature against embedded public key",
-  );
-  const promote = byName.get(
-    "Replace assets and promote the same immutable release",
-  );
-  assert.ok(requireKey);
-  assert.ok(signatureCheck);
-  assert.ok(promote);
-  assert.ok(steps.indexOf(signatureCheck) < steps.indexOf(promote));
-
-  assert.match(source, /ref:\s*\$\{\{ env\.REPAIR_TAG \}\}/);
-  assert.match(source, /TAURI_SIGNING_PRIVATE_KEY:\s*\$\{\{ secrets\.TAURI_SIGNING_PRIVATE_KEY \}\}/);
-  assert.match(source, /refusing to rotate or replace the updater key/i);
-  assert.match(source, /assert-release-tag\.ps1/);
-  assert.match(source, /verify_updater_signature/);
-  assert.match(source, /gh release upload.*--clobber/s);
-  assert.match(source, /gh release edit.*--prerelease=false.*--latest/s);
-  assert.doesNotMatch(source, /git tag\s+-f|update-ref.*refs\/tags|gh release delete/);
 });
 
 test("the release checklist requires all four signed downloadable assets", () => {
