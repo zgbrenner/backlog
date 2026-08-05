@@ -220,6 +220,28 @@ fn default_convert_workers() -> usize {
     by_cpu.min(convert_workers_ram_ceiling(total_ram_gib()))
 }
 
+impl Config {
+    /// Threads each llama-server child may use.
+    ///
+    /// llama.cpp defaults `--threads` to every logical core when the flag is
+    /// absent — and BackLog runs up to two servers (primary + escalation)
+    /// beside `convert_workers` Python processes carrying their own ONNX
+    /// thread pools. Letting every party claim every core is how a 12-core
+    /// machine ends up an order of magnitude slower end-to-end than the
+    /// single-lane SIZING.md baseline: the naming servers and the converters
+    /// spend the whole batch preempting each other. Leave the convert
+    /// workers their cores; two is the floor a server needs to stay
+    /// responsive.
+    pub fn slm_threads(&self) -> usize {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        cores
+            .saturating_sub(self.convert_workers)
+            .clamp(2, cores.max(2))
+    }
+}
+
 /// How many `convertd` workers installed RAM can hold.
 ///
 /// This became a real constraint the moment `Sidecar` grew a process pool.
