@@ -517,8 +517,7 @@ impl Pipeline {
                             // This wait is exclusively for another delivery's
                             // terminal transition. Do not spend this copy's
                             // own wall-clock work budget on it.
-                            let wait =
-                                (next_retry - now).min(DEFERRED_DUPLICATE_SHUTDOWN_POLL);
+                            let wait = (next_retry - now).min(DEFERRED_DUPLICATE_SHUTDOWN_POLL);
                             clock.parked(tokio::time::sleep(wait)).await;
                         }
                     }
@@ -1250,21 +1249,15 @@ impl Pipeline {
                     || match copy_then_remove(path, &dest) {
                         Ok(()) => true,
                         Err(e) => {
-                            log::error!(
-                                "failed to quarantine a duplicate of a reviewed file: {e}"
-                            );
-                            let _ = self.ledger.log_event(
-                                sha,
-                                "ingest",
-                                "DUPLICATE_QUARANTINE_FAILED",
-                            );
+                            log::error!("failed to quarantine a duplicate of a reviewed file: {e}");
+                            let _ =
+                                self.ledger
+                                    .log_event(sha, "ingest", "DUPLICATE_QUARANTINE_FAILED");
                             false
                         }
                     };
                 if moved {
-                    log::warn!(
-                        "quarantined a same-content copy of a file already under review"
-                    );
+                    log::warn!("quarantined a same-content copy of a file already under review");
                     let _ = self.ledger.log_event(
                         sha,
                         "ingest",

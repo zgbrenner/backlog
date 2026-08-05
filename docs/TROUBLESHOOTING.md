@@ -135,6 +135,7 @@ They deliberately carry no document text — see `docs/PRIVACY.md`.
 |---|---|
 | `PANIC` / `TIMEOUT` / `ENCRYPTED` / `ERROR` | Value-free classification of a failed conversion attempt. The full message goes to the app log, never to the ledger, because the raw error embeds the document's full path. |
 | `QUARANTINE_FAILED` | BackLog could not move the flagged file into Quarantine. **The source file is still in Processing and is safe.** Check the Quarantine folder's permissions. |
+| `DUPLICATE_QUARANTINE_FAILED` | A copy of a file already waiting in Needs Review arrived, and BackLog could not move that copy into Quarantine next to its original. **The copy is still in Processing and is safe.** Check the Quarantine folder's permissions, then drop the copy in again. |
 | `RESTORE_FAILED` | You approved a corrected name, but BackLog could not continue the delivery from Quarantine. In Local folder mode it files from Quarantine into Local Output; in Power Automate mode it prepares the handoff again. Check the selected output folder and Quarantine permissions, then Try again. |
 
 ## Still stuck
