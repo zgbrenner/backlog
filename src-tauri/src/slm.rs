@@ -476,6 +476,7 @@ impl SlmLane {
              - subject: exactly `<short form> - <party>`, at most 8 words, for example `Form 8829 - Marcus Alvarez`. Use the short identifier (Form 8829, Schedule E, K-1, W-2, 941, 1120S), never the form's full legal title. Name the one party the document belongs to, once, and never omit it.\n\
              - subject: add nothing else — no tax year, no EIN, no address, no generic word such as Document or Scan, and never the labels Taxpayer or Entity.\n\
              - description: exactly ONE sentence, 15 to 200 characters, adding useful information beyond the subject. It must end with a single full stop. Do not write a second sentence, and do not stop mid-sentence.\n\
+             - description: begin with the document type or action itself, for example `Shareholder's register transferring 40,000 shares to John Smith.` — never open with `The document`, `This document`, or `The file`.\n\
              Never invent dates, parties, or facts."
         );
         if let Some(violation) = violation_note {
