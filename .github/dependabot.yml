@@ -1,0 +1,56 @@
+# Dependabot version updates. Security-only updates are a repository setting;
+# this file adds scheduled version-update PRs on top. Every PR Dependabot opens
+# still has to pass full CI, and the release pipeline gates on ci.yml success,
+# so nothing here can reach a release unreviewed or block one.
+#
+# Deliberately NOT listed: sidecar/requirements.lock and
+# sidecar/build-requirements.lock. Dependabot's pip ecosystem does not
+# recognize those filenames as manifests (an entry pointing at /sidecar would
+# just produce failed "no dependency files found" runs). New advisories
+# against them are caught by the pip-audit job in
+# .github/workflows/security-audit.yml instead.
+version: 2
+updates:
+  # Keeps the SHA-pinned actions fresh; Dependabot rewrites the pinned SHA and
+  # the trailing `# vX` comment together.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+
+  - package-ecosystem: cargo
+    directory: "/src-tauri"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    # The Tauri stack moves as one unit; grouping patch/minor keeps the PR
+    # stream reviewable for one person.
+    groups:
+      cargo-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    groups:
+      npm-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # power-automate/requirements-dev.txt (jsonschema, used by the manifest
+  # contract tests) is a filename Dependabot does recognize.
+  - package-ecosystem: pip
+    directory: "/power-automate"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
