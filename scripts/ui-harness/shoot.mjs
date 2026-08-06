@@ -353,6 +353,51 @@ const CHECKS = [
     },
   },
   {
+    name: "naming instructions accept typing and survive an output-mode switch",
+    async run(page) {
+      await boot(page, "ready");
+      await page.getByRole("tab", { name: "Settings" }).click();
+      await page.getByRole("heading", { name: "Folders" }).waitFor({ state: "visible", timeout: 5000 });
+      const notes = page.locator('[name="custom_naming_notes"]');
+      const problems = [];
+      if (!(await notes.isVisible())) {
+        problems.push("the Naming instructions textarea is missing from Settings");
+        return problems;
+      }
+      if ((await notes.getAttribute("maxlength")) !== "600") {
+        problems.push(`naming instructions maxlength is ${JSON.stringify(await notes.getAttribute("maxlength"))}, not 600`);
+      }
+      await notes.fill("Prefer the client's company name as the party.");
+      const mode = page.locator('[name="output_mode"]');
+      await mode.selectOption("local");
+      await mode.selectOption("power_automate");
+      if ((await notes.inputValue()) !== "Prefer the client's company name as the party.") {
+        problems.push(`switching output modes rewrote the guidance to ${JSON.stringify(await notes.inputValue())}`);
+      }
+      return problems;
+    },
+  },
+  {
+    name: "the Power Automate step-by-step guide follows the delivery mode",
+    async run(page) {
+      await boot(page, "ready");
+      await page.getByRole("tab", { name: "Settings" }).click();
+      await page.getByRole("heading", { name: "Folders" }).waitFor({ state: "visible", timeout: 5000 });
+      const problems = [];
+      const guide = page.locator("details.pa-guide");
+      if (!(await guide.isVisible())) {
+        problems.push("Power Automate mode did not offer the step-by-step guide");
+      } else if (!/How to connect Power Automate \(step-by-step\)/.test(await guide.locator("summary").innerText())) {
+        problems.push("the guide summary lost its title");
+      }
+      await boot(page, "local-ready");
+      if (await page.locator("details.pa-guide").isVisible()) {
+        problems.push("Local mode still showed the Power Automate guide");
+      }
+      return problems;
+    },
+  },
+  {
     name: "first-run Local Output saves the selected mode and does not require Outbox",
     async run(page) {
       await boot(page, "first-run-save");

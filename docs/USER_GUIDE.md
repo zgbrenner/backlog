@@ -10,13 +10,15 @@ to install it.
 
 ## 1. Install one file - or use the no-installer package
 
-For the normal per-user install, download **`BackLog_0.8.0_x64-setup.exe`**
-from the [BackLog v0.8.0 release page](https://github.com/zgbrenner/backlog/releases)
+For the normal per-user install, download the Windows x64 setup installer
+(named `BackLog_<version>_x64-setup.exe`) from the
+[latest BackLog release page](https://github.com/zgbrenner/backlog/releases/latest)
 and double-click it. This is the only required download.
 
 If you are moving BackLog to another Windows x64 laptop and do not want an
-installer, download **`BackLog_0.8.0_x64-portable.zip`**, extract it completely,
-and double-click **`BackLog-Portable.cmd`**. The portable ZIP includes its own
+installer, download the portable package (named
+`BackLog_<version>_x64-portable.zip`) from the same release page, extract it
+completely, and double-click **`BackLog-Portable.cmd`**. The portable ZIP includes its own
 fixed WebView2 runtime and does not require a separate runtime, Python, VC++
 Redistributable, administrator password, or model download to launch. Keep the
 extracted folder together. See [`PORTABLE.md`](PORTABLE.md) for the short
@@ -101,6 +103,23 @@ download result remains visible if you leave Settings and come back.
 Document processing itself remains local and works offline. The only routine
 network operations are this optional model download and the startup update
 check.
+
+### Naming instructions (optional)
+
+Settings has a **Naming instructions** box where you can tell the naming model
+what you care about — for example "Prefer the client's company name as the
+party" or "Use Invoice rather than Bill". It is advisory guidance only:
+BackLog's safety checks still verify every name. Dates must exist in the
+document, personal numbers are never allowed, and made-up names are rejected —
+no instruction can turn those checks off. There is no separate reset; to remove
+the guidance, clear the box and save your settings.
+
+### In-app Power Automate directions
+
+In **Power Automate / SharePoint** mode, Settings now contains step-by-step
+directions for the maker building the flows: open **How to connect Power
+Automate (step-by-step)** under the Power Automate heading. The full copy-paste
+build guide remains [`power-automate/BUILD-GUIDE.md`](../power-automate/BUILD-GUIDE.md).
 
 ## 3. Daily use
 

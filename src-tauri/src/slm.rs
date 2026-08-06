@@ -161,6 +161,13 @@ pub struct SlmLane {
     recycle_after_requests: u32,
     /// 0 disables escalation idle-reaping (resident for process lifetime).
     escalation_idle_secs: u64,
+    /// Operator naming preferences (`Config::custom_naming_notes`), set via
+    /// `with_naming_notes` and appended to the system prompt as a
+    /// subordinate section by `build_system_prompt`. Empty — the default —
+    /// leaves the measured core prompt byte-identical. Not a `SlmTuning`
+    /// field: that struct is built with exhaustive literals in `pipeline.rs`
+    /// e2e tests, which a new field would break.
+    naming_notes: String,
     /// Reset to 0 on every successful (re)spawn of the primary server.
     primary_requests_served: AtomicU64,
     /// Requests currently dispatched to the live primary child.
@@ -239,11 +246,20 @@ impl SlmLane {
                 .expect("localhost HTTP client"),
             recycle_after_requests: tuning.recycle_after_requests,
             escalation_idle_secs: tuning.escalation_idle_secs,
+            naming_notes: String::new(),
             primary_requests_served: AtomicU64::new(0),
             primary_inflight: AtomicU64::new(0),
             escalation_inflight: AtomicU64::new(0),
             escalation_last_completion: Mutex::new(None),
         }
+    }
+
+    /// Attach the operator's `custom_naming_notes`. Builder-style so the
+    /// positional `SlmLane::new` calls in tests stay untouched; the two real
+    /// pipelines in `lib.rs` chain this with the value from `Config`.
+    pub fn with_naming_notes(mut self, notes: String) -> Self {
+        self.naming_notes = notes;
+        self
     }
 
     /// Pure argument construction, split out so ctx-size/parallel-per-tier is
@@ -636,16 +652,22 @@ impl SlmLane {
         Ok(&trimmed[start..=end])
     }
 
-    pub async fn name_document(
-        &self,
-        tier: Tier,
-        evidence: &str,
-        doc_type: &str,
+    /// The naming system prompt, split out as a pure helper so tests can
+    /// assert its exact bytes without a live llama-server (mirrors the
+    /// `request_body` and `server_args` splits above).
+    ///
+    /// `naming_notes` is the operator's `Config::custom_naming_notes`: when
+    /// non-empty after trimming it is appended AFTER the core rules as an
+    /// explicitly subordinate section, and BEFORE the violation note so the
+    /// correction stays the last, most salient instruction. When empty the
+    /// core prompt stays byte-identical — its shape is measured (see below)
+    /// and must not drift for operators who configured nothing.
+    fn build_system_prompt(
         language: &str,
+        doc_type: &str,
+        naming_notes: &str,
         violation_note: Option<&str>,
-    ) -> anyhow::Result<SlmOutput> {
-        let (port, _serve_guard) = self.ensure_up(tier).await?;
-
+    ) -> String {
         // The two `subject` rules below are the measured shape, and the length of
         // this prompt is a throughput decision as much as a quality one.
         //
@@ -703,11 +725,36 @@ impl SlmLane {
              - description: begin with the document type or action itself, for example `Shareholder's register transferring 40,000 shares to John Smith.` — never open with `The document`, `This document`, or `The file`.\n\
              Never invent dates, parties, or facts."
         );
+        let notes = naming_notes.trim();
+        if !notes.is_empty() {
+            // Subordinate by construction: the section names itself as
+            // preferences and defers to the rules above, and it carries no
+            // concrete example filenames of its own unless the operator
+            // typed them — the parrot risk documented above is theirs to
+            // weigh, the core rules stay structural.
+            system.push_str(&format!(
+                "\nOperator preferences (apply them only where they do not conflict with the rules above):\n{notes}"
+            ));
+        }
         if let Some(violation) = violation_note {
             system.push_str(&format!(
                 "\nA prior proposal was rejected by the deterministic validator: {violation}. Correct that exact problem."
             ));
         }
+        system
+    }
+
+    pub async fn name_document(
+        &self,
+        tier: Tier,
+        evidence: &str,
+        doc_type: &str,
+        language: &str,
+        violation_note: Option<&str>,
+    ) -> anyhow::Result<SlmOutput> {
+        let (port, _serve_guard) = self.ensure_up(tier).await?;
+        let system =
+            Self::build_system_prompt(language, doc_type, &self.naming_notes, violation_note);
 
         let body = Self::request_body(&system, evidence);
         let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
@@ -901,6 +948,63 @@ mod tests {
     fn isolates_json_from_template_noise() {
         let value = "<think></think>\n```json\n{\"date\":\"none\"}\n```";
         assert_eq!(SlmLane::json_object(value).unwrap(), "{\"date\":\"none\"}");
+    }
+
+    #[test]
+    fn system_prompt_includes_operator_section_verbatim_when_notes_are_set() {
+        let notes = "Prefer the client surname over the firm name.";
+        let prompt = SlmLane::build_system_prompt("en", "invoice", notes, None);
+        assert!(prompt.contains(
+            "\nOperator preferences (apply them only where they do not \
+             conflict with the rules above):\nPrefer the client surname over \
+             the firm name."
+        ));
+        // Notes only ever append: everything before them is the untouched
+        // core prompt, byte for byte.
+        let core = SlmLane::build_system_prompt("en", "invoice", "", None);
+        assert!(prompt.starts_with(&core));
+        assert!(prompt.ends_with(notes));
+    }
+
+    #[test]
+    fn system_prompt_is_byte_identical_when_notes_are_empty() {
+        let prompt = SlmLane::build_system_prompt("en", "invoice", "", None);
+        // No trace of the operator section — not even its header.
+        assert!(!prompt.contains("Operator preferences"));
+        // The measured core prompt still ends on its own closing rule.
+        assert!(prompt.ends_with("Never invent dates, parties, or facts."));
+        // Whitespace-only notes are unset notes, not an empty section.
+        assert_eq!(
+            SlmLane::build_system_prompt("en", "invoice", " \n\t ", None),
+            prompt
+        );
+    }
+
+    #[test]
+    fn operator_notes_precede_the_violation_note() {
+        let prompt = SlmLane::build_system_prompt(
+            "en",
+            "invoice",
+            "Use short client names.",
+            Some("subject exceeded eight words"),
+        );
+        let notes_at = prompt
+            .find("\nOperator preferences (apply them only where they do not conflict with the rules above):\nUse short client names.")
+            .expect("operator section present");
+        let violation_at = prompt
+            .find("\nA prior proposal was rejected by the deterministic validator: subject exceeded eight words. Correct that exact problem.")
+            .expect("violation note present");
+        assert!(
+            notes_at < violation_at,
+            "the correction must stay the last, most salient instruction"
+        );
+    }
+
+    #[test]
+    fn with_naming_notes_stores_the_operator_notes_on_the_lane() {
+        let with_notes = lane(19_337).with_naming_notes("prefer surnames".to_string());
+        assert_eq!(with_notes.naming_notes, "prefer surnames");
+        assert_eq!(lane(19_338).naming_notes, "");
     }
 
     fn lane(base_port: u16) -> SlmLane {

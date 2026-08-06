@@ -55,6 +55,10 @@ type Config = {
   output_mode?: OutputMode;
   local_output_dir?: string;
   quarantine_dir: string;
+  /** Advisory operator preferences folded into the naming model's prompt.
+   *  Default "", max 600 chars. The safety validators still gate every name:
+   *  no instruction here can loosen them. */
+  custom_naming_notes: string;
   cache_dir: string;
   llama_port: number;
   slm_primary_gguf: string;
@@ -2591,6 +2595,56 @@ function buildSettings(): Node[] {
       ${folder("Quarantine folder — files that need review wait here", "quarantine_dir",
         "Stays on this computer; it is never synced.")}
 
+      <section class="naming-notes">
+        <h2>Naming instructions</h2>
+        <label class="wide">Optional guidance for the naming model
+          <textarea name="custom_naming_notes" maxlength="600" rows="3" spellcheck="true" placeholder="Example: Prefer the client's company name as the party.">${esc(String(c.custom_naming_notes ?? ""))}</textarea>
+          <span class="field-note">Optional. Tell the naming model what you care about —
+            for example "Prefer the client's company name as the party" or "Use Invoice
+            rather than Bill". BackLog's safety checks still verify every name: dates must
+            exist in the document, personal numbers are never allowed, and made-up names
+            are rejected — no instruction can turn those off. There is no separate reset:
+            clearing this box and saving removes the guidance.</span>
+        </label>
+      </section>
+
+      <div class="mode-folder pa-guide-section" data-output-mode="power_automate" ${initialMode === "power_automate" ? "" : "hidden"}>
+        <h2>Power Automate</h2>
+        <details class="pa-guide">
+          <summary>How to connect Power Automate (step-by-step)</summary>
+          <div class="pa-guide-body">
+            <p class="dim-note">You will build two cloud flows at make.powerautomate.com:
+              Flow 1 moves each new SharePoint file into the Processing folder, and Flow 2
+              reads each finished manifest from Outbox/_manifests and files the renamed
+              document into SharePoint.</p>
+            <ol>
+              <li>In OneDrive for Business, create the folders <code>/BackLog/Processing</code>,
+                <code>/BackLog/Processed</code> and <code>/BackLog/Outbox/_manifests</code>, then sync
+                Processing and Outbox to this computer — Quarantine stays local and is never synced.</li>
+              <li>In SharePoint, create the document libraries <code>Intake</code> and
+                <code>Archive</code> (plus the <code>/Archive/_backlog-staging</code> folder) and the
+                lists <code>DocumentIndex</code>, <code>NeedsReview</code> and <code>_pa_errors</code>.</li>
+              <li>Flow 1: trigger "When a file is created (properties only)" on Intake with
+                concurrency 1, copy the file content into a deterministic per-item subfolder under
+                OneDrive Processing, delete the SharePoint source only after the copy succeeds, and
+                never rename the file.</li>
+              <li>Flow 2: trigger on new files in Outbox/_manifests with concurrency 1, use
+                Parse JSON with the schema from the repository's power-automate folder, treat
+                <code>manifest_id</code> as the idempotency key (never the file hash), and delete
+                the manifest last.</li>
+              <li>Add a scheduled recovery sweep every 15 minutes for manifests older than ten
+                minutes, because a corrected manifest reuses the same path and will not re-trigger
+                Flow 2.</li>
+              <li>Test before scale: drop one document through end-to-end, watch it arrive in
+                Archive and DocumentIndex, and only then raise Flow 2 parallelism to 4 if you want
+                more throughput.</li>
+            </ol>
+            <p class="dim-note">Full copy-paste build guide: the power-automate folder in the
+              BackLog repository on GitHub — <span class="repo-url">https://github.com/zgbrenner/backlog/tree/main/power-automate</span></p>
+          </div>
+        </details>
+      </div>
+
       <details class="advanced">
         <summary>Advanced — you shouldn't need to change these</summary>
         <div class="advanced-body">
@@ -2727,6 +2781,10 @@ async function saveConfigFromForm(): Promise<void> {
     ? "local"
     : "power_automate";
   next.output_mode = mode;
+  // Trimmed, not path-normalized: this is prose for the naming model, not a
+  // path, and stripping a quoted example the operator typed would be wrong.
+  const notes = form.querySelector<HTMLTextAreaElement>('[name="custom_naming_notes"]');
+  if (notes) next.custom_naming_notes = notes.value.trim();
   for (const key of ["processing_dir", "outbox_dir", "local_output_dir", "quarantine_dir", "slm_primary_gguf",
     "slm_escalation_gguf", "ettin_model_dir"] as const) {
     const value = text(key);
@@ -2748,8 +2806,10 @@ async function saveConfigFromForm(): Promise<void> {
     // and may clamp values, and a user whose displayed settings differ from
     // what was stored has a wrong mental model of their own configuration.
     cfg = await invoke<Config>("get_config");
+    // The [name=…] lookup deliberately matches any form control, so the
+    // naming-notes textarea gets the same normalized read-back as the inputs.
     for (const [key, value] of Object.entries(cfg)) {
-      const input = form.querySelector<HTMLInputElement>(`[name="${key}"]`);
+      const input = form.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[name="${key}"]`);
       if (input && input.value !== String(value)) input.value = String(value);
     }
     // The backend drops its cached preflight result on every save (paths may

@@ -32,6 +32,7 @@ const CONFIG = {
   output_mode: "power_automate",
   local_output_dir: "C:\\Users\\dana\\Documents\\BackLog\\Filed",
   quarantine_dir: "C:\\ProgramData\\BackLog\\Quarantine",
+  custom_naming_notes: "",
   cache_dir: "C:\\Users\\dana\\AppData\\Roaming\\ai.sonomos.backlog\\cache",
   llama_port: 8137,
   slm_primary_gguf: "C:\\ProgramData\\BackLog\\models\\Qwen3-0.6B-Q8_0.gguf",
