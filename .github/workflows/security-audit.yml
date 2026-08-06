@@ -40,7 +40,7 @@ jobs:
     name: Rust advisories (cargo-audit)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Built from source with --locked so the audit tool itself is pinned and
       # reproducible; rustup honors the repo's rust-toolchain.toml (1.94.1),
       # exactly as ci.yml relies on it.
@@ -62,7 +62,7 @@ jobs:
     name: npm advisories (audit-level=high)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -80,7 +80,7 @@ jobs:
     name: Python advisories (pip-audit)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # 3.11 to match the interpreter the sidecar actually ships against
       # (ci.yml documents why: onnxruntime/rapidocr wheel availability).
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
