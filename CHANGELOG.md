@@ -15,6 +15,27 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.9.1] — dependency hygiene
+
+### Fixed
+
+- The sidecar's transitive `cryptography` pin moves from 49.0.0 to 50.0.0,
+  closing PYSEC-2026-3552 (CVE-2026-69247, a PKCS#7 EnvelopedData
+  Bleichenbacher oracle). The vulnerable path was never called by the
+  sidecar; the pip-audit ignore that documented that reasoning is deleted
+  on exactly the removal condition it recorded, so the audit now runs with
+  zero ignores. Verified against the pinned Python 3.11: the lockfile
+  installs cleanly and `pdfminer.six` — the sole consumer — imports
+  against 50.0.0.
+
+### Changed
+
+- Playwright (UI-harness tooling only, not shipped) 1.62.0 → 1.62.1.
+- The 0.9.0 feature set was live-validated end-to-end on the installed
+  build after release: 33-file corpus, 33/33 accounted, 4.9 receipts/min,
+  operator naming instructions obeyed with zero instruction-text
+  parroting and no throughput cost.
+
 ## [0.9.0] — the operator gets a say
 
 ### Added
