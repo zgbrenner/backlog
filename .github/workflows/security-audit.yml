@@ -94,20 +94,12 @@ jobs:
       # All three files are audited in one step with the failure aggregated at
       # the end, so the first finding never hides a second one in another file.
       #
-      # Ignored advisories (each needs a reason and an owner-visible record):
-      #   PYSEC-2026-3552 (CVE-2026-69247 / GHSA-g6cj-pr64-35w5):
-      #     cryptography 49.0.0 PKCS#7 EnvelopedData decryption Bleichenbacher
-      #     oracle; fixed in 50.0.0. cryptography enters the lock only as a
-      #     transitive dependency of pdfminer.six, which uses it for encrypted
-      #     PDF payloads — the sidecar never calls pkcs7_decrypt_* and never
-      #     auto-decrypts attacker-supplied S/MIME, so the oracle is not
-      #     reachable. Remove this ignore when the lockfile moves to
-      #     cryptography >= 50.0.0.
+      # No ignored advisories. If one ever has to be added, record the
+      # advisory ID, why it is unreachable, and the condition for removing it.
       - name: Audit Python dependency manifests
         run: |
           status=0
-          pip-audit -r sidecar/requirements.lock --no-deps \
-            --ignore-vuln PYSEC-2026-3552 || status=1
+          pip-audit -r sidecar/requirements.lock --no-deps || status=1
           pip-audit -r sidecar/build-requirements.lock --no-deps || status=1
           pip-audit -r power-automate/requirements-dev.txt --no-deps || status=1
           exit "$status"
