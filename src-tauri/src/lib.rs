@@ -1230,23 +1230,26 @@ async fn review_only_pipeline(
             Sidecar::with_timeout(sidecar_exe, review_probe_timeout(&cfg))
                 .with_models_dir(models_dir),
         );
-        let slm = Arc::new(SlmLane::new(
-            llama_exe,
-            grammar,
-            cfg.slm_primary_gguf.clone(),
-            cfg.effective_escalation_gguf().to_path_buf(),
-            // SlmLane derives the escalation port as `port + 1`; a hand-edited
-            // config that never went through Config::validate must not be able
-            // to overflow that add.
-            cfg.llama_port.min(u16::MAX - 1),
-            cfg.slm_parallel,
-            cfg.slm_threads(),
-            SlmTuning {
-                escalation_parallel: cfg.slm_escalation_parallel,
-                recycle_after_requests: cfg.slm_recycle_after_requests,
-                escalation_idle_secs: cfg.slm_escalation_idle_secs,
-            },
-        ));
+        let slm = Arc::new(
+            SlmLane::new(
+                llama_exe,
+                grammar,
+                cfg.slm_primary_gguf.clone(),
+                cfg.effective_escalation_gguf().to_path_buf(),
+                // SlmLane derives the escalation port as `port + 1`; a hand-edited
+                // config that never went through Config::validate must not be able
+                // to overflow that add.
+                cfg.llama_port.min(u16::MAX - 1),
+                cfg.slm_parallel,
+                cfg.slm_threads(),
+                SlmTuning {
+                    escalation_parallel: cfg.slm_escalation_parallel,
+                    recycle_after_requests: cfg.slm_recycle_after_requests,
+                    escalation_idle_secs: cfg.slm_escalation_idle_secs,
+                },
+            )
+            .with_naming_notes(cfg.custom_naming_notes.clone()),
+        );
         // No idle reaper here on purpose: this pipeline is throwaway (one
         // resubmit, then dropped), and its `Arc<SlmLane>`'s natural `Drop`
         // (this path exits normally, unlike the real app's
@@ -1342,20 +1345,23 @@ async fn start_pipeline(
     // never call `.with_idle_reap`, so this is unreachable behavior change
     // for them by construction.
     sidecar.spawn_idle_reaper();
-    let slm = Arc::new(SlmLane::new(
-        binary(&app, "llama-server")?,
-        grammar,
-        cfg.slm_primary_gguf.clone(),
-        cfg.effective_escalation_gguf().to_path_buf(),
-        cfg.llama_port,
-        cfg.slm_parallel,
-        cfg.slm_threads(),
-        SlmTuning {
-            escalation_parallel: cfg.slm_escalation_parallel,
-            recycle_after_requests: cfg.slm_recycle_after_requests,
-            escalation_idle_secs: cfg.slm_escalation_idle_secs,
-        },
-    ));
+    let slm = Arc::new(
+        SlmLane::new(
+            binary(&app, "llama-server")?,
+            grammar,
+            cfg.slm_primary_gguf.clone(),
+            cfg.effective_escalation_gguf().to_path_buf(),
+            cfg.llama_port,
+            cfg.slm_parallel,
+            cfg.slm_threads(),
+            SlmTuning {
+                escalation_parallel: cfg.slm_escalation_parallel,
+                recycle_after_requests: cfg.slm_recycle_after_requests,
+                escalation_idle_secs: cfg.slm_escalation_idle_secs,
+            },
+        )
+        .with_naming_notes(cfg.custom_naming_notes.clone()),
+    );
     // `start_pipeline` is itself `async fn` and calls this directly (not
     // `spawn_blocking`), so the reaper's `tokio::spawn` has a live reactor to
     // land on. `_idle_reaper`'s `JoinHandle` is intentionally dropped

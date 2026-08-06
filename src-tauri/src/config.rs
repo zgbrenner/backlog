@@ -86,6 +86,13 @@ pub struct Config {
     pub slm_escalation_idle_secs: u64,
     /// Max evidence tokens (approximate, chars/4) sent to the SLM.
     pub evidence_token_budget: usize,
+    /// Operator-supplied naming preferences appended to the SLM system prompt
+    /// as a subordinate "Operator preferences" section (see
+    /// `SlmLane::build_system_prompt`). Empty — the default — leaves the
+    /// measured core prompt byte-identical. `normalize` unifies line endings
+    /// and strips control characters; `validate` caps the trimmed text at
+    /// 600 characters rather than truncating it silently.
+    pub custom_naming_notes: String,
 
     /// Optional fine-tuned Ettin token classifier directory (HF format).
     /// Empty string disables the Ettin lane gracefully.
@@ -156,6 +163,7 @@ impl Default for Config {
             slm_recycle_after_requests: 64,
             slm_escalation_idle_secs: 600,
             evidence_token_budget: 1500,
+            custom_naming_notes: String::new(),
             ettin_model_dir: String::new(),
             convert_workers: default_convert_workers(),
             convert_min_idle_workers: 1,
@@ -272,6 +280,21 @@ fn normalize_path_text(text: &str) -> String {
         })
         .unwrap_or(trimmed);
     unquoted.trim().to_string()
+}
+
+/// Clean operator naming notes: unify `\r\n` and bare `\r` line endings into
+/// `\n` first (so a Windows paste keeps its line breaks), then drop every
+/// control character except that newline, then trim. Deliberately no
+/// truncation — an over-long value must fail `validate` loudly instead of
+/// being shortened behind the operator's back.
+fn normalize_naming_notes(raw: &str) -> String {
+    let unified = raw.replace("\r\n", "\n").replace('\r', "\n");
+    unified
+        .chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn default_convert_workers() -> usize {
@@ -635,6 +658,7 @@ impl Config {
             *dir = normalize_path(dir);
         }
         self.ettin_model_dir = normalize_path_text(&self.ettin_model_dir);
+        self.custom_naming_notes = normalize_naming_notes(&self.custom_naming_notes);
     }
 
     /// Model path used for escalation attempts in this runtime.
@@ -834,6 +858,16 @@ impl Config {
             return Err(format!(
                 "evidence_token_budget must be between 1 and 16384; got {}.",
                 self.evidence_token_budget
+            ));
+        }
+        // Trimmed length, so padding whitespace never fails a value the
+        // operator sees as short enough. The cap keeps the operator section a
+        // subordinate note — the system prompt is re-sent on every naming
+        // attempt, so unbounded notes would tax every document named.
+        let naming_notes_chars = self.custom_naming_notes.trim().chars().count();
+        if naming_notes_chars > 600 {
+            return Err(format!(
+                "custom naming notes must be at most 600 characters; got {naming_notes_chars}."
             ));
         }
         if self.convert_workers == 0 || self.convert_workers > 8 {
@@ -1448,6 +1482,51 @@ mod tests {
         assert_eq!(cfg.output_mode, OutputMode::PowerAutomate);
         assert!(cfg.local_output_dir.as_os_str().is_empty());
         assert!(cfg.ready());
+    }
+
+    #[test]
+    fn custom_naming_notes_default_is_empty() {
+        assert_eq!(Config::default().custom_naming_notes, "");
+    }
+
+    #[test]
+    fn custom_naming_notes_cap_accepts_600_and_rejects_601_chars() {
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.custom_naming_notes = "a".repeat(600);
+        assert!(c.validate().is_ok());
+        c.custom_naming_notes = "a".repeat(601);
+        let error = c.validate().unwrap_err();
+        assert!(error.contains("custom naming notes"), "{error}");
+        // The cap applies to the trimmed text, so padding whitespace never
+        // fails a value the operator sees as exactly 600 characters.
+        c.custom_naming_notes = format!("  {}  ", "a".repeat(600));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn normalize_strips_control_characters_from_naming_notes() {
+        let mut c = Config {
+            custom_naming_notes: "  keep\r\nlines\rtogether\u{7}\u{0} neat\t stuff  ".into(),
+            ..Default::default()
+        };
+        c.normalize();
+        // \r\n and bare \r became \n; the bell, NUL, and tab were dropped;
+        // the padding was trimmed. No truncation happened.
+        assert_eq!(c.custom_naming_notes, "keep\nlines\ntogether neat stuff");
+    }
+
+    #[test]
+    fn config_json_without_naming_notes_loads_with_empty_default() {
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"processing_dir":"P:/processing","outbox_dir":"P:/outbox","quarantine_dir":"P:/quarantine"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.custom_naming_notes, "");
+        // And a set value survives a serialize/deserialize round trip.
+        cfg.custom_naming_notes = "prefer client surnames".into();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.custom_naming_notes, "prefer client surnames");
     }
 
     #[test]

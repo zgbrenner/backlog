@@ -1,0 +1,113 @@
+name: Security audit
+
+# Dependency-advisory sweep, deliberately OUTSIDE the release path: the release
+# pipeline gates on ci.yml only, and scripts/ci-local.sh + check-ci-parity.mjs
+# mirror ci.yml only. Nothing here can block a release; its job is to surface
+# NEW advisories published between merges, which a push-triggered workflow can
+# never see. Hence the weekly schedule as the primary trigger, with a
+# pull_request trigger scoped to the dependency manifests themselves so a
+# lockfile change gets an advisory check in review.
+#
+# npm audit --audit-level=high also runs in ci.yml's frontend job on every PR;
+# it is repeated here only so the weekly schedule re-checks a tree nobody is
+# touching. Keep the level in sync with ci.yml rather than tightening it here.
+
+on:
+  schedule:
+    # Mondays 09:00 UTC — quiet slot, and early enough in the week that a new
+    # advisory lands while someone is around to read it.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - src-tauri/Cargo.lock
+      - package-lock.json
+      - sidecar/requirements.lock
+      - sidecar/build-requirements.lock
+      - power-automate/requirements-dev.txt
+      - .github/workflows/security-audit.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  rust-audit:
+    name: Rust advisories (cargo-audit)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Built from source with --locked so the audit tool itself is pinned and
+      # reproducible; rustup honors the repo's rust-toolchain.toml (1.94.1),
+      # exactly as ci.yml relies on it.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      # cargo-audit needs only the lockfile, so no system libraries, sidecars
+      # or icons — the same reasoning that keeps ci.yml's trust-core job cheap.
+      #
+      # Default policy: only actual vulnerabilities fail; "unmaintained" and
+      # "unsound" warnings (the GTK3 bindings pulled in by Tauri's Linux stack,
+      # among others — 18 at the time of writing) are reported in the log but
+      # deliberately do not gate. Do not add `--deny warnings`: those crates
+      # are upstream Tauri choices this repo cannot drop.
+      - name: Audit src-tauri/Cargo.lock
+        run: cargo audit --file src-tauri/Cargo.lock
+
+  # ---------------------------------------------------------------------------
+  npm-audit:
+    name: npm advisories (audit-level=high)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      # --no-audit here so the install and the audit are two separate, readable
+      # failures; the audit step below is the actual gate.
+      - name: Install locked dependencies
+        run: npm ci --no-audit
+      # Same level as ci.yml's frontend job — see the header comment.
+      - name: Audit npm dependencies
+        run: npm audit --audit-level=high
+
+  # ---------------------------------------------------------------------------
+  pip-audit:
+    name: Python advisories (pip-audit)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # 3.11 to match the interpreter the sidecar actually ships against
+      # (ci.yml documents why: onnxruntime/rapidocr wheel availability).
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install pip-audit
+        run: python -m pip install pip-audit==2.10.1
+      # --no-deps because every file is a fully pinned lockfile: audit exactly
+      # what is written, resolve nothing, install nothing.
+      #
+      # All three files are audited in one step with the failure aggregated at
+      # the end, so the first finding never hides a second one in another file.
+      #
+      # Ignored advisories (each needs a reason and an owner-visible record):
+      #   PYSEC-2026-3552 (CVE-2026-69247 / GHSA-g6cj-pr64-35w5):
+      #     cryptography 49.0.0 PKCS#7 EnvelopedData decryption Bleichenbacher
+      #     oracle; fixed in 50.0.0. cryptography enters the lock only as a
+      #     transitive dependency of pdfminer.six, which uses it for encrypted
+      #     PDF payloads — the sidecar never calls pkcs7_decrypt_* and never
+      #     auto-decrypts attacker-supplied S/MIME, so the oracle is not
+      #     reachable. Remove this ignore when the lockfile moves to
+      #     cryptography >= 50.0.0.
+      - name: Audit Python dependency manifests
+        run: |
+          status=0
+          pip-audit -r sidecar/requirements.lock --no-deps \
+            --ignore-vuln PYSEC-2026-3552 || status=1
+          pip-audit -r sidecar/build-requirements.lock --no-deps || status=1
+          pip-audit -r power-automate/requirements-dev.txt --no-deps || status=1
+          exit "$status"

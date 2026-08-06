@@ -517,6 +517,36 @@ button.danger:hover { background: var(--bad-soft); }
   background: var(--accent-soft); color: var(--text); font-size: 12px; line-height: 1.45;
 }
 
+.naming-notes textarea { width: 100%; resize: vertical; }
+/* On a new computer the primary action must stay in the first viewport, so
+ * the optional guidance sections wait until the folders exist — the same
+ * reasoning as the hidden field notes above. Both come back on the next
+ * Settings render after first-run setup completes. */
+.settings.first-run-settings .naming-notes,
+.settings.first-run-settings .pa-guide-section { display: none; }
+
+/* The step-by-step Power Automate directions, shown only while the Power
+ * Automate output mode is selected. Same collapsed treatment as Advanced:
+ * present when needed, out of the way otherwise. */
+details.pa-guide {
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel); padding: 0 14px; margin-bottom: 14px;
+}
+details.pa-guide > summary {
+  cursor: pointer; padding: 12px 0; color: var(--text); font-size: 13px; font-weight: 600;
+}
+details.pa-guide[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+details.pa-guide .pa-guide-body { padding-bottom: 14px; }
+details.pa-guide .dim-note { margin-bottom: 12px; }
+details.pa-guide ol { margin: 0 0 12px; padding-left: 22px; }
+details.pa-guide li { margin-bottom: 8px; font-size: 12.5px; line-height: 1.55; }
+details.pa-guide li:last-child { margin-bottom: 0; }
+details.pa-guide code { font-family: var(--mono); font-size: 11.5px; }
+/* This app renders no <a> elements; the URL is selectable text to copy. */
+details.pa-guide .repo-url {
+  user-select: all; word-break: break-all; font-family: var(--mono); font-size: 11.5px;
+}
+
 details.advanced {
   border: 1px solid var(--border); border-radius: 10px;
   background: var(--panel); padding: 0 14px; margin-bottom: 14px;

@@ -1,0 +1,52 @@
+name: Workflow lint
+
+# Lints every workflow file with actionlint. Kept OUTSIDE ci.yml on purpose:
+# the release pipeline gates on ci.yml and check-ci-parity.mjs locks ci.yml to
+# scripts/ci-local.sh, so a linter for the workflows themselves belongs in its
+# own lane where it can never block a release and never trips the parity gate.
+#
+# The binary is downloaded straight from the pinned release and SHA-256
+# verified before it runs — the same pattern release.yml uses for NASM —
+# rather than trusting a tag that can move.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: actionlint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download actionlint (hash-verified)
+        run: |
+          version="1.7.12"
+          sha256="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            -o "$RUNNER_TEMP/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          echo "${sha256}  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+      # shellcheck integration stays ON: every bash run-block in the current
+      # workflows was verified clean with shellcheck 0.11.0 before this file
+      # landed. The version probe is there so that if the runner image ever
+      # drops shellcheck, this job fails loudly instead of actionlint silently
+      # skipping the rule and reporting a hollow green.
+      - name: Lint workflows
+        run: |
+          shellcheck --version
+          "$RUNNER_TEMP/actionlint" -color
