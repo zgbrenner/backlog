@@ -15,6 +15,49 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.9.0] — the operator gets a say
+
+### Added
+
+- **Naming instructions.** Settings has a new optional free-text field,
+  `custom_naming_notes` (max 600 characters), whose contents are appended to
+  the naming model's system prompt as an explicitly subordinate
+  "Operator preferences" section — after the core rules, before any
+  validator correction, and absent entirely when the box is empty, so the
+  measured core prompt stays byte-identical for operators who configure
+  nothing. The deterministic checker still validates every proposed name:
+  no instruction can loosen the date-grounding, PII, or fabrication
+  tripwires. Control characters are stripped and the value is length-capped
+  at save time.
+- **In-app Power Automate directions.** When the Power Automate /
+  SharePoint output mode is selected, Settings shows a collapsed
+  step-by-step guide ("How to connect Power Automate (step-by-step)")
+  covering the OneDrive and SharePoint preparation, the two cloud flows,
+  the 15-minute recovery sweep, and a test-before-scale checklist, with a
+  pointer to the full copy-paste build guide in the repository's
+  `power-automate/` folder.
+- **Scheduled dependency audits.** A new `security-audit` workflow runs
+  cargo-audit, npm audit, and pip-audit weekly, on demand, and on any PR
+  that touches a dependency manifest — separate from the release-gating CI
+  so an upstream advisory can never brick a release. One pre-existing
+  advisory (PYSEC-2026-3552 in the sidecar's transitive `cryptography`
+  49.0.0; the vulnerable PKCS#7 decrypt path is never called) is ignored
+  with a documented removal condition.
+- **Workflow linting.** A new `actionlint` workflow (with shellcheck
+  integration) validates every GitHub Actions file on change; the current
+  tree lints clean.
+- **Dependabot.** Weekly grouped update PRs for GitHub Actions, cargo, npm,
+  and the Power Automate tooling requirements.
+
+### Changed
+
+- Settings is grouped into clearer sections — Folders, Naming
+  instructions, Power Automate (only in that mode), then Advanced — and
+  the two new sections stay hidden during first-run setup so the primary
+  action keeps its place in the first viewport.
+- The user guide's install links are version-neutral and point at the
+  latest release page instead of a hard-coded 0.8.0 build.
+
 ## [0.8.3] — the checker learns to smell fabrication
 
 ### Fixed
