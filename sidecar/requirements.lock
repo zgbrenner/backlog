@@ -9,7 +9,7 @@ cobble==0.1.4
 colorama==0.4.6
 coloredlogs==15.0.1
 colorlog==6.12.0
-cryptography==49.0.0
+cryptography==50.0.0
 defusedxml==0.7.1
 et_xmlfile==2.0.0
 filelock==3.32.0
