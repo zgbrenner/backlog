@@ -23,8 +23,10 @@ The only outbound data and network activity are:
    language, original name/path, content and delivery identifiers, model
    versions and soft flags. It never includes document text or evidence.
 2. **A model-bundle download** from Hugging Face only when you press
-   **Download models (~2.4 GB)** in Settings. A fresh release already includes
-   the primary model; this action fills in missing or optional model assets. No
+   **Download models** in Settings — about 2.5 GB when nothing is present yet.
+   A fresh release already includes the everyday model, and machines with 9 GiB
+   of RAM or less use only that; this action fills in whatever is missing for
+   the tier this computer is set up for. No
    account, no login, and nothing about your documents is sent — it is a plain
    file download.
 3. **A check for a new version of BackLog** when the app starts, to a GitHub
@@ -75,7 +77,7 @@ chosen by the operator in Settings; they are not moved into AppData.
 | The record of every file processed: original name, proposed date, subject, description, state | `ledger.db` | **Encrypted.** The whole database file is encrypted with SQLCipher. |
 | The key to that database | `ledger.key` | Protected by Windows DPAPI, so it can only be decrypted by **you, on this machine**. It is never written in plain form. |
 | Converted document text | `cache\` | Deleted on filing (see above). |
-| Model files | `models\` | The bundled primary Qwen model plus the optional escalation model, about 2.4 GB when both are installed. |
+| Model files | `models\` | The bundled everyday Qwen model, plus the optional 1.7B backup model on a machine set up for it: about 2.5 GB with both installed, about 0.7 GB with only the bundled one. |
 | Log files | `logs\` | See below. |
 | Your settings | `backlog.config.json` | Plain text — folder paths and tuning numbers only. |
 | Final Local Output documents | The **Local Output folder** chosen in Settings | **Not encrypted by BackLog.** In Local folder mode, completed renamed documents are written directly here. Protect and retain them as you would the originals. |
@@ -146,14 +148,14 @@ operator-selected Quarantine folder instead of creating a cloud handoff.
 ## Removing BackLog
 
 Uninstalling BackLog removes the program. It deliberately leaves your data
-behind, because deleting it silently would be worse: the model files are a
-2.4 GB re-download, and the ledger is the record of what was filed.
+behind, because deleting it silently would be worse: the model files are up to
+a 2.5 GB re-download, and the ledger is the record of what was filed.
 
 To remove everything after uninstalling:
 
 1. Delete `%APPDATA%\ai.sonomos.backlog` — this removes the encrypted ledger,
    its DPAPI key, the converted-text cache, the logs, your settings, and the
-   2.4 GB of model files.
+   model files (up to about 2.5 GB).
 2. Delete the **Quarantine folder** you chose in Settings. The uninstaller does
    not touch it: unresolved and dismissed documents remain there for manual
    handling. During normal Local folder operation — not uninstall — an approved

@@ -37,8 +37,8 @@ const CONFIG = {
   llama_port: 8137,
   slm_primary_gguf: "C:\\ProgramData\\BackLog\\models\\Qwen3-0.6B-Q8_0.gguf",
   slm_escalation_gguf: "C:\\ProgramData\\BackLog\\models\\Qwen3-1.7B-Q8_0.gguf",
-  slm_parallel: 4,
-  evidence_token_budget: 1500,
+  slm_parallel: 2,
+  evidence_token_budget: 2500,
   ettin_model_dir: "",
   convert_workers: 4,
   sidecar_timeout_secs: 45,
@@ -47,7 +47,7 @@ const CONFIG = {
   max_tail_pages: 3,
   max_filename_len: 120,
   max_stage_attempts: 3,
-  per_file_wall_clock_secs: 90,
+  per_file_wall_clock_secs: 180,
   retain_cache: false,
   cache_ttl_days: 7,
 };
@@ -122,7 +122,7 @@ const BLOCKED_RUNTIME = {
       field: "models",
       code: "models_missing",
       message:
-        "BackLog still needs to download the two model files it uses to name documents. " +
+        "BackLog still needs to download its local model bundle. " +
         "Press Download models below; it is a one-time download of about 2.5 GB.",
       detail:
         "expected C:\\ProgramData\\BackLog\\models\\Qwen3-0.6B-Q8_0.gguf and " +
@@ -408,7 +408,7 @@ const RUNNING_QUEUE: Job[] = [
 // not be read", which is a state the backend cannot produce, and it meant a bug
 // harvesting date chips from the wrong document would have screenshotted clean.
 /** One file in flight, last touched just under the stall threshold
- *  (per_file_wall_clock_secs is 90, so paintActivity calls it stalled at 270s).
+ *  (per_file_wall_clock_secs is 180, so paintActivity calls it stalled at 540s).
  *  Evaluated when the module loads, i.e. immediately before the app boots, so
  *  the bar reads "Working on" on the first paint and can only turn into
  *  "Stalled" if something re-evaluates it against the clock. */
@@ -421,7 +421,7 @@ const STALLING_QUEUE: Job[] = [
     state: "filtered",
     final_filename: null,
     description: null,
-    updated_at: new Date(Date.now() - 262_000).toISOString(),
+    updated_at: new Date(Date.now() - 532_000).toISOString(),
   }),
 ];
 

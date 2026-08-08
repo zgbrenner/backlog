@@ -138,16 +138,28 @@ npm run tauri build    # local Windows package; not authorized for publication
 
 ### 2. Models
 
-The Windows installer already contains the verified Qwen3 0.6B primary model.
-On first launch BackLog moves it into the per-user app-data model directory, so
-the first document can be processed offline without a second download.
+The Windows installer contains the verified Qwen3 0.6B primary model. On first
+launch BackLog moves it into the per-user app-data model directory, so the
+first document can be named offline without a second download.
 
-The Qwen3 1.7B escalation model is optional. It can improve difficult
-documents, but costs about 1.8 GB of disk space and additional memory while
-running. Install it from Settings with **Download models**. The transfer can be
-cancelled and resumed, and BackLog SHA-256-verifies it before use. If it is
-absent, readiness stays honest and the primary model safely handles escalation
-attempts.
+The escalation tier — a third naming attempt on a document that failed two — is
+chosen from installed RAM:
+
+| Installed RAM | primary | escalation |
+|---|---|---|
+| <= 9 GiB, or unknown | Qwen3-0.6B-Q8_0 (bundled) | collapsed onto the primary |
+| more than 9 GiB | Qwen3-0.6B-Q8_0 (bundled) | Qwen3-1.7B-Q8_0 |
+
+The 1.7B is an optional in-app download of about 1.8 GB: Settings,
+**Download models**. It is not in the installer because carrying it would take
+the installer and the portable ZIP over GitHub's 2 GiB per-release-asset limit.
+The transfer can be cancelled and resumed, and BackLog SHA-256-verifies each
+file before use. Without it BackLog is fully functional — readiness says the
+optional model is absent and the primary handles escalation attempts.
+
+A larger 1.7B/4B pair was measured against this one and rejected: 2.0x the wall
+clock for no quality difference that survived the sample. `docs/SIZING.md` has
+that comparison and the memory arithmetic behind the table.
 
 Release maintainers can reproduce or audit the model lock from a connected
 staging machine:

@@ -29,7 +29,8 @@ The installer includes:
 - the BackLog app;
 - the document-conversion runtime;
 - the llama naming server and its Windows runtime libraries;
-- the verified Qwen3 0.6B everyday model;
+- the verified Qwen3 0.6B model, which is what BackLog names documents with
+  until any larger model is downloaded;
 - the pinned MiniLM semantic evidence model; and
 - the offline WebView2 runtime.
 
@@ -88,15 +89,23 @@ after the renamed output and its receipt are durably written. If Windows or
 BackLog stops, restart it: recovery reconciles unfinished deliveries rather
 than overwriting an output.
 
-### Optional model
+### The optional backup model
 
-The larger Qwen3 1.7B model is optional. It can help with difficult documents,
-but it uses about 1.8 GB more disk space and more memory while running. BackLog
-works without it by safely reusing the everyday 0.6B model for backup naming
-attempts.
+The installer carries the everyday naming model, so BackLog works the moment it
+is installed, with no internet.
 
-To add it, use **Download models** in Settings. BackLog verifies the bundled
-everyday model and downloads only anything missing. You can choose **Cancel
+On a computer with more than about 9 GB of memory, BackLog can also use a
+larger backup model for documents that are hard to name — a one-time download
+of about 1.8 GB. Until it is downloaded, BackLog reuses the everyday model for
+those attempts instead; nothing is broken and nothing is blocked.
+
+On a computer with about 8 GB of memory, or one that does not report its
+memory, BackLog deliberately stays on the everyday model for backup attempts
+too. The larger model would not leave that computer enough memory to also run
+Windows, your email and your documents.
+
+To download it, use **Download models** in Settings. BackLog verifies what is
+already present and downloads only what is missing. You can choose **Cancel
 download** and later **Resume download**; partial data is retained safely. The
 download result remains visible if you leave Settings and come back.
 
@@ -181,6 +190,12 @@ description is one sentence. If a correction breaks a rule, BackLog explains
 which rule.
 
 ## 5. Large backfills
+
+**Expect roughly 175 documents an hour** on a computer with 16 GB of memory —
+so a few hundred documents is an evening, and a few thousand is a couple of
+nights. Scans that need to be read as images take longer, and a document
+BackLog has to retry takes two or three times as long as one it names first
+time. If it feels slow, it is working, not stuck.
 
 For several thousand files:
 

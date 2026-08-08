@@ -47,6 +47,22 @@ class ModelSpecTests(unittest.TestCase):
             files,
         )
 
+    def test_every_tier_a_machine_can_be_assigned_is_staged(self):
+        # One staged models/ directory has to provision every deployment
+        # target. A machine at or below 9 GiB of RAM collapses its escalation
+        # tier onto the primary and never loads the 1.7B, but a staging run
+        # that dropped it could not provision anything above that, and the Rust
+        # downloader (src-tauri/src/model_download.rs) pins both against this
+        # same lock.
+        targets = {spec.target for spec in DOWNLOAD.MODEL_SPECS}
+        self.assertEqual(
+            {target for target in targets if target.endswith(".gguf")},
+            {
+                "Qwen3-0.6B-Q8_0.gguf",
+                "Qwen3-1.7B-Q8_0.gguf",
+            },
+        )
+
     def test_restricted_and_training_only_assets_are_absent(self):
         serialized = json.dumps(
             [spec.__dict__ for spec in DOWNLOAD.MODEL_SPECS]

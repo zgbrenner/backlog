@@ -13,7 +13,11 @@ Usage:
 a separate training input and is deliberately not part of this runtime bundle.
 
 This is the slim, torch-free sidecar profile's bundle: the two Apache-2.0
-Qwen3 GGUFs plus the local ONNX MiniLM semantic ranker/tokenizer. gliclass
+Qwen3 GGUFs plus the local ONNX MiniLM semantic ranker/tokenizer. Both GGUFs
+are staged even though a machine at or below 9 GiB of RAM collapses its
+escalation tier onto the primary and never loads the 1.7B (see ``Config``'s
+tier table): one staged ``models/`` directory has to be able to provision every
+deployment target, not just the smallest one. gliclass
 (doc-type classification) and granite (salience embeddings) are not fetched
 here -- they're torch-only naming enhancements that ``sidecar/convertd.py``'s
 ``_gliclass``/``_granite`` loaders degrade to deterministic fallbacks for when

@@ -21,12 +21,76 @@ use std::collections::HashSet;
 
 const TRACE_SCHEMA_VERSION: u8 = 1;
 const MAX_PARAGRAPH_CHARS: usize = 1_200;
-const SEMANTIC_TOP_K: usize = 12;
 const SEMANTIC_MIN_SCORE: f64 = 0.12;
 const SEMANTIC_DIVERSITY: f64 = 0.22;
 const ENTITY_THRESHOLD: f64 = 0.42;
 const ENTITY_MAX_PER_LABEL: usize = 8;
 const MIN_COMPRESSION_SAVINGS_RATIO: f64 = 0.10;
+
+/// The optimistic unit every evidence budget in this pipeline is expressed in:
+/// one "token" of `evidence_token_budget` buys four characters of bundle.
+///
+/// `pub(crate)` because `config.rs` converts the same budget into the same
+/// characters when it derives its upper bound; a second copy of the 4 over
+/// there would let the ceiling measure a different quantity than the pipeline
+/// actually spends.
+pub(crate) const BUDGET_CHARS_PER_TOKEN: usize = 4;
+
+/// The pessimistic rate the same characters are checked against a real
+/// tokenizer at.
+///
+/// chars/4 is fine as a *budget* — it only decides how much evidence to gather,
+/// and being wrong there costs a slightly thin or slightly fat bundle. It is
+/// not fine as a *ceiling*: Qwen3's BPE spends well over one token per four
+/// characters on what a bundle actually contains — ISO dates, party names, case
+/// captions, currency, table fragments and this module's own `- LABEL: "..."
+/// [paragraph 3, chars 88..104, score 0.91]` prefixes. Sizing the ceiling at 4
+/// would let a bundle that "fits" by the budget unit overflow the slot.
+///
+/// `pub(crate)` so `slm.rs` can assert the two halves of the derivation agree
+/// without restating the 3 that `SLM_CTX_PER_SLOT` was sized with.
+pub(crate) const CONSERVATIVE_CHARS_PER_TOKEN: usize = 3;
+
+/// The largest evidence bundle that provably fits one llama-server slot.
+///
+/// `slm::SLM_CTX_PER_SLOT` minus the prompt reserve and the answer allowance,
+/// converted at
+/// `CONSERVATIVE_CHARS_PER_TOKEN`: `(6656 - 640 - 220) * 3` = 17388 characters
+/// at today's constants, and it moves with them rather than restating them.
+///
+/// This is enforced, not documented, because the failure is silent. llama.cpp
+/// does not refuse an over-length prompt — it drops what does not fit, and the
+/// model then names the document from evidence with a hole in it. The output is
+/// a well-formed filename that the checker cannot fault and a human would not
+/// question; nothing is logged, because from the server's point of view nothing
+/// went wrong. Before this clamp existed the escalation rung asked for
+/// `evidence_token_budget * 2` in chars/4 — 12000 characters against a
+/// 4096-token slot, which is 3000 to 4800 real tokens — so a long document
+/// could already overflow at the shipped defaults, and did so invisibly.
+///
+/// `Config::validate` bounds `evidence_token_budget` so that no config which
+/// passes the start gate can reach this ceiling. That is the belt; this is the
+/// braces, and it is deliberately a different mechanism. Validation is a check
+/// at one entry point, and entry points get added: a `Config` built in code, a
+/// preset written against an older build, a hand-edited `backlog.config.json`
+/// consumed by a path that does not gate, or a default someone raises without
+/// reading this file all reach the bundle builder regardless. The ceiling
+/// therefore lives where the characters are actually spent, not only where
+/// they are configured.
+pub fn max_bundle_chars() -> usize {
+    (crate::slm::SLM_CTX_PER_SLOT
+        .saturating_sub(crate::slm::SLM_PROMPT_RESERVE_TOKENS)
+        .saturating_sub(crate::slm::SLM_MAX_OUTPUT_TOKENS)) as usize
+        * CONSERVATIVE_CHARS_PER_TOKEN
+}
+
+/// Every path from a configured token budget to a character budget goes
+/// through here, so the ceiling cannot be bypassed by adding a third caller.
+fn clamped_char_budget(token_budget: usize) -> usize {
+    token_budget
+        .saturating_mul(BUDGET_CHARS_PER_TOKEN)
+        .min(max_bundle_chars())
+}
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct CompressionMetrics {
@@ -270,7 +334,7 @@ pub fn build_evidence(
 ) -> anyhow::Result<FilterOutcome> {
     let mut h = harvest::harvest(markdown);
     let paragraphs = segment_paragraphs(markdown);
-    let char_budget = token_budget.saturating_mul(4);
+    let char_budget = clamped_char_budget(token_budget);
 
     // 5b: language gate on a head sample.
     let lang_sample: String = markdown.chars().take(1_500).collect();
@@ -449,10 +513,52 @@ struct ParagraphSelection {
     lane_char_budget: usize,
 }
 
+/// Share of the evidence budget the ranked-paragraph lane may spend.
+///
+/// 60%, up from 35%. Paired deliberately with `semantic_top_k` — raising
+/// either alone changes nothing, because the two bind at almost the same
+/// point. At `evidence_token_budget: 2500` the old pair gave the lane 3,500
+/// characters and offered it 12 paragraphs; rendered at roughly 350
+/// characters each (a ~50-character provenance prefix plus the text), those
+/// twelve want ~4,200 characters, so the lane truncated at about ten and the
+/// twelfth paragraph could never arrive however large the budget grew.
+///
+/// The other lanes are unaffected in practice: measured bundles were landing
+/// at 6,526-7,652 characters against a 10,000-character budget, so there was
+/// 2,400-3,500 characters of unused headroom for this to spend.
 fn semantic_lane_budget(char_budget: usize) -> usize {
-    ((char_budget.saturating_mul(35)) / 100)
+    ((char_budget.saturating_mul(60)) / 100)
         .max(char_budget.min(512))
         .min(char_budget)
+}
+
+/// How many ranked paragraphs to ask the semantic model for.
+///
+/// Derived from the budget rather than fixed, which is the actual defect this
+/// replaces. `SEMANTIC_TOP_K` was a hardcoded 12 with no relationship to
+/// `evidence_token_budget`, so the semantic lane could never see more than
+/// twelve paragraphs of a document no matter how much room it was given — on
+/// the 95-paragraph fixture in the v0.9.0 corpus that is 13% of the text.
+/// Raising the budget only let those same twelve be rendered more fully: a
+/// verbosity lever wearing a coverage lever's name.
+///
+/// That matters because the two naming failures this pipeline actually has —
+/// a party missing from the filename, and a real date sitting deep in the
+/// document — are both cases where the evidence exists and did not reach the
+/// model. A cap on how many paragraphs can reach it at all is a more direct
+/// explanation for those than model capacity is, and it sits upstream of both
+/// the evidence budget and the model tier.
+///
+/// `RENDERED_ITEM_CHARS` is what one ranked paragraph costs in the bundle:
+/// its text plus the `- [paragraph N; rank R; score S; probe: P]` prefix.
+/// 350 is the observed order of magnitude on this corpus, not a measurement
+/// of any single document, so this is a sizing heuristic and the clamp is
+/// what keeps it honest at both ends.
+fn semantic_top_k(char_budget: usize) -> usize {
+    const RENDERED_ITEM_CHARS: usize = 350;
+    const MIN_TOP_K: usize = 12;
+    const MAX_TOP_K: usize = 40;
+    (semantic_lane_budget(char_budget) / RENDERED_ITEM_CHARS).clamp(MIN_TOP_K, MAX_TOP_K)
 }
 
 fn ranked_without_compression(
@@ -540,7 +646,7 @@ fn select_paragraphs(
         .rank_paragraphs(
             paragraphs,
             probes,
-            SEMANTIC_TOP_K,
+            semantic_top_k(char_budget),
             SEMANTIC_MIN_SCORE,
             SEMANTIC_DIVERSITY,
         )
@@ -575,7 +681,9 @@ fn select_paragraphs(
     }
 
     ParagraphSelection {
-        ranked: deterministic_fallback_rank(paragraphs, probes, SEMANTIC_TOP_K),
+        // Same count the semantic path would have asked for. The fallback is
+        // already a worse selection; it should not also be a smaller one.
+        ranked: deterministic_fallback_rank(paragraphs, probes, semantic_top_k(char_budget)),
         routing: "semantic_unavailable".into(),
         bypass_reason: Some("semantic model unavailable; exact deterministic fallback used".into()),
         model: result.model,
@@ -1141,8 +1249,11 @@ fn expanded_ranked(ev: &Evidence) -> Vec<RankedParagraph> {
 /// first attempt and appends previously unselected exact source paragraphs, so
 /// the larger model receives the same document with more evidence rather than
 /// a different lossy summary.
+///
+/// This is the widest bundle the pipeline ever builds and therefore the one
+/// that reaches [`max_bundle_chars`] first — see `clamped_char_budget`.
 pub fn widened_bundle(ev: &Evidence, token_budget: usize) -> String {
-    let char_budget = token_budget.saturating_mul(4);
+    let char_budget = clamped_char_budget(token_budget);
     let expanded = expanded_ranked(ev);
     let semantic_budget = ev
         .semantic_lane_char_budget
@@ -1163,6 +1274,12 @@ pub fn widened_bundle(ev: &Evidence, token_budget: usize) -> String {
 
 /// Trimmed evidence for the second attempt: deterministic lanes only, at half
 /// the normal character allowance.
+///
+/// Deliberately not routed through `clamped_char_budget`: this rung shrinks
+/// rather than widens (chars/2 against the bundle's chars/4), it is only ever
+/// called with the base `evidence_token_budget`, and it emits a fixed handful
+/// of harvested lines rather than as much source as will fit. Adding the clamp
+/// here would suggest the ceiling is what bounds it, and it is not.
 pub fn trimmed_bundle(ev: &Evidence, token_budget: usize) -> String {
     let mut bundle = String::new();
     if !ev.harvest.dates.is_empty() {
@@ -1289,5 +1406,152 @@ mod tests {
         let cut = truncate_to_chars("A€B", 2);
         assert_eq!(cut, "A€");
         assert_eq!(cut.chars().count(), 2);
+    }
+
+    /// A long document with every paragraph available to the widening pass —
+    /// enough source that the bundle is bounded by its budget and nothing else.
+    fn oversized_evidence() -> Evidence {
+        let source = format!(
+            "Subject: Termination of the Acme master services agreement\n\n{}",
+            (0..600)
+                .map(|n| format!(
+                    "Paragraph {n}: the parties agree the effective date is March 5, 2024, \
+                     and that Acme Holdings LLC remains liable under section {n}.\n\n"
+                ))
+                .collect::<String>()
+        );
+        let paragraphs = segment_paragraphs(&source);
+        let ranked: Vec<RankedParagraph> = paragraphs
+            .iter()
+            .take(4)
+            .map(|paragraph| RankedParagraph {
+                index: paragraph.index,
+                text: paragraph.text.clone(),
+                start_char: paragraph.start_char,
+                end_char: paragraph.end_char,
+                score: 0.7,
+                probe: "effective date".into(),
+                rank: paragraph.index,
+            })
+            .collect();
+        Evidence {
+            bundle: String::new(),
+            language: "en".into(),
+            doc_type: Some("services agreement".into()),
+            doc_type_score: 0.8,
+            harvest: harvest::harvest(&source),
+            meta_dates: vec!["2024-03-05".into()],
+            salient: ranked.iter().map(|r| r.text.clone()).collect(),
+            ettin_spans: Vec::new(),
+            thin: false,
+            paragraphs,
+            ranked_paragraphs: ranked,
+            entities: Vec::new(),
+            semantic_lane_char_budget: 2_000,
+            trace: EvidenceTrace::default(),
+        }
+    }
+
+    /// The evidence budget must buy COVERAGE, not just verbosity.
+    ///
+    /// `SEMANTIC_TOP_K` used to be a hardcoded 12 with no relationship to the
+    /// budget, so a larger budget rendered the same twelve paragraphs more
+    /// fully and never reached a thirteenth. On the 95-paragraph fixture in
+    /// the v0.9.0 corpus that capped the semantic lane at 13% of the document
+    /// however much room it was given — and "the evidence was there and did
+    /// not reach the model" is exactly the shape of both naming failures this
+    /// pipeline actually has.
+    ///
+    /// So this asserts the derivative, not a value: more budget must mean
+    /// strictly more paragraphs, up to the clamp. A future refactor that
+    /// reintroduces a fixed cap fails here rather than quietly costing
+    /// coverage again.
+    #[test]
+    fn a_larger_evidence_budget_buys_more_paragraphs_not_just_longer_ones() {
+        let small = semantic_top_k(4_000);
+        let shipped = semantic_top_k(10_000); // evidence_token_budget 2500
+        let widened = semantic_top_k(16_000); // the rung-3 escalation budget
+
+        assert!(
+            shipped > small,
+            "raising the budget from 4,000 to 10,000 chars bought no extra \
+             paragraphs ({small} -> {shipped}); the lane is capped again"
+        );
+        assert!(
+            widened > shipped,
+            "the escalation rung sees no more paragraphs than rungs 1-2 \
+             ({shipped} -> {widened}), so widening the bundle is verbosity only"
+        );
+        // The floor is the old fixed value: no budget may ever buy LESS
+        // coverage than the pipeline had before this became derived.
+        assert!(
+            small >= 12,
+            "a small budget must not drop below the old fixed 12: got {small}"
+        );
+    }
+
+    /// The clamp is what stands between a too-large budget and a silently
+    /// truncated prompt: llama.cpp drops the overflow and answers anyway, so
+    /// nothing downstream can notice. Asserting "it got smaller" would pass on
+    /// a bundle that was still twice the slot, so this pins the actual ceiling
+    /// — and pins that the ceiling was the binding constraint, not the source.
+    #[test]
+    fn no_evidence_bundle_can_exceed_what_one_slot_holds() {
+        let ev = oversized_evidence();
+        let ceiling = max_bundle_chars();
+
+        // A budget no validated config could produce. That is the point: the
+        // ceiling must not depend on validation having run.
+        let unbounded = widened_bundle(&ev, absurd_budget());
+        let at_ceiling = widened_bundle(&ev, ceiling.div_ceil(BUDGET_CHARS_PER_TOKEN));
+        let modest = widened_bundle(&ev, 1_000);
+
+        assert!(
+            unbounded.chars().count() <= ceiling,
+            "widened bundle was {} chars against a {ceiling}-char slot ceiling",
+            unbounded.chars().count()
+        );
+        // The strong form: an unbounded budget produces exactly what the
+        // ceiling budget produces. "Something truncated it" would also satisfy
+        // the assertion above while leaving the bundle twice the slot.
+        assert_eq!(
+            unbounded, at_ceiling,
+            "an over-large budget must be clamped to the ceiling, not merely trimmed"
+        );
+        // And the ceiling is what bound it, not the document: this evidence was
+        // still yielding more bundle as the budget grew right up to it.
+        assert!(
+            modest.chars().count() < at_ceiling.chars().count(),
+            "the source must have more to give than the ceiling allows, or this \
+             test proves nothing ({} vs {})",
+            modest.chars().count(),
+            at_ceiling.chars().count()
+        );
+    }
+
+    /// Both budget paths — `build_evidence`'s first bundle and the escalation
+    /// rung's widened one — go through the same clamp, so it is asserted once
+    /// against the arithmetic rather than twice against two bundles.
+    #[test]
+    fn the_char_budget_saturates_at_the_slot_ceiling() {
+        assert_eq!(clamped_char_budget(absurd_budget()), max_bundle_chars());
+        // Ordinary budgets are untouched: the clamp is a ceiling, not a
+        // rescaling, and the shipped defaults must still spend what they ask.
+        assert_eq!(clamped_char_budget(2_500), 10_000);
+        assert_eq!(clamped_char_budget(4_000), 16_000);
+        assert!(
+            max_bundle_chars() >= 16_000,
+            "the shipped default escalation rung (4000 budget tokens) must fit a slot unclamped"
+        );
+        // That the ceiling itself still fits a slot alongside the prompt and
+        // the answer is slm.rs's assertion, next to the constants it derives
+        // from — it is one invariant and it belongs in one place.
+    }
+
+    /// Large enough that `* 4` is meaningless, small enough that it cannot
+    /// overflow on the way there — the clamp must not need `saturating_mul` to
+    /// be the thing that saves it.
+    fn absurd_budget() -> usize {
+        usize::MAX / 8
     }
 }

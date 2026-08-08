@@ -7,10 +7,14 @@
 //! never during document processing.
 //!
 //! Layout on disk mirrors `models/download_models.py`'s targets one-to-one:
-//! the two Qwen GGUFs land wherever `Config::slm_primary_gguf` /
-//! `slm_escalation_gguf` point (normally `app_data/models/…`, see
-//! [`resolve_configured_model_path`]), and the semantic ONNX/tokenizer pair
-//! lands under `app_data/models/semantic/…`. The slim, torch-free sidecar
+//! a Qwen GGUF a tier is configured to use lands wherever
+//! `Config::slm_primary_gguf` / `slm_escalation_gguf` point (normally
+//! `app_data/models/…`, see [`resolve_configured_model_path`]), a GGUF no tier
+//! is configured to use lands at `models_dir/<basename>` (see
+//! [`download_targets`], which is what keeps the bundle's GGUFs and the two
+//! config fields from ever landing on top of each other), and the semantic
+//! ONNX/tokenizer pair lands under `app_data/models/semantic/…`. The slim,
+//! torch-free sidecar
 //! profile ships without the gliclass/granite naming enhancements (see
 //! `sidecar/convertd.py`'s `_gliclass`/`_granite` loaders and
 //! `docs/DEPENDENCY_COMPATIBILITY.md`), so there are no torch-only model
@@ -42,6 +46,14 @@ use tauri::{AppHandle, Emitter, Manager};
 
 /// Default basename for the primary-tier GGUF, used when a configured path
 /// is unset (never downloaded/configured yet).
+///
+/// This is also the GGUF the installer physically carries, which is what makes
+/// a fresh install able to name its first document with no network at all: the
+/// primary *is* the bundled model, so there is nothing for the naming lane to
+/// fall back from. Keeping it that way is a release constraint, not just a
+/// sizing one — `src-tauri/resources/models/` ships exactly one GGUF and the
+/// NSIS installer is already 1.076 GB, so a 1.83 GB primary would put both the
+/// installer and the portable ZIP over GitHub's 2 GiB per-release-asset limit.
 pub const PRIMARY_GGUF_NAME: &str = "Qwen3-0.6B-Q8_0.gguf";
 /// Default basename for the escalation-tier GGUF.
 pub const ESCALATION_GGUF_NAME: &str = "Qwen3-1.7B-Q8_0.gguf";
@@ -87,6 +99,10 @@ pub const MODEL_FILES: &[ModelFile] = &[
     // Apache-2.0 Qwen3 GGUFs served by llama.cpp, plus the Apache-2.0
     // MiniLM semantic assets. There are no gliclass/granite snapshots to
     // fetch (see the module doc comment above).
+    //
+    // The primary is still pinned and still fetched even though the installer
+    // carries it: a machine whose copy is stale or damaged has to be able to
+    // repair it here.
     ModelFile {
         repo: "Qwen/Qwen3-0.6B-GGUF",
         revision: "main",
@@ -178,6 +194,13 @@ pub fn resolve_configured_model_path(
     }
 }
 
+/// Every GGUF basename this bundle knows about, in tier order. Used to work
+/// out which bundle member a configured tier path is actually asking for,
+/// which is not the same question as which tier field the path is stored in:
+/// a machine at or below 9 GiB of RAM collapses its escalation tier onto the
+/// primary, so `slm_escalation_gguf` there names [`PRIMARY_GGUF_NAME`].
+const GGUF_TARGETS: [&str; 2] = [PRIMARY_GGUF_NAME, ESCALATION_GGUF_NAME];
+
 /// `app_data_dir()/models` — the persistent, installed-app-safe home for the
 /// whole runtime bundle. Also the value injected into the convertd sidecar's
 /// `BACKLOG_MODELS_DIR` (see `sidecar.rs::Sidecar::with_models_dir`).
@@ -206,39 +229,93 @@ struct DownloadTarget {
     size_hint: u64,
 }
 
-/// Maps every [`MODEL_FILES`] entry onto a concrete destination: distinct
-/// configured GGUF paths are honored, semantic assets stay under their fixed
-/// subtree, and a legacy/collapsed GGUF pair is separated into the canonical
-/// filenames under `models_dir` so one download can never overwrite the other.
+/// Which bundle member a configured tier path is asking for.
+///
+/// It is not always the member that tier canonically holds. The RAM tiers
+/// decide what each field holds — a machine at or below 9 GiB collapses
+/// escalation onto the primary, so its `slm_escalation_gguf` names the 0.6B,
+/// not the 1.7B — so a configured path that names a member of this bundle is a
+/// request for *that* member, and only a path naming something outside the
+/// bundle (an operator's own `.gguf`, under whatever name they chose) falls
+/// through to the tier's canonical member.
+fn claimed_member(configured: &Path, canonical_member: &'static str) -> &'static str {
+    configured
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| {
+            GGUF_TARGETS
+                .into_iter()
+                .find(|target| target.eq_ignore_ascii_case(name))
+        })
+        .unwrap_or(canonical_member)
+}
+
+/// Maps every [`MODEL_FILES`] entry onto a concrete destination: a configured
+/// GGUF path is honored for the member it names, semantic assets stay under
+/// their fixed subtree, and everything else lands at `models_dir/<target>`.
+///
+/// The invariant this exists to hold is that **no two entries ever resolve to
+/// the same destination**. Two entries sharing one path is not a cosmetic
+/// problem: whichever downloads second finds the first one's bytes already
+/// sitting there, and [`ensure_file`] correctly refuses them as "exists but is
+/// not the expected model file" — a bundle that can never complete, reported
+/// to the operator as if they had planted a bad GGUF themselves. It is
+/// reachable from ordinary states, not just hand-edited ones: a collapsed
+/// machine has both fields naming one member, and a config carried across a
+/// tier-table change can have a member's canonical name sitting in the other
+/// tier's field.
+///
+/// So a configured path is honored only when it steps on no *other* member's
+/// canonical `models_dir/<target>` and on no other honored path; a member
+/// pushed off a configured path falls back to its own canonical name, which is
+/// free by construction because those names are unique
+/// (`model_files_has_no_duplicate_targets`) and only the member itself may be
+/// honored onto its own. The escalation tier is the one that yields when both
+/// fields ask for the same file, because a collapsed pair is one model and one
+/// download by definition (`SlmLane::escalation_collapsed`).
 fn download_targets(
     models_dir: &Path,
     primary_gguf: &Path,
     escalation_gguf: &Path,
 ) -> Vec<DownloadTarget> {
-    let destinations_collide = primary_gguf == escalation_gguf;
+    let primary_member = claimed_member(primary_gguf, PRIMARY_GGUF_NAME);
+    let escalation_member = claimed_member(escalation_gguf, ESCALATION_GGUF_NAME);
+    let escalation_member = (escalation_member != primary_member).then_some(escalation_member);
+
+    // `model_paths_collide`, not `==`: `lib.rs` normalizes model paths against
+    // that same case- and separator-insensitive notion of identity, and two
+    // adjacent checks disagreeing about what counts as the same file is how
+    // the v0.4.4 model-path bug class started.
+    let honored = |configured: &Path, member: &'static str| -> Option<PathBuf> {
+        let steps_on_another_member = MODEL_FILES.iter().any(|f| {
+            f.target != member && crate::model_paths_collide(configured, &models_dir.join(f.target))
+        });
+        (!steps_on_another_member).then(|| configured.to_path_buf())
+    };
+    let primary_dest = honored(primary_gguf, primary_member);
+    let escalation_dest = escalation_member
+        .and_then(|member| honored(escalation_gguf, member))
+        .filter(|dest| {
+            primary_dest
+                .as_ref()
+                .is_none_or(|primary| !crate::model_paths_collide(primary, dest))
+        });
+
     MODEL_FILES
         .iter()
         .map(|f| {
-            let dest = if f.target == PRIMARY_GGUF_NAME {
-                if destinations_collide {
-                    models_dir.join(PRIMARY_GGUF_NAME)
-                } else {
-                    primary_gguf.to_path_buf()
-                }
-            } else if f.target == ESCALATION_GGUF_NAME {
-                if destinations_collide {
-                    models_dir.join(ESCALATION_GGUF_NAME)
-                } else {
-                    escalation_gguf.to_path_buf()
-                }
+            let configured = if f.target == primary_member {
+                primary_dest.clone()
+            } else if Some(f.target) == escalation_member {
+                escalation_dest.clone()
             } else {
-                models_dir.join(f.target)
+                None
             };
             DownloadTarget {
                 key: f.target,
                 url: download_url_at(f.repo, f.revision, f.hf_path),
                 expected_sha256: f.expected_sha256,
-                dest,
+                dest: configured.unwrap_or_else(|| models_dir.join(f.target)),
                 size_hint: f.size_hint,
             }
         })
@@ -1117,6 +1194,21 @@ mod tests {
         }
     }
 
+    /// `download_targets` resolves collisions by pushing a member onto its own
+    /// `models_dir/<target>`, and `claimed_member` reads a configured path's
+    /// filename against this list. Both are only sound while the list and the
+    /// bundle's GGUF entries are the same set.
+    #[test]
+    fn gguf_targets_lists_exactly_the_bundles_ggufs() {
+        let from_bundle: std::collections::HashSet<&str> = MODEL_FILES
+            .iter()
+            .map(|file| file.target)
+            .filter(|target| target.ends_with(".gguf"))
+            .collect();
+        let listed: std::collections::HashSet<&str> = GGUF_TARGETS.into_iter().collect();
+        assert_eq!(from_bundle, listed);
+    }
+
     #[test]
     fn every_spec_entry_pins_a_well_formed_digest() {
         for file in MODEL_FILES {
@@ -1208,20 +1300,56 @@ mod tests {
         assert_eq!(once, twice);
     }
 
+    fn dest_of<'a>(targets: &'a [DownloadTarget], key: &str) -> &'a Path {
+        &targets
+            .iter()
+            .find(|target| target.key == key)
+            .unwrap_or_else(|| panic!("no bundle member keyed {key}"))
+            .dest
+    }
+
     #[test]
     fn download_targets_routes_gguf_files_to_the_configured_config_paths() {
         let models_dir = Path::new("/app-data/models");
         let primary = Path::new("/custom/primary.gguf");
-        let escalation = Path::new("/app-data/models/Qwen3-1.7B-Q8_0.gguf");
-        let targets = download_targets(models_dir, primary, escalation);
+        let escalation = models_dir.join(ESCALATION_GGUF_NAME);
+        let targets = download_targets(models_dir, primary, &escalation);
 
-        let primary_target = targets.iter().find(|t| t.key == PRIMARY_GGUF_NAME).unwrap();
-        assert_eq!(primary_target.dest, primary);
-        let escalation_target = targets
-            .iter()
-            .find(|t| t.key == ESCALATION_GGUF_NAME)
-            .unwrap();
-        assert_eq!(escalation_target.dest, escalation);
+        assert_eq!(dest_of(&targets, PRIMARY_GGUF_NAME), primary);
+        assert_eq!(dest_of(&targets, ESCALATION_GGUF_NAME), escalation);
+    }
+
+    /// Destinations follow the member a configured path *names*, not the tier
+    /// field it happens to sit in. A config carried across a tier-table change
+    /// can have the two canonical names in the opposite fields, and a router
+    /// keyed on tier role would then write each GGUF over the other one — two
+    /// destinations, two digests, neither of them satisfiable.
+    #[test]
+    fn download_targets_follow_the_model_a_tier_names_not_the_tier_it_sits_in() {
+        let models_dir = Path::new("/app-data/models");
+        let swapped_primary = models_dir.join(ESCALATION_GGUF_NAME);
+        let swapped_escalation = models_dir.join(PRIMARY_GGUF_NAME);
+        let targets = download_targets(models_dir, &swapped_primary, &swapped_escalation);
+
+        assert_eq!(dest_of(&targets, PRIMARY_GGUF_NAME), swapped_escalation);
+        assert_eq!(dest_of(&targets, ESCALATION_GGUF_NAME), swapped_primary);
+    }
+
+    /// The collapsed lane every machine at or below 9 GiB of RAM runs: both
+    /// fields name the primary. The escalation GGUF is still fetched, and must
+    /// land on its own canonical name rather than on top of the primary the
+    /// operator is actually running.
+    #[test]
+    fn download_targets_keep_the_escalation_gguf_off_a_collapsed_primary() {
+        let models_dir = Path::new("/app-data/models");
+        let collapsed = models_dir.join(PRIMARY_GGUF_NAME);
+        let targets = download_targets(models_dir, &collapsed, &collapsed);
+
+        assert_eq!(dest_of(&targets, PRIMARY_GGUF_NAME), collapsed);
+        assert_eq!(
+            dest_of(&targets, ESCALATION_GGUF_NAME),
+            models_dir.join(ESCALATION_GGUF_NAME)
+        );
     }
 
     #[test]
@@ -1230,18 +1358,58 @@ mod tests {
         let shared = Path::new("/custom/primary.gguf");
         let targets = download_targets(models_dir, shared, shared);
 
-        let primary = targets
-            .iter()
-            .find(|target| target.key == PRIMARY_GGUF_NAME)
-            .unwrap();
-        let escalation = targets
-            .iter()
-            .find(|target| target.key == ESCALATION_GGUF_NAME)
-            .unwrap();
+        // A collapsed pair is one model and one download, so the escalation
+        // tier is the one that yields to its own canonical name.
+        assert_eq!(dest_of(&targets, PRIMARY_GGUF_NAME), shared);
+        assert_eq!(
+            dest_of(&targets, ESCALATION_GGUF_NAME),
+            models_dir.join(ESCALATION_GGUF_NAME)
+        );
+    }
 
-        assert_ne!(primary.dest, escalation.dest);
-        assert_eq!(primary.dest, models_dir.join("Qwen3-0.6B-Q8_0.gguf"));
-        assert_eq!(escalation.dest, models_dir.join("Qwen3-1.7B-Q8_0.gguf"));
+    /// The invariant, stated against the property rather than against today's
+    /// basenames so it keeps holding when the tier table moves again: for any
+    /// pair of configured paths — including a collapsed pair, a path that
+    /// names another member, and a path that names a member the *other* tier
+    /// also names — every bundle member gets a destination of its own.
+    ///
+    /// Two members sharing one destination is not cosmetic: the second one to
+    /// arrive fails `ensure_file`'s digest gate on the first one's bytes, and
+    /// the bundle can never finish.
+    #[test]
+    fn download_targets_never_route_two_bundle_members_to_one_destination() {
+        let models_dir = Path::new("/app-data/models");
+        let candidates = [
+            PathBuf::from(""),
+            PathBuf::from("/custom/primary.gguf"),
+            PathBuf::from("/custom/shared.gguf"),
+            models_dir.join(PRIMARY_GGUF_NAME),
+            models_dir.join(ESCALATION_GGUF_NAME),
+            models_dir.join(SEMANTIC_MODEL_TARGET),
+            // Case variants of both canonical names: `model_paths_collide` is
+            // case-insensitive, and a router that compared filenames with `==`
+            // would route these onto a member that is also going somewhere else.
+            models_dir.join("Qwen3-0.6b-q8_0.GGUF"),
+            models_dir.join("Qwen3-1.7b-q8_0.GGUF"),
+        ];
+        for primary in &candidates {
+            for escalation in &candidates {
+                let targets = download_targets(models_dir, primary, escalation);
+                assert_eq!(targets.len(), MODEL_FILES.len());
+                let mut seen = std::collections::HashSet::new();
+                for target in &targets {
+                    assert!(
+                        seen.insert(target.dest.clone()),
+                        "{} and an earlier member both resolve to {} \
+                         (primary {}, escalation {})",
+                        target.key,
+                        target.dest.display(),
+                        primary.display(),
+                        escalation.display()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

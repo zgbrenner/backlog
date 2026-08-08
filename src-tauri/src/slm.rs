@@ -7,6 +7,28 @@
 //! chat template through llama.cpp's OpenAI-compatible chat-completions
 //! endpoint.
 //!
+//! A Qwen3-1.7B primary with a Qwen3-4B-Q4_K_M escalation was built and
+//! measured against this pair and **rejected**, so that neither the idea nor
+//! the reason for dropping it has to be reconstructed. On the same corpus,
+//! same code, same context and evidence budget, `slm_parallel: 1`,
+//! `convert_workers: 3`, at matched evidence coverage: **40.11 s/file against
+//! 20.03**. Twice the wall clock, and the only quality signal that favoured it
+//! was two documents of subject faithfulness at n=26 — inside the run-to-run
+//! variance `docs/SIZING.md` warns about. It was not a memory problem; the
+//! 1.7B primary fits the 16 GB class comfortably. It simply did not earn its
+//! seconds.
+//!
+//! What did earn them was upstream of the model: `filter.rs`'s
+//! `semantic_top_k` had been a hardcoded 12 paragraphs unrelated to
+//! `evidence_token_budget`, and deriving it made this same 0.6B pair **19%
+//! faster** (24.69 -> 20.03 s/file) by putting better evidence in front of it
+//! and provoking fewer rejected proposals. When naming quality is the
+//! question, look at what reaches the model before reaching for a bigger one.
+//!
+//! At or below 9 GiB `Config::normalize` leaves the escalation GGUF equal to
+//! the primary and rung 3 runs on the server that is already up — see
+//! `escalation_collapsed`.
+//!
 //! Qwen3 and its GGUF conversions are Apache-2.0; this replaces the prior
 //! Liquid-licensed LFM2.5 lane so the app can be redistributed without a
 //! non-standard model license.
@@ -21,24 +43,95 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+/// `--ctx-size` granted per llama-server slot; the server is asked for
+/// `SLM_CTX_PER_SLOT * parallel` (see `server_args`).
+///
+/// Derived, not chosen. Rung 3 asks the filter for 4000 evidence "tokens" in
+/// the codebase's optimistic chars/4 unit (`Config::escalation_evidence_token_budget`),
+/// which is 16000 characters of real document text. Qwen3's tokenizer does not
+/// achieve chars/4 on what an evidence bundle is made of — ISO dates, party
+/// names, case captions, currency, table fragments and this module's own label
+/// prefixes — so the slot is sized at a pessimistic 3 real chars/token: 5334
+/// tokens. Add [`SLM_PROMPT_RESERVE_TOKENS`] (640) and [`SLM_MAX_OUTPUT_TOKENS`]
+/// (220) and one slot must hold 6194 tokens; rounded up to the next multiple of
+/// 256, because llama.cpp allocates KV in blocks and a ragged number buys
+/// nothing, that is 6656.
+///
+/// The cost is paid in resident memory on every install: at 6656 the 28-layer
+/// KV cache the shipped 0.6B and 1.7B share is 728 MiB per slot, against
+/// 448 MiB at the old 4096 — which is why `slm_parallel` tops out at 2 rather
+/// than the 4 it allowed when slots were cheaper. Do not raise this to "leave
+/// headroom" without redoing the RAM tiering in `config.rs` — nothing here
+/// fails loudly when the sum stops fitting; the machine just swaps.
+///
+/// Overflow in the other direction is not slow, it is wrong: llama.cpp does not
+/// refuse an over-length prompt, it drops what does not fit, and the model then
+/// names the document from evidence with a hole in it. `filter::max_bundle_chars`
+/// derives an enforced ceiling from this constant for exactly that reason.
+pub const SLM_CTX_PER_SLOT: u32 = 6656;
+
+/// Tokens reserved inside each slot for everything that is not evidence: the
+/// system prompt, the operator's `custom_naming_notes` section, the retry's
+/// violation note and Qwen3's chat-template wrapper.
+///
+/// `build_system_prompt`'s core rules render to ~1.6 kB, which is ~530 tokens
+/// at the same pessimistic 3 chars/token this lane sizes everything against and
+/// closer to 400 at a realistic rate; the chat template and the retry's
+/// violation note are tens of tokens each. 640 therefore covers what the app
+/// ships with, and the operator's notes are the variable part —
+/// `Config::validate` caps them at 600 characters, which at 3 chars/token is
+/// another 200. Worst case (a maxed-out notes block, everything tokenizing at
+/// the pessimistic rate) overruns this reserve by roughly 135 tokens, and that
+/// is deliberately survivable: rounding [`SLM_CTX_PER_SLOT`] up to a multiple
+/// of 256 left ~460 tokens of slack in the slot, which is where the overrun is
+/// spent. This number is the sizing assumption, not a limit anything enforces —
+/// nothing measures the rendered prompt at runtime.
+pub const SLM_PROMPT_RESERVE_TOKENS: u32 = 640;
+
+/// `max_tokens` for one naming response (see `request_body`). The answer is a
+/// small JSON object — date, subject, description — so 220 is generous for it;
+/// the value is unchanged and only named here because the slot ceiling has to
+/// reserve it, and a literal buried inside a `json!` body cannot be derived
+/// from.
+pub const SLM_MAX_OUTPUT_TOKENS: u32 = 220;
+
 /// How long a freshly spawned llama-server gets to answer `/health` before
-/// the child is killed and the slot cleared. Loading a 1.8 GB GGUF off a
-/// cold disk is genuinely slow; being wedged forever is not acceptable.
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
+/// the child is killed and the slot cleared. Being wedged forever is not
+/// acceptable; neither is killing a server that is merely still loading.
+///
+/// 60s was sized when the largest GGUF this lane loaded was 1.8 GB into a
+/// 4096-token slot. The escalation tier is now a 2.33 GB Q4_K_M read off a
+/// possibly-cold disk, followed by a ~936 MiB KV allocation at
+/// [`SLM_CTX_PER_SLOT`] — both of which happen before
+/// `/health` answers at all. Losing that race is not a slow first document, it
+/// is a permanent one: the deadline kills the child and clears the slot, so the
+/// next attempt starts the same multi-gigabyte load from scratch and fails the
+/// same way forever. 180s is a ceiling, not a wait — the loop polls every
+/// `HEALTH_POLL_INTERVAL` and a warm start still returns in under a second, so
+/// raising this costs a healthy machine nothing and only widens what a
+/// genuinely slow first load is allowed to take.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long one `/v1/chat/completions` call may take before the client gives up.
 ///
-/// Must stay at or above `Config::per_file_wall_clock_secs` (default 90), which
-/// is what `pipeline.rs`'s `wall_clock_cap` budgets for a single naming rung.
-/// This was 60s against that 90s budget, so the two disagreed about who gets to
-/// end a slow request — and the tighter one silently won. That never showed up
-/// on a workstation, where naming takes seconds; it matters on the 8 GB, no-GPU
-/// laptops this ships to, where the whole point of the wall-clock budget is to
-/// tolerate a slow-but-succeeding document. Losing the race turns such a file
-/// into `SLM_FAIL:no valid output after escalation` — a message that blames the
+/// Must stay at or above `Config::per_file_wall_clock_secs` (default 180),
+/// which is what `pipeline.rs`'s `wall_clock_cap` budgets for a single naming
+/// rung. The pair was once inverted — a 60s client against a 90s budget — so
+/// the two disagreed about who gets to end a slow request and the tighter one
+/// silently won. That never showed up on a workstation, where naming takes
+/// seconds; it matters on the no-GPU laptops this ships to, where the whole
+/// point of the wall-clock budget is to tolerate a slow-but-succeeding
+/// document. Losing the race turns such a file into
+/// `SLM_FAIL:no valid output after escalation` — a message that blames the
 /// model for a deadline the HTTP client imposed.
-const NAMING_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// 300s keeps the ordering correct with room for the operator to raise the
+/// knob: the configured budget, not this constant, is what ends a slow naming
+/// request, so the number in `backlog.config.json` means what it says and the
+/// timeout that fires is the one whose expiry the pipeline can attribute. Past
+/// 300 the ordering inverts again and this constant has to move with it.
+const NAMING_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How far above the configured base port `reserve_port` will look for a free
 /// one before giving up.
@@ -72,6 +165,19 @@ impl Drop for Server {
 enum ResolvedSlot {
     Primary,
     Escalation,
+}
+
+impl ResolvedSlot {
+    /// What a log line calls this slot. The physical slot, deliberately, not
+    /// the nominal `Tier` — a collapsed install routes `Tier::Escalation` onto
+    /// the primary child, and a recycle line that named the tier would blame
+    /// the wrong server.
+    fn name(self) -> &'static str {
+        match self {
+            ResolvedSlot::Primary => "primary",
+            ResolvedSlot::Escalation => "escalation",
+        }
+    }
 }
 
 /// Per-tier server tuning. Grouped so adding a knob touches one call site's
@@ -157,7 +263,10 @@ pub struct SlmLane {
     primary: Mutex<Option<Server>>,
     escalation: Mutex<Option<Server>>,
     http: reqwest::Client,
-    /// 0 disables request-count recycling of the primary server.
+    /// 0 disables request-count recycling. Applies to BOTH slots: llama.cpp's
+    /// Windows RSS growth is a property of the server process, not of the tier
+    /// it happens to be serving, and the escalation server is now the larger
+    /// of the two. See `Config::slm_recycle_after_requests`.
     recycle_after_requests: u32,
     /// 0 disables escalation idle-reaping (resident for process lifetime).
     escalation_idle_secs: u64,
@@ -170,6 +279,11 @@ pub struct SlmLane {
     naming_notes: String,
     /// Reset to 0 on every successful (re)spawn of the primary server.
     primary_requests_served: AtomicU64,
+    /// Same, for a genuinely separate (non-collapsed) escalation child. A
+    /// collapsed install never resolves to `ResolvedSlot::Escalation`, so this
+    /// stays 0 there and the primary's counter does all the work — which is
+    /// correct, because collapsed means there is only one process to grow.
+    escalation_requests_served: AtomicU64,
     /// Requests currently dispatched to the live primary child.
     primary_inflight: AtomicU64,
     /// Same, for a genuinely separate (non-collapsed) escalation child.
@@ -248,6 +362,7 @@ impl SlmLane {
             escalation_idle_secs: tuning.escalation_idle_secs,
             naming_notes: String::new(),
             primary_requests_served: AtomicU64::new(0),
+            escalation_requests_served: AtomicU64::new(0),
             primary_inflight: AtomicU64::new(0),
             escalation_inflight: AtomicU64::new(0),
             escalation_last_completion: Mutex::new(None),
@@ -284,7 +399,10 @@ impl SlmLane {
             "--threads".to_string(),
             threads.to_string(),
             "--ctx-size".to_string(),
-            (4096u32 * parallel as u32).to_string(),
+            // llama.cpp splits --ctx-size evenly across --parallel slots, so
+            // the total has to scale with the slot count or two concurrent
+            // documents would each get half a slot's worth of context.
+            (SLM_CTX_PER_SLOT * parallel as u32).to_string(),
             // Required so llama-server renders Qwen3's embedded chat
             // template for the /v1/chat/completions endpoint below.
             "--jinja".to_string(),
@@ -293,6 +411,23 @@ impl SlmLane {
             "--api-key".to_string(),
             api_key.to_string(),
         ]
+    }
+
+    /// The slot's served-request counter. Split from `inflight` because the
+    /// two answer different questions — "how much has this child grown" and
+    /// "may it be killed right now" — and the recycle decision needs both.
+    fn requests_served(&self, slot: ResolvedSlot) -> &AtomicU64 {
+        match slot {
+            ResolvedSlot::Primary => &self.primary_requests_served,
+            ResolvedSlot::Escalation => &self.escalation_requests_served,
+        }
+    }
+
+    fn inflight(&self, slot: ResolvedSlot) -> &AtomicU64 {
+        match slot {
+            ResolvedSlot::Primary => &self.primary_inflight,
+            ResolvedSlot::Escalation => &self.escalation_inflight,
+        }
     }
 
     fn parallel_for(&self, slot: ResolvedSlot) -> u8 {
@@ -341,18 +476,30 @@ impl SlmLane {
     /// the server that is already up. Standing a second llama-server on a
     /// second port over the same GGUF would double the resident cost — and
     /// the KV cache, not the weights, is the expensive half — to buy nothing.
-    /// This is the configuration an 8 GB machine ships in: the installer
-    /// carries only the 0.6B, `Config::normalize` points both tiers at it,
-    /// and the escalation rung still happens.
+    ///
+    /// This is the shape an 8 GB machine ships in: the installer carries only
+    /// the 0.6B, `Config::normalize` points both tiers at it, and the
+    /// escalation rung still happens. Above 9 GiB the 1.7B is fetched by the
+    /// in-app downloader and gets a server of its own.
+    ///
+    /// Collapse is cheaper than it was, and worth knowing before widening it.
+    /// At `SLM_CTX_PER_SLOT` 6656 a second 0.6B slot costs 728 MiB of KV
+    /// rather than the 448 MiB it cost at 4096, so the memory saved by
+    /// collapsing grew with the context — but what collapse costs in quality
+    /// did not change: rung 3 still runs, on a wider evidence bundle, against
+    /// the server already up.
     pub fn escalation_collapsed(&self) -> bool {
         self.escalation_gguf == self.primary_gguf
     }
 
     /// Why the child is re-checked and the slot cleared rather than polled to
     /// exhaustion: a llama-server that died on startup (missing CUDA runtime,
-    /// corrupt GGUF, port taken) used to cost 60 seconds of polling followed
-    /// by a message that named the port and nothing else — and every later
-    /// call paid the same 60 seconds against the same dead child forever.
+    /// corrupt GGUF, port taken) used to cost a full `HEALTH_TIMEOUT` of
+    /// polling followed by a message that named the port and nothing else —
+    /// and every later call paid that same wait against the same dead child
+    /// forever. Now that the timeout is 180s to accommodate a multi-gigabyte
+    /// cold load, detecting the corpse rather than waiting it out matters
+    /// three times as much as it did.
     async fn ensure_up(&self, tier: Tier) -> anyhow::Result<(u16, ServeGuard<'_>)> {
         anyhow::ensure!(
             !self.shutting_down.load(Ordering::SeqCst),
@@ -389,19 +536,32 @@ impl SlmLane {
 
             // Recycle check runs BEFORE the live/dead check and under the
             // same lock as the respawn decision below — this is the only
-            // place two concurrent ensure_up calls for the primary slot are
+            // place two concurrent ensure_up calls for one slot are
             // serialized, and it is what makes "never race an in-flight
             // request" provable: the inflight read here can never be stale
             // relative to another task's reservation, because reservations
             // (below) are also made inside this same critical section.
-            if resolved == ResolvedSlot::Primary && guard.is_some() {
-                let served = self.primary_requests_served.load(Ordering::SeqCst);
-                let inflight = self.primary_inflight.load(Ordering::SeqCst);
+            //
+            // Both slots recycle, not just the primary. Until the 1.7B/4B
+            // tiers this was primary-only, on the reasoning that the
+            // escalation server is woken rarely and idle-reaped anyway. That
+            // no longer holds: the escalation server is now the LARGER of the
+            // two, and measurement on this workload put the 4B at a 5,068 MiB
+            // working set at rest and 9,258 MiB after sixteen requests. An
+            // escalation server that is busy enough never to go idle is
+            // exactly the one that grows, and idle-reaping by definition never
+            // fires on it.
+            if guard.is_some() {
+                let served = self.requests_served(resolved).load(Ordering::SeqCst);
+                let inflight = self.inflight(resolved).load(Ordering::SeqCst);
                 if self.recycle_after_requests > 0
                     && served >= self.recycle_after_requests as u64
                     && inflight == 0
                 {
-                    log::info!("recycling primary llama-server after {served} requests");
+                    log::info!(
+                        "recycling {} llama-server after {served} requests",
+                        resolved.name()
+                    );
                     *guard = None; // Server::drop kills the outgoing child
                 }
                 // inflight > 0: defer. The next ensure_up call that finds
@@ -423,26 +583,17 @@ impl SlmLane {
                     let port = reserve_port(preferred_port)?;
                     let server = self.spawn_server(gguf, port, self.parallel_for(resolved))?;
                     *guard = Some(server);
-                    if resolved == ResolvedSlot::Primary {
-                        self.primary_requests_served.store(0, Ordering::SeqCst);
-                    }
+                    self.requests_served(resolved).store(0, Ordering::SeqCst);
                     port
                 }
             };
 
             // Reserve the dispatch while still holding the lock (see comment
-            // above). This does NOT yet count toward `primary_requests_served`
+            // above). This does NOT yet count toward the slot's served count
             // — that only happens once health is confirmed, so a server that
-            // never comes up doesn't inflate the "served" count that gates
-            // the NEXT recycle decision.
-            match resolved {
-                ResolvedSlot::Primary => {
-                    self.primary_inflight.fetch_add(1, Ordering::SeqCst);
-                }
-                ResolvedSlot::Escalation => {
-                    self.escalation_inflight.fetch_add(1, Ordering::SeqCst);
-                }
-            }
+            // never comes up doesn't inflate the count that gates the NEXT
+            // recycle decision.
+            self.inflight(resolved).fetch_add(1, Ordering::SeqCst);
             port
         };
 
@@ -451,13 +602,8 @@ impl SlmLane {
         // health-check failure that leaked the reservation would freeze
         // `primary_inflight` at "busy" forever and permanently disable
         // recycling.
-        let release = |lane: &Self| match resolved {
-            ResolvedSlot::Primary => {
-                lane.primary_inflight.fetch_sub(1, Ordering::SeqCst);
-            }
-            ResolvedSlot::Escalation => {
-                lane.escalation_inflight.fetch_sub(1, Ordering::SeqCst);
-            }
+        let release = |lane: &Self| {
+            lane.inflight(resolved).fetch_sub(1, Ordering::SeqCst);
         };
 
         let health_url = format!("http://127.0.0.1:{port}/health");
@@ -483,9 +629,8 @@ impl SlmLane {
                 .await
             {
                 if response.status().is_success() {
-                    if resolved == ResolvedSlot::Primary {
-                        self.primary_requests_served.fetch_add(1, Ordering::SeqCst);
-                    }
+                    self.requests_served(resolved)
+                        .fetch_add(1, Ordering::SeqCst);
                     return Ok((
                         port,
                         ServeGuard {
@@ -603,7 +748,7 @@ impl SlmLane {
                 {"role": "user", "content": evidence}
             ],
             "temperature": 0.0,
-            "max_tokens": 220,
+            "max_tokens": SLM_MAX_OUTPUT_TOKENS,
             "stream": false,
             "cache_prompt": false,
             "chat_template_kwargs": {"enable_thinking": false},
@@ -710,8 +855,26 @@ impl SlmLane {
         // 54 files in the 2026-08-05 v0.8.2 validation run — the 0.6B parrots
         // any salient literal it is handed. The checker cannot catch this: the
         // subject is well-formed, only unfaithful. Keep these rules structural;
-        // the one surviving example lives in the description rule, whose
-        // output was never observed to parrot.
+        // the one surviving example lives in the description rule.
+        //
+        // That surviving example DOES parrot, and saying otherwise here was
+        // wrong. The 2026-08-06 1.7B/4B batch named `v090b_edge_garbage.pdf` —
+        // a deliberately contentless fixture — as
+        // `2026-08-06 Shareholder's register - John Smith.pdf`, description
+        // `Shareholder's register transferring 40,000 shares to John Smith.`,
+        // which is this rule's example copied whole. It shipped `ok`, not
+        // flagged: the date fell back to mtime, and the subject is
+        // well-formed, so nothing downstream had grounds to reject it.
+        //
+        // Deliberately not fixed here. Removing the example is a one-line
+        // change with a measured cost — the example is what stops descriptions
+        // opening `The document...`, and 0.4.3's numbers were bought partly by
+        // it — so it needs its own A/B over the full sample rather than a
+        // reflex during a model-tier change. The failure mode is confined to
+        // documents with no extractable content, where every possible name is
+        // wrong; the real defect is that such a document is named at all
+        // instead of being flagged for having nothing to name it from.
+        // Recorded in docs/KNOWN_ISSUES.md.
         let mut system = format!(
             "You name business and legal documents from evidence excerpts.\n\
              Document language: {language}. Classified type: {doc_type}.\n\
@@ -1055,7 +1218,8 @@ mod tests {
     }
 
     /// A missing or dead llama-server must fail fast with something a support
-    /// ticket can act on, not after a 60-second poll against a corpse.
+    /// ticket can act on, not after a full `HEALTH_TIMEOUT` poll against a
+    /// corpse.
     #[tokio::test]
     async fn ensure_up_fails_immediately_when_the_binary_cannot_be_spawned() {
         let lane = lane(19_237);
@@ -1079,16 +1243,23 @@ mod tests {
         );
     }
 
+    /// Expectations are computed from `SLM_CTX_PER_SLOT` rather than restated
+    /// as literals: the constant is sized against the escalation evidence
+    /// budget and will move again when that is remeasured, and a test that
+    /// hardcoded 8192/4096 would keep passing while asserting the wrong thing
+    /// — the one failure mode this test exists to catch. What it does pin is
+    /// the *relationship*: per-slot context times that tier's own parallel.
     #[test]
     fn spawn_server_uses_the_resolved_tiers_own_parallel_and_ctx_size() {
         let get = |args: &[String], flag: &str| -> Option<String> {
             args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
         };
+        let expected_ctx = |parallel: u32| (SLM_CTX_PER_SLOT * parallel).to_string();
 
         let primary_args =
             SlmLane::server_args(Path::new("/models/x.gguf"), 18_137, 2, 4, "secret-token");
         assert_eq!(get(&primary_args, "--parallel").as_deref(), Some("2"));
-        assert_eq!(get(&primary_args, "--ctx-size").as_deref(), Some("8192"));
+        assert_eq!(get(&primary_args, "--ctx-size"), Some(expected_ctx(2)));
         assert_eq!(get(&primary_args, "--threads").as_deref(), Some("4"));
         assert_eq!(get(&primary_args, "--port").as_deref(), Some("18137"));
         assert_eq!(
@@ -1097,11 +1268,40 @@ mod tests {
         );
 
         // A different tier's own parallel changes both --parallel and
-        // --ctx-size together (4096 * parallel), independent of --threads.
+        // --ctx-size together, independent of --threads.
         let escalation_args =
             SlmLane::server_args(Path::new("/models/x.gguf"), 18_138, 1, 4, "secret-token");
         assert_eq!(get(&escalation_args, "--parallel").as_deref(), Some("1"));
-        assert_eq!(get(&escalation_args, "--ctx-size").as_deref(), Some("4096"));
+        assert_eq!(get(&escalation_args, "--ctx-size"), Some(expected_ctx(1)));
+        assert_ne!(
+            get(&primary_args, "--ctx-size"),
+            get(&escalation_args, "--ctx-size"),
+            "a per-slot size that ignored --parallel would give both tiers the same total"
+        );
+    }
+
+    /// The slot has to hold the widest bundle the filter can hand it plus the
+    /// prompt and the answer. That is how `SLM_CTX_PER_SLOT` was derived, and
+    /// it is only true while all four constants agree — one of them being
+    /// edited alone is precisely the silent overflow (llama.cpp truncates
+    /// rather than refuses) that `filter::max_bundle_chars` exists to prevent.
+    #[test]
+    fn one_slot_holds_the_largest_bundle_plus_the_prompt_and_the_answer() {
+        // The ceiling is expressed in characters; convert back at the same
+        // pessimistic rate it was derived with.
+        let evidence_tokens = crate::filter::max_bundle_chars()
+            .div_ceil(crate::filter::CONSERVATIVE_CHARS_PER_TOKEN)
+            as u32;
+        assert!(
+            evidence_tokens + SLM_PROMPT_RESERVE_TOKENS + SLM_MAX_OUTPUT_TOKENS <= SLM_CTX_PER_SLOT,
+            "{evidence_tokens} evidence + {SLM_PROMPT_RESERVE_TOKENS} prompt + \
+             {SLM_MAX_OUTPUT_TOKENS} answer must fit {SLM_CTX_PER_SLOT}"
+        );
+        assert_eq!(
+            SLM_CTX_PER_SLOT % 256,
+            0,
+            "llama.cpp allocates KV in blocks; a ragged slot size buys nothing"
+        );
     }
 
     /// §7.4 regression: nothing ever resolves to `ResolvedSlot::Escalation`
@@ -1187,6 +1387,87 @@ server.serve_forever()
             2,
             tuning,
         )
+    }
+
+    /// The slot generalization itself, provable without spawning anything:
+    /// each slot must own a distinct pair of counters. A `requests_served`
+    /// that returned the primary's counter for both slots would make the
+    /// escalation server recycle on the primary's traffic — and, worse, look
+    /// correct in the unix-only spawn tests below, which only ever drive one
+    /// slot at a time.
+    #[test]
+    fn each_slot_counts_its_own_requests_and_its_own_in_flight_work() {
+        let lane = lane(19_437);
+        for slot in [ResolvedSlot::Primary, ResolvedSlot::Escalation] {
+            lane.requests_served(slot).store(0, Ordering::SeqCst);
+            lane.inflight(slot).store(0, Ordering::SeqCst);
+        }
+
+        lane.requests_served(ResolvedSlot::Primary)
+            .fetch_add(7, Ordering::SeqCst);
+        lane.inflight(ResolvedSlot::Escalation)
+            .fetch_add(3, Ordering::SeqCst);
+
+        assert_eq!(
+            lane.requests_served(ResolvedSlot::Primary)
+                .load(Ordering::SeqCst),
+            7
+        );
+        assert_eq!(
+            lane.requests_served(ResolvedSlot::Escalation)
+                .load(Ordering::SeqCst),
+            0,
+            "the escalation server must not inherit the primary's request count"
+        );
+        assert_eq!(
+            lane.inflight(ResolvedSlot::Primary).load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            lane.inflight(ResolvedSlot::Escalation)
+                .load(Ordering::SeqCst),
+            3
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escalation_recycles_after_the_configured_request_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let lane = fake_lane(
+            29_501,
+            dir.path(),
+            SlmTuning {
+                recycle_after_requests: 3,
+                ..SlmTuning::default()
+            },
+        );
+
+        // The escalation server is the larger of the two tiers now, so it is
+        // the one whose unbounded growth actually threatens the machine. Until
+        // the 1.7B/4B change it was never recycled at all: idle-reaping was
+        // the only bound, and it by definition never fires on the busy server
+        // that is doing the growing.
+        let mut first_pid = None;
+        for call in 1..=4u32 {
+            let (_port, guard) = lane.ensure_up(Tier::Escalation).await.unwrap();
+            drop(guard);
+            let pid = lane.escalation_child_pid().expect("server must be up");
+            match call {
+                1 => first_pid = Some(pid),
+                3 => assert_eq!(
+                    Some(pid),
+                    first_pid,
+                    "must not recycle before the configured threshold"
+                ),
+                4 => assert_ne!(
+                    Some(pid),
+                    first_pid,
+                    "the 4th call must recycle after 3 served requests"
+                ),
+                _ => {}
+            }
+        }
     }
 
     #[cfg(unix)]

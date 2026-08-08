@@ -2,6 +2,8 @@
 //! data dir; every field has a sane default so first launch works with only
 //! the folder paths filled in from the UI.
 
+use crate::filter::{max_bundle_chars, BUDGET_CHARS_PER_TOKEN};
+use crate::slm::SLM_CTX_PER_SLOT;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -75,16 +77,53 @@ pub struct Config {
     pub slm_escalation_gguf: PathBuf,
     pub slm_parallel: u8,
     pub slm_escalation_parallel: u8,
-    /// Requests a primary llama-server serves before being killed and
-    /// respawned — llama.cpp Windows RSS growth is unfixed upstream
-    /// (ggml-org/llama.cpp#24356; measured 3.45->4.45 GB over 21 files).
-    /// 0 disables recycling.
+    /// Requests EITHER llama-server serves before being killed and respawned —
+    /// llama.cpp Windows RSS growth is unfixed upstream
+    /// (ggml-org/llama.cpp#24356). 0 disables recycling.
+    ///
+    /// Was 64, from a measurement of 3.45->4.45 GB over 21 files on this same
+    /// 0.6B/1.7B pair — but at the old 4096-token slot. Growth tracks the KV
+    /// cache the server is churning through, and the slot is now 6656, so that
+    /// threshold no longer bounds what it was chosen to bound. Measured on this
+    /// workload at ctx 6656, parallel 1:
+    ///
+    /// | server | at rest | after 3 | after 16 |
+    /// |---|---|---|---|
+    /// | Qwen3-1.7B-Q8_0 | 2,860 MiB WS | — | 5,785 MiB WS |
+    /// | Qwen3-4B-Q4_K_M | 5,068 MiB WS / 2,842 private | 6,186 / 3,880 | 9,258 MiB WS |
+    ///
+    /// The 1.7B row is the one that binds what ships: it is this build's
+    /// escalation server, and it doubles its working set inside 16 requests. At
+    /// 64 it would pass 5.8 GB on the 16 GB deployment target long before
+    /// recycling, on top of the primary beside it. The 4B row is from the
+    /// rejected tier sweep (see `default_primary_gguf_for_ram`) and is kept
+    /// because it is the evidence behind `GgufShape::overhead_bytes`, not
+    /// because anything ships it. The 0.6B primary was never measured at this
+    /// context — which is a reason to keep the threshold low, not a reason to
+    /// assume the small model is well behaved.
+    ///
+    /// The growth is front-loaded, so a low threshold is what actually bounds
+    /// it.
+    ///
+    /// 8 is affordable because respawning is cheap and getting cheaper the
+    /// more often you do it: a warm reload measured **3.5-3.6 s** against
+    /// naming requests of 35-84 s, so recycling every eighth request costs
+    /// about 1.3% of wall clock. The file is still in the OS page cache
+    /// immediately after a recycle, which is what keeps the reload warm.
+    /// `cache_prompt` is already false, so a recycle discards nothing that was
+    /// going to be reused.
     pub slm_recycle_after_requests: u32,
     /// Seconds since the escalation server's last request COMPLETED (never
     /// mid-request — see `SlmLane::reap_idle_escalation`) before it is
     /// dropped. 0 disables idle-reaping (resident for the process lifetime).
     pub slm_escalation_idle_secs: u64,
-    /// Max evidence tokens (approximate, chars/4) sent to the SLM.
+    /// Max evidence tokens (approximate, chars/4) sent to the SLM on rungs 1
+    /// and 2. Rung 3 does not get a second field: it is derived from this one
+    /// by `escalation_evidence_token_budget`, so raising this raises both
+    /// together and the two can never be configured into an inversion where
+    /// the escalation attempt sees *less* than the attempt it is retrying.
+    /// `validate` caps it at `max_evidence_token_budget()`, past which the
+    /// bundle, the system prompt and the answer stop fitting in one slot.
     pub evidence_token_budget: usize,
     /// Operator-supplied naming preferences appended to the SLM system prompt
     /// as a subordinate "Operator preferences" section (see
@@ -123,6 +162,30 @@ pub struct Config {
     pub manifest_emit_per_min: u32,
 
     /// Pages sampled for oversized documents.
+    ///
+    /// Left at 10/3 through the evidence-budget rise from 1500 to 2500, which
+    /// is the obvious thing to reopen and the wrong one. These two knobs decide
+    /// which pages are ELIGIBLE; `evidence_token_budget` decides how much of
+    /// the eligible text actually reaches the model, and it binds first almost
+    /// everywhere:
+    ///
+    /// * `convertd.py::_truncate_pdf_markdown` only engages at all above
+    ///   `head + tail` pages AND 40,000 characters of extracted markdown. A
+    ///   20-page document keeps 10/20 + 3/20 = 65% of its text; the evidence
+    ///   filter then selects 10,000 characters out of that.
+    /// * So a wider window does not add evidence, it adds *candidates* — more
+    ///   mid-document text competing for an unchanged character budget,
+    ///   against identifying signal (dates, parties, form numbers) that is
+    ///   front-loaded in real documents.
+    ///
+    /// The case it would genuinely help is a date or party that appears only
+    /// past page 10 of a long document, which is the harvest-window limit
+    /// already recorded in `docs/KNOWN_ISSUES.md` — a real limitation, but one
+    /// a budget rise neither causes nor fixes.
+    ///
+    /// Untested rather than validated: the v0.9.0 corpus has no document that
+    /// clears both thresholds, so the E2E batch cannot exercise this path.
+    /// Tuning it needs a corpus of genuinely long text-layer PDFs first.
     pub max_head_pages: usize,
     pub max_tail_pages: usize,
 
@@ -131,6 +194,19 @@ pub struct Config {
 
     /// Retry policy.
     pub max_stage_attempts: u8,
+    /// Wall-clock ceiling for one attempt at one file. `slm.rs`'s naming HTTP
+    /// timeout must stay at or above this, or the transport gives up while the
+    /// stage still believes it has time.
+    ///
+    /// 90 s was survivable when a rung sent 1500 evidence tokens at a warm
+    /// primary. Two things here moved it. `evidence_token_budget` rose to 2500
+    /// and `filter.rs`'s coverage fix is what finally made it bind (bundles
+    /// went from 6,526-7,652 to 9,277-10,000 characters), so every request
+    /// carries more; and rung 3 may cold-load the escalation server first —
+    /// 1749 MiB of weights plus a calculated 728 MiB KV preallocation,
+    /// CPU-only, on the target laptop. Against naming requests measured at
+    /// 35-84 s on their own, a ceiling below 180 does not fail a broken
+    /// document, it fails a slow one.
     pub per_file_wall_clock_secs: u64,
 
     /// Keep converted markdown in the cache after a file is successfully
@@ -155,14 +231,30 @@ impl Default for Config {
             llama_port: 8137,
             // Apache-2.0 Qwen3 GGUFs (llama.cpp) replace the Liquid-licensed
             // LFM2.5 pair so the app can be redistributed without a
-            // non-standard model license.
-            slm_primary_gguf: PathBuf::from("models/Qwen3-0.6B-Q8_0.gguf"),
-            slm_escalation_gguf: PathBuf::from("models/Qwen3-1.7B-Q8_0.gguf"),
+            // non-standard model license. The primary is the same 0.6B on
+            // every machine — promoting the 1.7B into that slot was measured
+            // and rejected, see `default_primary_gguf_for_ram` — and it is
+            // also the model the installer bundles, so a fresh install names
+            // its first document with no network at all. Only the escalation
+            // tier is chosen from installed RAM, because that is the one that
+            // asks whether a *second* server fits beside the first.
+            slm_primary_gguf: default_primary_gguf(),
+            slm_escalation_gguf: default_slm_escalation_gguf(),
             slm_parallel: default_slm_parallel(),
             slm_escalation_parallel: default_slm_escalation_parallel(),
-            slm_recycle_after_requests: 64,
-            slm_escalation_idle_secs: 600,
-            evidence_token_budget: 1500,
+            slm_recycle_after_requests: 8,
+            // Five minutes, not ten. The 1.7B escalation server is 2977 MiB
+            // of the 4815 MiB two-server footprint — 62% of the naming lane,
+            // calculated; see `slm_parallel_for_ram` — and only the minority
+            // of documents that fail twice on the 0.6B ever wake it.
+            // Releasing it after five idle minutes is what keeps the steady
+            // state on a batch with sparse escalations at 1838 MiB rather
+            // than 4815 MiB; at 600 s it frequently never fired inside a
+            // batch at all, which made it a knob in name only. Reaping is
+            // timestamped from request *completion*, so a longer-running
+            // escalation can never be reaped out from under itself.
+            slm_escalation_idle_secs: 300,
+            evidence_token_budget: 2500,
             custom_naming_notes: String::new(),
             ettin_model_dir: String::new(),
             convert_workers: default_convert_workers(),
@@ -174,7 +266,7 @@ impl Default for Config {
             max_tail_pages: 3,
             max_filename_len: 120,
             max_stage_attempts: 3,
-            per_file_wall_clock_secs: 90,
+            per_file_wall_clock_secs: 180,
             retain_cache: false,
             cache_ttl_days: 7,
         }
@@ -358,9 +450,30 @@ fn convert_workers_ram_ceiling(gib: Option<u64>) -> usize {
         // leaves real slack; two (1.1 GB) leaves under 150 MB — no margin.
         // This tier drops from 2 to 1.
         Some(g) if g <= 9 => 1,
-        // 16 GB class: ~8.3 GB left after OS/app/SLM@2. Four workers
-        // (2.2 GB) unchanged — wide margin at the corrected figure.
-        Some(g) if g <= 17 => 4,
+        // 16 GB class, and the machine BackLog is actually deployed on. This
+        // tier drops from 4 to 3, and it is worth being honest that the
+        // at-rest arithmetic alone no longer forces that. The 0.6B/1.7B pair
+        // holds a calculated 4815 MiB with both servers up
+        // (`slm_parallel_for_ram`), which on a 14.7 GB laptop with ~13.7 GiB
+        // usable leaves ~9.0 GiB; Windows takes 2.5-3 GiB and the app and
+        // WebView2 ~0.4 GiB, so the workers are dividing ~5.6-6.1 GiB and four
+        // of them (2.2 GB) would fit on paper.
+        //
+        // Two things say three anyway. At-rest is not steady state:
+        // llama.cpp's Windows RSS growth is unfixed upstream and the 1.7B
+        // measured 2,860 -> 5,785 MiB over 16 requests at this context, so a
+        // batch spends most of its life somewhere above 4815 MiB and
+        // `slm_recycle_after_requests` bounds that drift rather than removing
+        // it — the headroom this ceiling is protecting is the headroom that
+        // absorbs it. And the fourth worker buys throughput the pipeline
+        // cannot use while `Sidecar` serializes conversions, so it is real
+        // memory spent against a maybe.
+        //
+        // The common case is easier still. ~2.3 GiB of the naming lane is
+        // mmapped weights that Windows can evict, and the escalation server is
+        // reaped after `slm_escalation_idle_secs`, so most of a batch runs
+        // with the 1838 MiB primary alone and roughly 7 GiB free.
+        Some(g) if g <= 17 => 3,
         // >16 GB: CPU-derived by_cpu (capped 6) binds first, not RAM.
         Some(_) => 6,
         // Match the smallest tier: don't gamble on the smaller machine's behalf.
@@ -412,43 +525,310 @@ fn total_ram_gib() -> Option<u64> {
     None
 }
 
+/// The primary GGUF on every RAM tier, and the one the installer bundles — so
+/// a fresh install names its first document without a download, whatever the
+/// machine turns out to be. There is no second primary constant on purpose:
+/// see `default_primary_gguf_for_ram` for why every tier gets this one.
+const DEFAULT_PRIMARY_GGUF: &str = "models/Qwen3-0.6B-Q8_0.gguf";
+
+/// The GGUF a fresh install names for the escalation tier — on a machine that
+/// can hold a second server of this size beside the primary. Smaller machines
+/// get a collapsed pair instead; see `default_escalation_gguf_for_ram`.
+const DEFAULT_ESCALATION_GGUF: &str = "models/Qwen3-1.7B-Q8_0.gguf";
+
+/// The transformer shape of one GGUF this app ships, downloads, or defaults
+/// to, plus its pinned size.
+///
+/// Memory cost is not a property of the file size alone. llama.cpp
+/// preallocates the entire KV cache at startup and that cache scales with the
+/// *shape* of the attention stack, which not every catalogued model shares:
+/// the 0.6B and 1.7B this build ships both have 28 layers, the 4B has 36.
+/// Every estimate in this module reads its shape from here instead of
+/// hardcoding 28/8/128, which was silently 1.286x optimistic for a 36-layer
+/// model — the direction of error that wedges a machine rather than merely
+/// wasting a slot on it.
+///
+/// That the shipped pair is now uniformly 28 layers makes this table more
+/// necessary, not less. A hardcoded 28 would look correct against every
+/// default and be wrong for exactly the model an operator reaches for when
+/// they decide they want more than the defaults give them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GgufShape {
+    /// `file_name()` of the GGUF, which is what `shape_for` matches on.
+    /// Operators move these files wherever they like, so the directory says
+    /// nothing; the name is the only stable identity we have.
+    pub basename: &'static str,
+    /// `num_hidden_layers` from the model's `config.json`.
+    pub layers: u32,
+    /// `num_key_value_heads`. Qwen3 is GQA, so this is far below the
+    /// attention-head count, and it is the number the KV cache scales with.
+    pub kv_heads: u32,
+    /// `head_dim` from the model's `config.json`.
+    pub head_dim: u32,
+    /// On-disk weight bytes — the pinned download size from
+    /// `model_download.rs`, so a shape entry and a catalog entry can never
+    /// end up describing different files. llama.cpp mmaps these, so they are
+    /// not private commit on day one — but a batch touches every weight on
+    /// every token, so the working set converges here and sizing has to treat
+    /// them as resident.
+    pub weight_bytes: u64,
+    /// Everything the server holds that is neither weights nor KV cache:
+    /// compute buffers, the logit buffer, the tokenizer, the HTTP stack.
+    ///
+    /// Per-model because it measured wildly per-model, which a single flat
+    /// constant hid. At rest, ctx 6656, parallel 1, this workload:
+    ///
+    /// | server | working set | weights + KV | remainder |
+    /// |---|---|---|---|
+    /// | Qwen3-1.7B-Q8_0 | 2,860 MiB | 2,477 MiB | ~383 MiB |
+    /// | Qwen3-4B-Q4_K_M | 5,068 MiB | 3,318 MiB | **~1,750 MiB** |
+    ///
+    /// 4.6x the overhead for 1.25x the hidden size, so this does not follow
+    /// from the shape fields above and cannot be derived from them. No flat
+    /// allowance can be pessimistic for the 4B without being absurd for the
+    /// 1.7B — a 200 MiB constant under-budgeted the 4B by 1,550 MiB while its
+    /// comment claimed to be generous. So these are recorded facts about
+    /// specific pinned files, each rounded up from its measurement, not a
+    /// theory of llama.cpp's allocator.
+    ///
+    /// This is the at-rest cost only. These servers grow as they serve; see
+    /// `Config::slm_recycle_after_requests` for how much and for what bounds
+    /// it. Sizing against the converged figure would price in memory that
+    /// recycling exists to hand back.
+    pub overhead_bytes: u64,
+}
+
+/// Every GGUF this app ships or downloads, plus one it no longer defaults to
+/// but must still be able to price.
+///
+/// Shapes verified against each HF repo's `config.json` (`num_hidden_layers`,
+/// `num_key_value_heads`, `head_dim`); sizes are the pinned bytes from
+/// `model_download.rs`. Adding a model here is what teaches the RAM tiers and
+/// `Settings` about it — a GGUF absent from this table is sized as if it were
+/// the largest entry, which is safe but pessimistic. Removing one is the
+/// dangerous direction, and the 4B entry below says why.
+const GGUF_SHAPES: &[GgufShape] = &[
+    // The primary on every tier, and the installer's bundled GGUF, so a fresh
+    // install names its first document without network.
+    GgufShape {
+        basename: "Qwen3-0.6B-Q8_0.gguf",
+        layers: 28,
+        kv_heads: 8,
+        head_dim: 128,
+        weight_bytes: 639_446_688,
+        // Not measured at ctx 6656 — the tier sweep covered the two models
+        // that change was proposing, not the one it proposed to replace.
+        // 500 MiB is the 1.7B's measured allowance, reused unchanged rather
+        // than scaled down for the smaller model. This entry is now what
+        // every machine's primary tier is budgeted against, so an unmeasured
+        // number here must be the pessimistic one, not the flattering one.
+        overhead_bytes: 500 * 1024 * 1024,
+    },
+    // Escalation tier above 9 GiB; collapsed onto the primary below that.
+    GgufShape {
+        basename: "Qwen3-1.7B-Q8_0.gguf",
+        layers: 28,
+        kv_heads: 8,
+        head_dim: 128,
+        weight_bytes: 1_834_426_016,
+        // Measured remainder ~383 MiB; rounded up.
+        overhead_bytes: 500 * 1024 * 1024,
+    },
+    // Catalogued, not shipped. No tier defaults to this model — promoting it
+    // measured 2.0x the wall clock at matched coverage and was not merged, see
+    // `default_primary_gguf_for_ram` — but it stays in the table, for two
+    // reasons that both cost memory safety if it were deleted.
+    //
+    // `largest_known_shape` folds this table, so the 4B is what
+    // `shape_or_largest` charges an *unknown* operator-supplied GGUF. Delete
+    // it and that pessimistic fallback silently becomes the 1.7B's 2977 MiB —
+    // 2241 MiB cheaper than the largest model we have actually weighed, on the
+    // one estimate whose entire job is to over-charge.
+    //
+    // And an operator who points Settings at a 4B by hand is then priced at
+    // its real 5218 MiB rather than mistaken for a 1.7B, which is what lets
+    // `naming_lane_budget_mib` tell the machines that can hold it apart from
+    // the ones that cannot. A model absent from this table is not treated as
+    // large; it is treated as unknown, and `model_is_replaceable` declines to
+    // touch what it cannot price.
+    //
+    // 36 layers, not 28 — this is the whole reason this table exists.
+    GgufShape {
+        basename: "Qwen3-4B-Q4_K_M.gguf",
+        layers: 36,
+        kv_heads: 8,
+        head_dim: 128,
+        weight_bytes: 2_497_280_256,
+        // Measured remainder ~1,750 MiB; rounded up. Nearly 4x the 1.7B's,
+        // which is the finding that killed the flat constant.
+        overhead_bytes: 1_900 * 1024 * 1024,
+    },
+];
+
+/// F16 KV-cache bytes one token of context occupies for a model of this shape.
+///
+/// `2 (K and V) * layers * kv_heads * head_dim * 2 (bytes per F16 element)`.
+/// 114688 B for the 28-layer 0.6B and 1.7B; 147456 B for the 36-layer 4B.
+/// llama.cpp allocates `--ctx-size` of these up front, per server, before it
+/// serves a single request — which is why this number, not throughput, is
+/// what the tiers below are actually deciding.
+pub fn kv_bytes_per_token(layers: u32, kv_heads: u32, head_dim: u32) -> u64 {
+    2 * layers as u64 * kv_heads as u64 * head_dim as u64 * 2
+}
+
+/// The catalogued shape of `gguf`, matched on its file name (case-insensitively,
+/// because Windows), or `None` when nothing in `GGUF_SHAPES` matches.
+///
+/// `None` must never be read as "small". An operator is free to point Settings
+/// at some other GGUF, and this module cannot know its layer count — so every
+/// memory estimate goes through `shape_or_largest`, which substitutes the
+/// largest shape in the catalog. An over-estimate costs an unused slot; an
+/// under-estimate hands the operator a config that thrashes the machine it was
+/// meant to protect.
+pub fn shape_for(gguf: &Path) -> Option<&'static GgufShape> {
+    let name = gguf.file_name()?.to_str()?;
+    GGUF_SHAPES
+        .iter()
+        .find(|shape| shape.basename.eq_ignore_ascii_case(name))
+}
+
+/// The largest shape in the catalog, by the only measure that matters here:
+/// what one server holding it costs resident. Folded from the table rather
+/// than named, so adding a bigger model to `GGUF_SHAPES` cannot leave this
+/// pointing at the previous maximum.
+fn largest_known_shape() -> &'static GgufShape {
+    GGUF_SHAPES
+        .iter()
+        .max_by_key(|shape| resident_bytes(shape, 1))
+        .expect("GGUF_SHAPES is never empty")
+}
+
+/// `shape_for`, degraded to `largest_known_shape` for an unknown GGUF. This is
+/// the entry point every memory estimate uses; see `shape_for` for why the
+/// fallback goes up rather than down.
+pub fn shape_or_largest(gguf: &Path) -> &'static GgufShape {
+    shape_for(gguf).unwrap_or_else(largest_known_shape)
+}
+
+/// Bytes one llama-server holding `shape` with `parallel` slots keeps resident
+/// once loaded and idle: mmapped weights + the KV cache llama.cpp preallocates
+/// for `SLM_CTX_PER_SLOT * parallel` tokens + the model's own
+/// `overhead_bytes`.
+///
+/// Calculated, but each term is anchored to a measurement: the KV term to the
+/// shape fields read from the model's `config.json`, the overhead term to a
+/// working-set capture of that exact GGUF at this exact context size. It
+/// reproduces the sizing table cited by `slm_parallel_for_ram` exactly, and
+/// `the_naming_lane_footprint_matches_the_sizing_table` asserts that so the
+/// prose and the arithmetic cannot drift apart.
+///
+/// **At-rest, not peak.** A server that has served requests is larger — see
+/// `Config::slm_recycle_after_requests`, which is the knob that bounds the
+/// difference and the reason it is safe to size against the smaller number.
+pub fn resident_bytes(shape: &GgufShape, parallel: u8) -> u64 {
+    let kv = kv_bytes_per_token(shape.layers, shape.kv_heads, shape.head_dim)
+        * SLM_CTX_PER_SLOT as u64
+        * parallel as u64;
+    shape.weight_bytes + kv + shape.overhead_bytes
+}
+
+/// `resident_bytes` rounded to the nearest MiB — the unit the sizing tables
+/// and the clamp log messages are written in.
+pub fn resident_mib(shape: &GgufShape, parallel: u8) -> u64 {
+    (resident_bytes(shape, parallel) + (1 << 19)) >> 20
+}
+
 /// How many naming slots to give llama-server, chosen from installed RAM.
 ///
 /// This is a memory knob wearing a concurrency knob's name. `slm.rs` derives
-/// `--ctx-size` as `4096 * slm_parallel`, and llama.cpp preallocates the whole
-/// KV cache at startup, so the cost is linear and large: Qwen3 (28 layers,
-/// 8 KV heads, head_dim 128, F16) needs 112 KiB per token, i.e. **448 MiB per
-/// parallel slot**. Measured on Windows for Qwen3-0.6B: 590 MB private commit
-/// at 1, 1,040 MB at 2, 1,938 MB at 4.
+/// `--ctx-size` as `SLM_CTX_PER_SLOT * parallel`, and llama.cpp preallocates
+/// the whole KV cache at startup, so the cost is linear, large, and **not the
+/// same for every model this module can be pointed at** — the shape table
+/// above is what keeps that honest. At `SLM_CTX_PER_SLOT` = 6656, per
+/// `kv_bytes_per_token`:
 ///
-/// The escalation tier makes that worst case double. `SlmLane` keeps `primary`
-/// and `escalation` in separate slots and the 1.7B server "remains resident for
-/// the batch" once a third naming attempt wakes it, so a long run ends up
-/// holding both. Measured together at the old flat default of 4: 6,078 MB of
-/// working set for the two servers alone, which does not fit beside Windows,
-/// the app and convertd on an 8 GB machine.
+/// * 28-layer (0.6B, 1.7B): 6656 * 114688 B = **728 MiB per slot**
+/// * 36-layer (4B):         6656 * 147456 B = **936 MiB per slot**
 ///
-/// A flat 4 was therefore right for the workstation it was written on and
-/// wrong for the laptops this ships to. Per-slot context is `4096` either way
-/// (total is `4096 * n` across `n` slots), so lowering this costs no evidence
-/// headroom — only cross-file naming overlap, which is rarely the bottleneck
-/// because `Sidecar` serializes every conversion through one process anyway.
+/// The escalation tier is a second server, not a second slot: `SlmLane` keeps
+/// `primary` and `escalation` separate and the escalation server remains
+/// resident until `slm_escalation_idle_secs` reaps it, so a run with active
+/// escalations holds both at once. Naming-lane footprints at rest
+/// (weights + KV + the model's own `overhead_bytes`):
+///
+/// | Installed RAM | primary | escalation | both resident |
+/// |---|---|---|---|
+/// | <= 9 GiB  | 0.6B @1: 610 + 728 + 500 = 1838 MiB | collapsed | 1838 MiB |
+/// | <= 17 GiB | 0.6B @1: 610 + 728 + 500 = 1838 MiB | 1.7B @1: 1749 + 728 + 500 = 2977 MiB | 4815 MiB |
+/// | > 17 GiB  | 0.6B @2: 610 + 2*728 + 500 = 2566 MiB | 1.7B @1: 2977 MiB | 5543 MiB |
+///
+/// The primary column does not vary by tier because the model does not: see
+/// `default_primary_gguf_for_ram`. Only the slot count and the escalation
+/// server move.
+///
+/// **Calculated, not measured** — every cell is `resident_mib(shape, parallel)`
+/// and nothing else, and `the_naming_lane_footprint_matches_the_sizing_table`
+/// asserts every footprint in this table, plus the 728 MiB slot term the rows
+/// are broken into, so the prose cannot drift from the arithmetic that
+/// produced it. What is measured are the *terms*: the KV term comes from shape
+/// fields read out of each model's `config.json`, and the overhead term from a
+/// working-set capture of that exact GGUF at this exact context size — the
+/// 1.7B captured 2,860 MiB at rest against the 2977 MiB calculated here.
+///
+/// These are recomputed for this pair at this slot size, not inherited. The
+/// figures this function used to cite — 590 MB private commit at 1 slot,
+/// 1,040 MB at 2, 1,938 MB at 4, 6,078 MB for both servers at 4 — were taken
+/// at the old 4096-token slot, where one slot cost 448 MiB instead of 728.
+/// Nothing sized before `SLM_CTX_PER_SLOT` moved describes what runs now, even
+/// for the models it was measured on.
+///
+/// The 16 GB class is the machine BackLog is deployed on (~14.7 GB, floored to
+/// 14), and it is the tier this whole sizing exists to be correct for. Its
+/// 4815 MiB overstates the pressure twice over:
+///
+/// * **~2.3 GiB of it is mmapped weights**, which are file-backed and
+///   evictable. Windows reclaims those under pressure at a cost in speed, not
+///   correctness.
+/// * **It is the transient, not the steady state.** The escalation server only
+///   wakes for a document that failed two attempts and is reaped after
+///   `slm_escalation_idle_secs`. Most of a batch runs primary-only, at
+///   1838 MiB.
+///
+/// So memory is not what holds the deployment target at one slot any more —
+/// 5543 MiB would fit there. What holds it is that nothing measured says a
+/// second slot pays: `Sidecar` serializes every conversion through its worker
+/// pool, so cross-file naming overlap is rarely the bottleneck, and the
+/// throughput this build is documented at (20.03 s/file, 5.6 h per 1,000) was
+/// measured at `slm_parallel: 1`. Shipping a default nobody has run, to buy
+/// overlap nobody has demonstrated, is how a sizing table stops being evidence
+/// and starts being decoration. The workstation tier gets a second slot
+/// because a machine with that much spare RAM has the spare cores to use it;
+/// anything past 2 would be the same guess one step further out.
 fn default_slm_parallel() -> u8 {
     slm_parallel_for_ram(total_ram_gib())
 }
 
 /// The decision itself, split from reading the machine so it can be tested.
 ///
-/// The 8 GB branch is the entire reason this function exists and it is the one
-/// branch the build machine can never exercise, so it is covered by
+/// The small branches are the entire reason this function exists and they are
+/// the ones a large build machine can never exercise, so they are covered by
 /// `slm_parallel_is_chosen_from_installed_ram` rather than by hoping.
 fn slm_parallel_for_ram(gib: Option<u64>) -> u8 {
     match gib {
-        Some(g) if g <= 9 => 1,  // 8 GB class: ~448 MiB of KV cache per server
-        Some(g) if g <= 17 => 2, // 16 GB class
-        Some(_) => 4,
-        // Unknown RAM is not a reason to gamble on behalf of the smaller machine.
-        None => 2,
+        // 8 GB class: one 1838 MiB server (collapsed — this tier gets no
+        // second model) is already most of what is free once Windows and
+        // convertd are up. It also runs `convert_workers: 1`, so there is
+        // never a second document in flight for a second slot to name.
+        Some(g) if g <= 9 => 1,
+        // 16 GB class — the deployment target. Room for a second slot
+        // (5543 MiB), no evidence it pays; see `default_slm_parallel`.
+        Some(g) if g <= 17 => 1,
+        // Workstations: a second slot takes the primary to 2566 MiB and the
+        // pair to 5543 MiB, which is affordable here and has cores behind it.
+        Some(_) => 2,
+        // Unknown RAM gets the smallest machine's answer. Guessing large on
+        // behalf of a machine that will not say is how you thrash it.
+        None => 1,
     }
 }
 
@@ -456,15 +836,223 @@ fn default_slm_escalation_parallel() -> u8 {
     slm_escalation_parallel_for_ram(total_ram_gib())
 }
 
-/// Deliberately never inherits `slm_parallel_for_ram`'s 4 — the whole point
-/// of a separate knob is decoupling escalation's KV cost from primary's.
-/// `docs/SIZING.md` measures 2,262 MB (parallel 1) vs 3,609 MB (parallel 4)
-/// for the 1.7B; this keeps it at the low end always.
-fn slm_escalation_parallel_for_ram(gib: Option<u64>) -> u8 {
-    match gib {
-        Some(g) if g <= 9 => 1,
-        _ => 2, // >9 GiB and unknown RAM both get the small ceiling
+/// One slot on every machine, and the argument is deliberately ignored.
+///
+/// Escalation is the rare third attempt at a document that failed twice, and
+/// `SlmLane` serializes it behind the same wall clock as everything else, so a
+/// second slot buys overlap that never happens. The price of that nothing fell
+/// with the tier decision — **728 MiB**, the 28-layer slot, rather than the
+/// 936 MiB a 36-layer escalation model would have cost — but a cheaper nothing
+/// is still nothing: it would take the 16 GB class from a calculated 4815 MiB
+/// to 5543 MiB and hand back no concurrency it can use. When the tier is
+/// collapsed (`slm_escalation_gguf == slm_primary_gguf`) there is no second
+/// server for this to size at all.
+fn slm_escalation_parallel_for_ram(_gib: Option<u64>) -> u8 {
+    1
+}
+
+/// Which GGUF a fresh install names for the primary tier.
+///
+/// The same 0.6B on every machine, today. The tier hook stays because the
+/// question it asks — can this machine afford a better primary? — is a real
+/// one whose answer is empirical rather than structural, and because the
+/// escalation tier below derives its collapsed case from this function, so
+/// deleting the parameter would decide two things at once.
+///
+/// It has been answered once, against the pair that would have replaced this
+/// one. Same corpus, same code, same ctx and evidence budget, `slm_parallel: 1`,
+/// `convert_workers: 3`, semantic lane confirmed live in every arm:
+///
+/// | config | s/file | h/1000 | FAITHFUL | NAMES PARTY | TOP ENTITY |
+/// |---|---|---|---|---|---|
+/// | 0.6B/1.7B, top_k 12 | 24.69 | 6.9 | 24/25 | 25/26 | 19/26 |
+/// | 0.6B/1.7B, top_k 17 | **20.03** | **5.6** | 23/25 | 25/26 | 19/26 |
+/// | 1.7B/4B, top_k 12 | 38.47 | 10.7 | 24/24 | 24/26 | 16/26 |
+/// | 1.7B/4B, top_k 17 | 40.11 | 11.1 | 25/25 | 25/26 | 13/26 |
+///
+/// At matched evidence coverage (top_k 17) a 1.7B primary costs **2.0x the
+/// wall clock** — 40.11 s/file against 20.03 — to buy a two-document
+/// faithfulness difference at n=26, which is inside this project's own
+/// documented run-to-run variance, while giving back six documents of TOP
+/// ENTITY. Rejected on quality-per-second, so this function returns the 0.6B
+/// for a 64 GiB workstation for exactly the same reason it returns it for an
+/// 8 GB laptop: not affordability, evidence.
+///
+/// Memory was never what was wrong with it, and saying so is the point of
+/// writing this down. A 1.7B primary fits the 16 GB class comfortably: a
+/// calculated 2977 MiB against the 0.6B's 1838. If someone re-proposes the
+/// promotion on new evidence, the tier that still needs an argument is the
+/// small one — the 1.7B is a calculated 1139 MiB more resident, and on an
+/// 8 GB machine (7.4 GiB usable, less Windows at 2.5-3 GiB, one convertd
+/// worker at 550 MB and the app at ~400 MB) that is most of the margin the
+/// tier has. Measure it there before shipping it there, and measure the wall
+/// clock at matched coverage rather than at matched `top_k`, because that is
+/// the comparison that reversed the last conclusion.
+///
+/// Unknown RAM would match the smallest tier, as it does everywhere else in
+/// this module — that fact is invisible while there is one answer, and it is
+/// what `models_are_chosen_from_installed_ram` pins so it stays true if a
+/// second answer ever comes back.
+fn default_primary_gguf_for_ram(_gib: Option<u64>) -> &'static str {
+    DEFAULT_PRIMARY_GGUF
+}
+
+fn default_primary_gguf() -> PathBuf {
+    PathBuf::from(default_primary_gguf_for_ram(total_ram_gib()))
+}
+
+/// Does this machine get a genuinely separate escalation model, or a collapsed
+/// pair?
+///
+/// The 1.7B calculates to 2977 MiB resident, so it is a second server only
+/// where one fits beside the primary's 1838 MiB — a 4815 MiB naming lane,
+/// which an 8 GB machine (7.4 GiB usable) does not have once Windows, the app
+/// and a convertd worker are up. Below the line, `slm_escalation_gguf` is set
+/// equal to `slm_primary_gguf` and `SlmLane::escalation_collapsed()` takes
+/// over: rung 3 still runs, on a wider evidence bundle
+/// (`escalation_evidence_token_budget`), against the server that is already
+/// up. So the small tier loses a second opinion, not the third attempt.
+///
+/// Unknown RAM is treated as the small machine for the same reason
+/// `slm_parallel_for_ram` does — a machine that will not report its memory is
+/// not an invitation to assume it has plenty.
+fn separate_escalation_model_fits(gib: Option<u64>) -> bool {
+    matches!(gib, Some(g) if g > 9)
+}
+
+/// Which GGUF a fresh install names for the escalation tier. Pure in `gib` so
+/// the tiers are testable on a build machine that is none of them.
+fn default_escalation_gguf_for_ram(gib: Option<u64>) -> &'static str {
+    if separate_escalation_model_fits(gib) {
+        DEFAULT_ESCALATION_GGUF
+    } else {
+        // The *same* string as the primary tier's, not merely a similar one:
+        // `SlmLane` detects a collapsed pair by comparing the two paths, so
+        // deriving this from `default_primary_gguf_for_ram` is what makes the
+        // collapse true by construction instead of by coincidence.
+        default_primary_gguf_for_ram(gib)
     }
+}
+
+fn default_slm_escalation_gguf() -> PathBuf {
+    PathBuf::from(default_escalation_gguf_for_ram(total_ram_gib()))
+}
+
+/// At-rest MiB the configured naming lane holds: both servers, or **one** when
+/// the pair is collapsed.
+///
+/// The collapse check is path equality, the same test
+/// `SlmLane::escalation_collapsed()` makes, because a collapsed pair is not two
+/// servers costing the same thing twice — it is one server that rung 3 reuses.
+/// Adding it twice would price the small tiers at double what they hold and
+/// clamp configurations that are perfectly safe.
+///
+/// Sizing goes through `shape_or_largest`, so an uncatalogued model is charged
+/// the largest shape in the table. That is the safe direction for the *total*;
+/// what it must never become is grounds for replacing the unknown model
+/// itself, which is `model_is_replaceable`'s job.
+fn naming_lane_mib(
+    primary: &Path,
+    escalation: &Path,
+    primary_parallel: u8,
+    escalation_parallel: u8,
+) -> u64 {
+    let primary_mib = resident_mib(shape_or_largest(primary), primary_parallel);
+    if escalation == primary {
+        primary_mib
+    } else {
+        primary_mib + resident_mib(shape_or_largest(escalation), escalation_parallel)
+    }
+}
+
+/// May this module overwrite `configured` with something else?
+///
+/// Only when the catalog can price it. Sizing an unknown model pessimistically
+/// costs an unused slot; *replacing* it costs the operator the model they
+/// explicitly chose, which is a much heavier act than lowering a number and one
+/// this module cannot justify on a shape it does not know. An uncatalogued GGUF
+/// still contributes its pessimistic `shape_or_largest` figure to
+/// `naming_lane_mib`, so it can push the *other* half of the pair down — it
+/// simply cannot be sacrificed itself. "We cannot price this" means hands off,
+/// never "it fits".
+///
+/// The configs this exists to repair are the ones an older BackLog wrote naming
+/// BackLog's own models, and those are all catalogued by construction.
+fn model_is_replaceable(configured: &Path) -> bool {
+    shape_for(configured).is_some()
+}
+
+/// The at-rest MiB this machine's tier will let the naming lane hold.
+///
+/// This is the number the model clamp compares against, and getting it from the
+/// machine rather than from the tier's default models is the whole point.
+/// "Bigger than what a fresh install would have written" is not a reason to
+/// override an operator — plenty of machines can hold more than they ship with.
+/// "Bigger than the memory actually available" is. The two questions used to be
+/// conflated, and the symptom was a 64 GiB workstation having a hand-configured
+/// 4B escalation server (a calculated 7056 MiB beside the 0.6B primary, on a
+/// box with over 20 GiB free) replaced by the 1.7B, for no reason but that the
+/// tier default said 1.7B.
+///
+/// Derived per tier from the same representative machine every other comment in
+/// this module reasons about, with Windows taken at the pessimistic end of its
+/// 2.5-3 GiB range and `convert_workers` at that tier's own ceiling:
+///
+/// | tier | machine | usable | Windows | app | convertd | headroom | budget |
+/// |---|---|---|---|---|---|---|---|
+/// | <= 9 GiB  | 8 GB   | 7578 MiB  | 3072 | 400 | 1 x 550 | 3556 MiB  | **2300** |
+/// | <= 17 GiB | 16 GB  | 14028 MiB | 3072 | 400 | 3 x 550 | 8906 MiB  | **5900** |
+/// | > 17 GiB  | 32 GiB | 31744 MiB | 3072 | 400 | 6 x 550 | 24972 MiB | **16600** |
+///
+/// The budget is headroom / 1.5, rounded **down** to the nearest 100 MiB,
+/// because the figures being compared to it are at-rest and a llama-server that
+/// has served requests is bigger. 1.5 is not a guess: llama.cpp's Windows RSS
+/// growth was measured at this context on both models, and interpolating those
+/// captures to the shipped `slm_recycle_after_requests` of 8 gives 1.51x for
+/// the 1.7B (2,860 -> ~4,320 of its measured 5,785 at 16) and 1.45x for the 4B
+/// (5,068 -> ~7,370 of its measured 9,258 at 16). So the lane may commit two
+/// thirds of its headroom at rest and still fit when it has drifted.
+///
+/// The thinnest case this leaves is the *bottom* of the 16 GB tier — a 10 GiB
+/// machine gets the 16 GB budget, because `separate_escalation_model_fits`
+/// draws its line at 9 GiB. That boundary predates this budget and is not
+/// re-litigated here; it is noted so the next person to move either one knows
+/// they are coupled.
+fn naming_lane_budget_mib(gib: Option<u64>) -> u64 {
+    match gib {
+        Some(g) if g <= 9 => 2300,
+        Some(g) if g <= 17 => 5900,
+        Some(_) => 16600,
+        // Unknown RAM gets the smallest machine's budget, as it gets the
+        // smallest machine's answer everywhere else in this module.
+        None => 2300,
+    }
+}
+
+/// The largest `evidence_token_budget` that still fits in one llama-server
+/// slot beside the prompt and the answer — 4347 at today's constants.
+///
+/// Composed from other modules' constants, never written down here.
+/// [`max_bundle_chars`] is
+/// `(SLM_CTX_PER_SLOT - SLM_PROMPT_RESERVE_TOKENS - SLM_MAX_OUTPUT_TOKENS) *
+/// CONSERVATIVE_CHARS_PER_TOKEN`, i.e. `(6656 - 640 - 220) * 3` = 17388
+/// characters; [`BUDGET_CHARS_PER_TOKEN`] converts that into the optimistic
+/// chars/4 unit `evidence_token_budget` is expressed in, so 17388 / 4 = 4347.
+///
+/// Every one of those numbers is imported rather than restated. That is the
+/// whole point: a second copy of 6656/640/220/3/4 living here would let a
+/// future retune of the slot size move one home and not the other, and the
+/// symptom would be `validate` accepting a budget that `filter.rs` then
+/// silently truncates. Truncation is the failure worth engineering against
+/// precisely because it is silent — llama.cpp does not refuse an over-length
+/// prompt, it drops what does not fit, and the model names the document from
+/// evidence with a hole in it.
+///
+/// `validate` rejects anything above this and
+/// `escalation_evidence_token_budget` clamps to it, so no configuration —
+/// hand-edited, imported, or migrated forward — can reach that ceiling at all.
+pub fn max_evidence_token_budget() -> usize {
+    max_bundle_chars() / BUDGET_CHARS_PER_TOKEN
 }
 
 impl Config {
@@ -549,56 +1137,40 @@ impl Config {
         cfg
     }
 
-    /// Lower `slm_parallel` to what installed RAM can hold, and say so.
-    ///
-    /// `default_slm_parallel` only decides what a *fresh* install writes, and
-    /// `backlog.config.json` is persistent — so an 8 GB laptop upgrading from a
-    /// build whose default was a flat 4 would keep 4 forever and thrash through
-    /// its whole backfill, having never chosen that number. This is the upgrade
-    /// path for that machine.
-    ///
-    /// Deliberately one-directional: a value at or below the RAM-derived
-    /// ceiling is left exactly as configured, because someone lowering it knows
-    /// something about their machine that this does not. Only an
-    /// overcommitment is corrected, and never silently — at 4 on 8 GB the two
-    /// model servers alone want ~6.1 GB of working set, which is not a slow
-    /// run, it is a wedged one.
-    #[cfg(test)]
-    fn clamp_slm_parallel_for_test(&mut self, gib: Option<u64>) {
-        let ceiling = slm_parallel_for_ram(gib);
-        if self.slm_parallel > ceiling {
-            self.slm_parallel = ceiling;
-        }
-    }
-
-    /// Same one-directional contract as `clamp_slm_parallel_for_test`, for
-    /// the escalation tier's own ceiling.
-    #[cfg(test)]
-    fn clamp_slm_escalation_parallel_for_test(&mut self, gib: Option<u64>) {
-        let ceiling = slm_escalation_parallel_for_ram(gib);
-        if self.slm_escalation_parallel > ceiling {
-            self.slm_escalation_parallel = ceiling;
-        }
-    }
-
-    #[cfg(test)]
-    fn clamp_resources_for_test(&mut self, gib: Option<u64>) {
-        self.slm_parallel = self.slm_parallel.min(slm_parallel_for_ram(gib));
-        self.slm_escalation_parallel = self
-            .slm_escalation_parallel
-            .min(slm_escalation_parallel_for_ram(gib));
-        self.convert_workers = self
-            .convert_workers
-            .min(convert_workers_ram_ceiling(gib))
-            .max(1);
-    }
-
     /// Apply the machine's memory ceilings to loaded and newly submitted
     /// settings. This is intentionally one-directional: conservative custom
     /// values survive, while an old or imported high-memory preset is made
     /// safe before it can start worker processes.
     pub fn clamp_resources_to_machine(&mut self) {
-        let gib = total_ram_gib();
+        self.clamp_resources_for_ram(total_ram_gib());
+    }
+
+    /// The ceilings themselves, split from reading the machine so that every
+    /// tier is testable on a build machine that can only ever be one of them.
+    ///
+    /// The `default_*` functions only decide what a *fresh* install writes,
+    /// and `backlog.config.json` is persistent — so an 8 GB laptop upgrading
+    /// from a build whose default was a flat `slm_parallel: 4`, or carrying a
+    /// config imported from a larger machine that names the 1.7B as its
+    /// primary, would keep that forever and thrash through its whole backfill
+    /// having never chosen it. This is the upgrade path for that machine.
+    ///
+    /// Every clamp here is one-directional. A value at or below what the tier
+    /// budgets is left exactly as configured, because someone who lowered it
+    /// knows something about their machine that this does not; only an
+    /// overcommitment is corrected. And never silently: each clamp says which
+    /// knob it moved, what it cost, and what it moved it to, because the only
+    /// thing worse than a config being overridden is a config being overridden
+    /// invisibly.
+    ///
+    /// The order matters and is not arbitrary. Slot counts are clamped first,
+    /// because the model budget below prices the lane at `slm_parallel` /
+    /// `slm_escalation_parallel` and must see the values this run will actually
+    /// use — reading them first would charge the pair for slots that are about
+    /// to be taken away and clamp models that fit. Convert workers sit in
+    /// between because their ceiling is a fixed per-tier count that nothing
+    /// else here reads.
+    fn clamp_resources_for_ram(&mut self, gib: Option<u64>) {
         let slm_ceiling = slm_parallel_for_ram(gib);
         if self.slm_parallel > slm_ceiling {
             log::warn!(
@@ -639,6 +1211,79 @@ impl Config {
         // floor `validate` already enforces on both fields — the reaper
         // simply does not run on a machine whose convert_workers ceiling
         // dropped to 1, e.g. the corrected 8 GB tier.
+
+        // The two model knobs, judged as a pair against an explicit memory
+        // budget (`naming_lane_budget_mib`) rather than against the tier's
+        // default models. A configured pair that fits is never touched, however
+        // far it is from what a fresh install would have written — "not the
+        // default" is not a memory problem, and the operator who typed it knows
+        // something about their machine that this function does not.
+        //
+        // Only over-budget pairs come down, and they come down in the order
+        // that costs the operator least.
+        let budget = naming_lane_budget_mib(gib);
+        let machine = || {
+            gib.map(|g| g.to_string())
+                .unwrap_or_else(|| "an unknown amount of".into())
+        };
+        let configured = naming_lane_mib(
+            &self.slm_primary_gguf,
+            &self.slm_escalation_gguf,
+            self.slm_parallel,
+            self.slm_escalation_parallel,
+        );
+        if configured > budget {
+            // Step 1: give up the second *server* before giving up either
+            // model. Escalation degrades gracefully — `escalation_collapsed()`
+            // still runs rung 3, on a wider evidence bundle, against the server
+            // already up — while the primary is on every document's path. This
+            // is a collapse, so it must land on the exact primary path.
+            if self.slm_escalation_gguf != self.slm_primary_gguf
+                && model_is_replaceable(&self.slm_escalation_gguf)
+            {
+                log::warn!(
+                    "the configured naming pair calculates to ~{} MiB resident, more than the \
+                     ~{} MiB {} GiB of RAM budgets for the naming lane; collapsing escalation \
+                     onto {} for this run — the third naming attempt still runs, on a wider \
+                     evidence bundle, against the server that is already up (name a smaller \
+                     pair explicitly to silence this, or see docs/SIZING.md)",
+                    configured,
+                    budget,
+                    machine(),
+                    self.slm_primary_gguf.display()
+                );
+                self.slm_escalation_gguf = self.slm_primary_gguf.clone();
+            }
+            // Step 2: one server of the configured primary is still too much,
+            // so the model itself has to go. Falling back to the tier's own
+            // defaults is guaranteed to fit — `every_tier_can_afford_its_own_defaults`
+            // is what keeps that guarantee from rotting — and the escalation
+            // tier is re-derived from the primary we land on so that a small
+            // machine's collapse stays exact.
+            let collapsed = naming_lane_mib(
+                &self.slm_primary_gguf,
+                &self.slm_escalation_gguf,
+                self.slm_parallel,
+                self.slm_escalation_parallel,
+            );
+            if collapsed > budget && model_is_replaceable(&self.slm_primary_gguf) {
+                let primary = PathBuf::from(default_primary_gguf_for_ram(gib));
+                let escalation = PathBuf::from(default_escalation_gguf_for_ram(gib));
+                log::warn!(
+                    "slm_primary_gguf {} calculates to ~{} MiB resident on its own, more than \
+                     the ~{} MiB {} GiB of RAM budgets for the naming lane; using {} for this \
+                     run (name a smaller model explicitly to silence this, or see \
+                     docs/SIZING.md)",
+                    self.slm_primary_gguf.display(),
+                    collapsed,
+                    budget,
+                    machine(),
+                    primary.display()
+                );
+                self.slm_primary_gguf = primary;
+                self.slm_escalation_gguf = escalation;
+            }
+        }
     }
 
     /// Clean every operator-supplied value in place. Called on load and again
@@ -676,6 +1321,21 @@ impl Config {
 
     pub fn using_primary_for_escalation(&self) -> bool {
         !self.slm_escalation_gguf.is_file() && self.slm_primary_gguf.is_file()
+    }
+
+    /// The evidence budget for the third naming attempt: 1.6x the configured
+    /// one, clamped to `max_evidence_token_budget()`. 4000 at the default 2500.
+    ///
+    /// Derived rather than configured, deliberately. Rung 3 exists to give a
+    /// larger model a *wider* view of the same document, so its budget has to
+    /// stay above rung 1's — and two independent fields would let a
+    /// hand-edited config invert them, turning the escalation into a narrower
+    /// look at a document that has already failed twice, which is the one
+    /// thing it must never be. One visible knob scales both rungs, and the
+    /// ceiling is what keeps a slot overflow structurally impossible even with
+    /// that knob wound to its maximum.
+    pub fn escalation_evidence_token_budget(&self) -> usize {
+        (self.evidence_token_budget.saturating_mul(8) / 5).min(max_evidence_token_budget())
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -854,9 +1514,11 @@ impl Config {
                 self.slm_escalation_idle_secs
             ));
         }
-        if self.evidence_token_budget == 0 || self.evidence_token_budget > 16_384 {
+        let max_evidence = max_evidence_token_budget();
+        if self.evidence_token_budget == 0 || self.evidence_token_budget > max_evidence {
             return Err(format!(
-                "evidence_token_budget must be between 1 and 16384; got {}.",
+                "evidence_token_budget must be between 1 and {max_evidence}; got {}. Larger \
+                 values would not fit one llama-server slot alongside the prompt and the answer.",
                 self.evidence_token_budget
             ));
         }
@@ -1053,6 +1715,10 @@ mod tests {
         cases.push((c, "evidence_token_budget"));
 
         let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
+        c.evidence_token_budget = max_evidence_token_budget() + 1;
+        cases.push((c, "evidence_token_budget"));
+
+        let mut c = cfg("/a/proc", "/a/out", "/a/quar", "/a/cache");
         c.convert_workers = 0;
         cases.push((c, "convert_workers"));
 
@@ -1101,6 +1767,60 @@ mod tests {
         c.manifest_emit_per_min = u32::MAX;
         let error = c.validate().expect_err("manifest_emit_per_min");
         assert!(error.contains("manifest_emit_per_min"), "{error}");
+    }
+
+    /// The evidence ceiling is what makes a slot overflow structurally
+    /// impossible, so it is asserted twice over: once against the literal 4347
+    /// that the doc comments and the Settings range are written against, and
+    /// once against the slot arithmetic itself, so that a change to
+    /// `SLM_CTX_PER_SLOT` fails here rather than silently redefining what
+    /// "fits" means.
+    #[test]
+    fn the_evidence_budgets_always_fit_one_llama_server_slot() {
+        let max = max_evidence_token_budget();
+        assert_eq!(max, 4347, "the constants no longer produce the pinned 4347");
+
+        // The ceiling the bundle builder actually enforces, in characters.
+        // The conversion back has to land inside it: integer division is what
+        // makes that true rather than merely likely, and this is where a
+        // change to the budget unit would surface.
+        let slot_chars = max_bundle_chars();
+        assert!(
+            max * BUDGET_CHARS_PER_TOKEN <= slot_chars,
+            "the ceiling itself must fit the slot it was derived from"
+        );
+        // And the slot arithmetic behind it, so a change to `SLM_CTX_PER_SLOT`
+        // fails here rather than silently redefining what "fits" means.
+        assert_eq!(
+            slot_chars,
+            (SLM_CTX_PER_SLOT
+                - crate::slm::SLM_PROMPT_RESERVE_TOKENS
+                - crate::slm::SLM_MAX_OUTPUT_TOKENS) as usize
+                * crate::filter::CONSERVATIVE_CHARS_PER_TOKEN
+        );
+
+        // Rung 3 is 1.6x rung 1, and the default pair is the shape the
+        // pipeline was tuned on.
+        let cfg = Config::default();
+        assert_eq!(cfg.evidence_token_budget, 2500);
+        assert_eq!(cfg.escalation_evidence_token_budget(), 4000);
+        assert!(cfg.escalation_evidence_token_budget() > cfg.evidence_token_budget);
+
+        // The escalation budget is clamped, not merely scaled, so even the
+        // largest configuration `validate` accepts cannot overflow a slot.
+        let widest = Config {
+            evidence_token_budget: max,
+            ..Default::default()
+        };
+        assert_eq!(widest.escalation_evidence_token_budget(), max);
+        assert!(widest.escalation_evidence_token_budget() * BUDGET_CHARS_PER_TOKEN <= slot_chars);
+
+        // A tiny budget still scales rather than collapsing to the floor.
+        let narrow = Config {
+            evidence_token_budget: 400,
+            ..Default::default()
+        };
+        assert_eq!(narrow.escalation_evidence_token_budget(), 640);
     }
 
     /// Unlike every other duration/count knob above, 0 is a legal value here
@@ -1327,23 +2047,26 @@ mod tests {
     }
 
     /// `slm_parallel` is a memory knob: `slm.rs` derives `--ctx-size` as
-    /// `4096 * slm_parallel` and llama.cpp preallocates the whole KV cache, at
-    /// 448 MiB per slot per server — doubled once the escalation tier wakes and
-    /// stays resident. Measured, both servers at 4: 6,078 MB of working set,
-    /// which does not fit on an 8 GB machine beside Windows and convertd.
+    /// `SLM_CTX_PER_SLOT * slm_parallel` and llama.cpp preallocates the whole
+    /// KV cache, at a calculated 728 MiB per slot for the 28-layer primary —
+    /// beside, not instead of, the 2977 MiB the 1.7B escalation server holds
+    /// once it wakes.
     ///
-    /// The 8 GB row is the reason this logic exists and is the one row a
-    /// 62 GB build machine can never produce, so it is asserted here.
+    /// 14 GiB is the row that matters most: it is what `total_ram_gib()`
+    /// reports on the ~14.7 GB laptop this ships to, and it must land in the
+    /// 16 GB class rather than the workstation one. The 8 GiB row is the other
+    /// row a large build machine can never produce, so both are asserted here.
     #[test]
     fn slm_parallel_is_chosen_from_installed_ram() {
         for (gib, expected) in [
             (4u64, 1u8),
             (8, 1),
             (9, 1),
-            (12, 2),
-            (16, 2),
-            (17, 2),
-            (32, 4),
+            (12, 1),
+            (14, 1), // the deployment target
+            (16, 1),
+            (17, 1),
+            (32, 2),
         ] {
             assert_eq!(
                 slm_parallel_for_ram(Some(gib)),
@@ -1352,31 +2075,247 @@ mod tests {
             );
         }
         // Unknown RAM must not gamble on behalf of the smaller machine.
-        assert_eq!(slm_parallel_for_ram(None), 2);
+        assert_eq!(slm_parallel_for_ram(None), 1);
     }
 
-    /// The escalation tier deliberately never inherits `slm_parallel_for_ram`'s
-    /// 4 — it stays at the low end (1 or 2) on every machine, because its
-    /// whole point is decoupling escalation's KV cost from primary's.
+    /// One escalation slot on every machine. Escalation is the rare third
+    /// attempt at a document that already failed twice, so a second slot buys
+    /// overlap that never happens — and what it would cost is another 728 MiB
+    /// of the 1.7B's KV cache, taking the 16 GB class from a calculated
+    /// 4815 MiB to 5543 MiB for concurrency it cannot use.
     #[test]
-    fn slm_escalation_parallel_is_chosen_from_installed_ram() {
-        for (gib, expected) in [
-            (4u64, 1u8),
-            (8, 1),
-            (9, 1),
-            (12, 2),
-            (16, 2),
-            (17, 2),
-            (32, 2),
-        ] {
+    fn slm_escalation_parallel_is_one_on_every_machine() {
+        for gib in [4u64, 8, 9, 12, 14, 16, 17, 32, 128] {
             assert_eq!(
                 slm_escalation_parallel_for_ram(Some(gib)),
-                expected,
-                "{gib} GiB should give {expected}"
+                1,
+                "{gib} GiB should give 1"
             );
         }
-        // Unknown RAM must not gamble on behalf of the smaller machine.
-        assert_eq!(slm_escalation_parallel_for_ram(None), 2);
+        assert_eq!(slm_escalation_parallel_for_ram(None), 1);
+    }
+
+    /// The model tiers, which are memory decisions as much as `slm_parallel`
+    /// is. Three invariants beyond the table itself: the small tiers collapse
+    /// *exactly* (`slm_escalation_gguf == slm_primary_gguf` is what
+    /// `SlmLane::escalation_collapsed()` tests, so "equivalent" paths would
+    /// not do); the primary is the same 0.6B on every row, including the
+    /// 128 GiB one, because it was chosen on measured quality-per-second and
+    /// not on what a machine can afford (see `default_primary_gguf_for_ram`);
+    /// and no tier at any size names the 4B, which stays in `GGUF_SHAPES` for
+    /// sizing only.
+    ///
+    /// The constants are pinned to their literal paths here on purpose. Every
+    /// other assertion in this file compares one constant against another and
+    /// would keep passing if both moved together, which is exactly how a tier
+    /// change gets re-introduced by editing two lines.
+    #[test]
+    fn models_are_chosen_from_installed_ram() {
+        assert_eq!(DEFAULT_PRIMARY_GGUF, "models/Qwen3-0.6B-Q8_0.gguf");
+        assert_eq!(DEFAULT_ESCALATION_GGUF, "models/Qwen3-1.7B-Q8_0.gguf");
+
+        for (gib, escalation) in [
+            (Some(4u64), None),
+            (Some(8), None),
+            // The collapse boundary, asserted from both sides.
+            (Some(9), None),
+            (Some(10), Some(DEFAULT_ESCALATION_GGUF)),
+            (Some(12), Some(DEFAULT_ESCALATION_GGUF)),
+            // The deployment target: 0.6B primary, real 1.7B escalation.
+            (Some(14), Some(DEFAULT_ESCALATION_GGUF)),
+            (Some(17), Some(DEFAULT_ESCALATION_GGUF)),
+            (Some(32), Some(DEFAULT_ESCALATION_GGUF)),
+            (Some(128), Some(DEFAULT_ESCALATION_GGUF)),
+            // A machine that will not say gets the smallest tier's answer.
+            (None, None),
+        ] {
+            let chosen_primary = default_primary_gguf_for_ram(gib);
+            let chosen_escalation = default_escalation_gguf_for_ram(gib);
+            assert_eq!(
+                chosen_primary, DEFAULT_PRIMARY_GGUF,
+                "every tier gets the same primary; {gib:?} GiB did not"
+            );
+            assert_ne!(
+                chosen_escalation, "models/Qwen3-4B-Q4_K_M.gguf",
+                "no tier defaults to the 4B; {gib:?} GiB did"
+            );
+            match escalation {
+                Some(expected) => {
+                    assert_eq!(chosen_escalation, expected, "escalation for {gib:?} GiB");
+                    assert!(
+                        separate_escalation_model_fits(gib),
+                        "{gib:?} GiB should get its own escalation server"
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        chosen_escalation, chosen_primary,
+                        "{gib:?} GiB must collapse onto the exact primary path"
+                    );
+                    assert!(!separate_escalation_model_fits(gib));
+                }
+            }
+        }
+    }
+
+    /// Every path a tier can produce has to be one the shape table knows,
+    /// or the RAM estimates for a stock install silently fall back to the
+    /// pessimistic unknown-model path.
+    #[test]
+    fn the_default_models_are_all_in_the_shape_table() {
+        for gib in [Some(8u64), Some(14), Some(32), None] {
+            for path in [
+                default_primary_gguf_for_ram(gib),
+                default_escalation_gguf_for_ram(gib),
+            ] {
+                assert!(
+                    shape_for(Path::new(path)).is_some(),
+                    "{path} is not in GGUF_SHAPES"
+                );
+            }
+        }
+        let cfg = Config::default();
+        assert!(shape_for(&cfg.slm_primary_gguf).is_some());
+        assert!(shape_for(&cfg.slm_escalation_gguf).is_some());
+        // And the stock config is a valid one on any machine.
+        assert!(cfg.evidence_token_budget <= max_evidence_token_budget());
+    }
+
+    /// The gotcha this table exists for: the 4B has 36 layers, not the 28 the
+    /// old hardcoded estimate assumed, so its KV cache costs 1.286x more per
+    /// token. Anything that hardcodes one shape is wrong for the other — and
+    /// that is now easier to get wrong, not harder, because both *shipped*
+    /// models are 28-layer and a hardcoded 28 would pass every default.
+    #[test]
+    fn kv_cache_math_matches_the_pinned_model_shapes() {
+        assert_eq!(kv_bytes_per_token(28, 8, 128), 114_688);
+        assert_eq!(kv_bytes_per_token(36, 8, 128), 147_456);
+        for (basename, per_token, mib_per_slot) in [
+            ("Qwen3-0.6B-Q8_0.gguf", 114_688u64, 728u64),
+            ("Qwen3-1.7B-Q8_0.gguf", 114_688, 728),
+            ("Qwen3-4B-Q4_K_M.gguf", 147_456, 936),
+        ] {
+            let shape = shape_for(Path::new(basename)).expect(basename);
+            assert_eq!(
+                kv_bytes_per_token(shape.layers, shape.kv_heads, shape.head_dim),
+                per_token,
+                "{basename}"
+            );
+            assert_eq!(
+                per_token * SLM_CTX_PER_SLOT as u64 / (1024 * 1024),
+                mib_per_slot,
+                "{basename} per-slot KV"
+            );
+        }
+    }
+
+    /// The footprints the tier doc comments quote are calculated, and this is
+    /// the calculation — asserted so the prose and the arithmetic cannot drift
+    /// apart the way the old "448 MiB per slot" comment did. Every literal
+    /// here appears verbatim in `default_slm_parallel`'s table or in the
+    /// comment of the knob that cites it.
+    ///
+    /// These were recomputed for this pair rather than restored: the slot
+    /// moved 4096 -> 6656 and `GgufShape::overhead_bytes` replaced a flat
+    /// 200 MiB, so no footprint predating either change survives, including
+    /// for models that did not change.
+    #[test]
+    fn the_naming_lane_footprint_matches_the_sizing_table() {
+        let primary = shape_for(Path::new("Qwen3-0.6B-Q8_0.gguf")).unwrap();
+        let escalation = shape_for(Path::new("Qwen3-1.7B-Q8_0.gguf")).unwrap();
+        // Catalogued but no longer a default; see `GGUF_SHAPES`.
+        let unknown_ceiling = shape_for(Path::new("Qwen3-4B-Q4_K_M.gguf")).unwrap();
+
+        assert_eq!(resident_mib(primary, 1), 1838); // every tier's primary
+        assert_eq!(resident_mib(primary, 2), 2566); // > 17 GiB primary
+        assert_eq!(resident_mib(escalation, 1), 2977); // escalation server
+
+        // The two-server transient worst cases the budgets are built on.
+        assert_eq!(resident_mib(primary, 1) + resident_mib(escalation, 1), 4815);
+        assert_eq!(resident_mib(primary, 2) + resident_mib(escalation, 1), 5543);
+
+        // A second escalation slot costs the same 728 MiB and buys nothing;
+        // `slm_escalation_parallel_for_ram` quotes this pair of numbers as the
+        // price of the thing it refuses to do.
+        assert_eq!(resident_mib(escalation, 2), 3705);
+        assert_eq!(resident_mib(primary, 1) + resident_mib(escalation, 2), 5543);
+
+        // The per-slot KV term each row is broken into, asserted as the
+        // difference it actually is rather than as a number retyped from
+        // `kv_bytes_per_token`.
+        assert_eq!(resident_mib(primary, 2) - resident_mib(primary, 1), 728);
+        assert_eq!(
+            resident_mib(escalation, 2) - resident_mib(escalation, 1),
+            728
+        );
+
+        // What an unknown or hand-configured GGUF is charged instead — the
+        // reason the 4B stays catalogued after being dropped as a default.
+        // `shape_or_largest` and every budget comparison built on it lean on
+        // this staying the largest thing the table has weighed.
+        assert_eq!(resident_mib(unknown_ceiling, 1), 5218);
+        assert_eq!(
+            resident_mib(unknown_ceiling, 1) - resident_mib(escalation, 1),
+            2241,
+            "dropping the 4B would make the pessimistic fallback 2241 MiB cheaper"
+        );
+    }
+
+    /// An operator may point Settings at any GGUF. We cannot know its shape,
+    /// so the estimate degrades to the largest model we do know — never the
+    /// smallest. Being too pessimistic wastes a slot; being too optimistic
+    /// wedges the machine.
+    ///
+    /// This is the test that makes retiring the 4B as a *default* safe.
+    /// `largest_known_shape` folds `GGUF_SHAPES`, not the default table, so a
+    /// model can stop being shipped without stopping being a ceiling — and
+    /// nothing here should ever resolve to a model a tier actually names.
+    #[test]
+    fn an_unknown_gguf_is_sized_as_the_largest_known_shape() {
+        let unknown = Path::new("C:/models/somebody-elses-70b.gguf");
+        assert!(shape_for(unknown).is_none());
+
+        let assumed = shape_or_largest(unknown);
+        assert_eq!(assumed.basename, "Qwen3-4B-Q4_K_M.gguf");
+        for shape in GGUF_SHAPES {
+            assert!(
+                resident_bytes(assumed, 1) >= resident_bytes(shape, 1),
+                "the fallback must not be cheaper than {}",
+                shape.basename
+            );
+        }
+        // The ceiling outlives the defaults: no tier may name the model that
+        // is standing in for "we have no idea how big this is".
+        for gib in [None, Some(8u64), Some(14), Some(64)] {
+            for path in [
+                default_primary_gguf_for_ram(gib),
+                default_escalation_gguf_for_ram(gib),
+            ] {
+                assert_ne!(
+                    shape_or_largest(Path::new(path)).basename,
+                    assumed.basename,
+                    "{path} is a default AND the pessimistic fallback"
+                );
+            }
+        }
+
+        // A hand-configured 4B is priced at its own shape rather than
+        // mistaken for the 1.7B it sits above in the catalog. That is what
+        // lets the budget see the real cost of the lane it sits in — and, the
+        // other half of the same coin, what makes it replaceable at all.
+        let by_hand = Path::new("D:/models/Qwen3-4B-Q4_K_M.gguf");
+        assert_eq!(resident_mib(shape_or_largest(by_hand), 1), 5218);
+        assert!(model_is_replaceable(by_hand));
+        assert!(
+            !model_is_replaceable(unknown),
+            "an unpriceable model must never be swapped out from under the operator"
+        );
+
+        // Matching is on the file name and Windows is case-insensitive.
+        assert_eq!(
+            shape_or_largest(Path::new("C:/Models/qwen3-1.7b-q8_0.gguf")).basename,
+            "Qwen3-1.7B-Q8_0.gguf"
+        );
     }
 
     /// Each `convertd` worker converges toward `CONVERTD_WORKER_RSS_MB`
@@ -1384,9 +2323,25 @@ mod tests {
     /// pools them, so two of them is 1.1 GB and leaves under 150 MB of
     /// margin on an 8 GB machine beside Windows, the model servers and the
     /// app — the 8 GB tier drops from 2 workers to 1 for exactly that reason.
+    ///
+    /// The 16 GB tier drops from 4 to 3 for a different reason, and not a
+    /// pure memory one: at rest the pair holds a calculated 4815 MiB and four
+    /// workers would fit. What buys the fourth worker back is that at-rest is
+    /// not steady state (the 1.7B measured 2,860 -> 5,785 MiB over 16 requests
+    /// at this context) and that `Sidecar` serializes conversions, so the
+    /// fourth would be real memory spent on throughput the pipeline cannot
+    /// take. See `convert_workers_ram_ceiling`.
     #[test]
     fn convert_workers_are_capped_by_installed_ram() {
-        for (gib, expected) in [(4u64, 1usize), (8, 1), (9, 1), (12, 4), (17, 4), (32, 6)] {
+        for (gib, expected) in [
+            (4u64, 1usize),
+            (8, 1),
+            (9, 1),
+            (12, 3),
+            (14, 3), // the deployment target
+            (17, 3),
+            (32, 6),
+        ] {
             assert_eq!(
                 convert_workers_ram_ceiling(Some(gib)),
                 expected,
@@ -1409,15 +2364,26 @@ mod tests {
             slm_parallel: 4,
             ..Default::default()
         };
-        cfg.clamp_slm_parallel_for_test(Some(8));
+        cfg.clamp_resources_for_ram(Some(8));
         assert_eq!(cfg.slm_parallel, 1, "8 GB must not inherit 4");
+
+        // The deployment target keeps one slot too — and not because it
+        // cannot afford two (5543 MiB fits). The measured throughput this
+        // build ships against was taken at `slm_parallel: 1`, and nothing has
+        // measured the second slot.
+        let mut cfg = Config {
+            slm_parallel: 2,
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(Some(14));
+        assert_eq!(cfg.slm_parallel, 1, "14 GB must not inherit 2");
 
         // One-directional: someone who lowered it knows their machine.
         let mut cfg = Config {
             slm_parallel: 1,
             ..Default::default()
         };
-        cfg.clamp_slm_parallel_for_test(Some(64));
+        cfg.clamp_resources_for_ram(Some(64));
         assert_eq!(cfg.slm_parallel, 1, "a deliberate 1 must survive on 64 GB");
     }
 
@@ -1428,33 +2394,347 @@ mod tests {
             slm_escalation_parallel: 2,
             ..Default::default()
         };
-        cfg.clamp_slm_escalation_parallel_for_test(Some(8));
+        cfg.clamp_resources_for_ram(Some(8));
         assert_eq!(cfg.slm_escalation_parallel, 1, "8 GB must not inherit 2");
+
+        // Not even a workstation gets a second escalation slot.
+        let mut cfg = Config {
+            slm_escalation_parallel: 4,
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(Some(64));
+        assert_eq!(cfg.slm_escalation_parallel, 1);
 
         // One-directional: someone who lowered it knows their machine.
         let mut cfg = Config {
             slm_escalation_parallel: 1,
             ..Default::default()
         };
-        cfg.clamp_slm_escalation_parallel_for_test(Some(64));
+        cfg.clamp_resources_for_ram(Some(64));
         assert_eq!(
             cfg.slm_escalation_parallel, 1,
             "a deliberate 1 must survive on 64 GB"
         );
     }
 
+    /// The models are persisted too, and they are the expensive half of the
+    /// budget. A config written on (or imported from) a larger machine can
+    /// name the 1.7B as its primary; an 8 GB machine loading it must come back
+    /// down to the bundled 0.6B and a collapsed escalation tier, or it holds a
+    /// calculated 2977 MiB against a 2300 MiB budget on a box with about
+    /// 7.4 GiB usable.
+    ///
+    /// What is asserted here is the *order* of the reduction as much as the
+    /// outcome. Over-budget pairs give up the second server before they give up
+    /// a model, and give up the escalation model before the primary, because
+    /// that is the order that costs the operator least: collapse still runs
+    /// rung 3, while replacing the primary changes how every document is named.
+    #[test]
+    fn a_persisted_model_pair_is_clamped_down_but_never_up() {
+        // A pair from a machine that could afford a separate escalation
+        // server, loaded on one that cannot.
+        let mut cfg = Config {
+            slm_primary_gguf: DEFAULT_ESCALATION_GGUF.into(),
+            slm_escalation_gguf: DEFAULT_ESCALATION_GGUF.into(),
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(Some(8));
+        assert_eq!(cfg.slm_primary_gguf, PathBuf::from(DEFAULT_PRIMARY_GGUF));
+        assert_eq!(
+            cfg.slm_escalation_gguf, cfg.slm_primary_gguf,
+            "8 GB must collapse onto the primary it ended up with, exactly"
+        );
+
+        // The deployment target keeps the shipped pair — this is the tier the
+        // sizing exists for, and nothing about it may be clamped.
+        let mut cfg = Config {
+            slm_primary_gguf: DEFAULT_PRIMARY_GGUF.into(),
+            slm_escalation_gguf: DEFAULT_ESCALATION_GGUF.into(),
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(Some(14));
+        assert_eq!(cfg.slm_primary_gguf, PathBuf::from(DEFAULT_PRIMARY_GGUF));
+        assert_eq!(
+            cfg.slm_escalation_gguf,
+            PathBuf::from(DEFAULT_ESCALATION_GGUF)
+        );
+
+        // A config left behind by a build of the rejected tier change names
+        // the 1.7B/4B pair, a calculated 8195 MiB. On the 16 GB target that is
+        // over the 5900 MiB budget, and the cheapest way back under it is to
+        // drop the second *server* — the 1.7B primary the operator has is
+        // 2977 MiB and fits fine, so it is not the thing that has to go.
+        let mut cfg = Config {
+            slm_primary_gguf: DEFAULT_ESCALATION_GGUF.into(),
+            slm_escalation_gguf: "models/Qwen3-4B-Q4_K_M.gguf".into(),
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(Some(14));
+        assert_eq!(
+            cfg.slm_primary_gguf,
+            PathBuf::from(DEFAULT_ESCALATION_GGUF),
+            "a 1.7B primary fits 16 GB and must not be taken away to fix the escalation tier"
+        );
+        assert_eq!(
+            cfg.slm_escalation_gguf, cfg.slm_primary_gguf,
+            "the second server is what 16 GB cannot afford, so it collapses"
+        );
+
+        // One-directional: an explicitly collapsed pair survives on a machine
+        // that could have afforded a second server.
+        let mut cfg = Config {
+            slm_primary_gguf: DEFAULT_PRIMARY_GGUF.into(),
+            slm_escalation_gguf: DEFAULT_PRIMARY_GGUF.into(),
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(Some(64));
+        assert_eq!(
+            cfg.slm_primary_gguf,
+            PathBuf::from(DEFAULT_PRIMARY_GGUF),
+            "a deliberate 0.6B must survive on 64 GB"
+        );
+        assert_eq!(
+            cfg.slm_escalation_gguf,
+            PathBuf::from(DEFAULT_PRIMARY_GGUF),
+            "a deliberately collapsed pair must survive on 64 GB"
+        );
+
+        // A machine that will not report its memory is treated as the
+        // smallest one, models included.
+        let mut cfg = Config {
+            slm_primary_gguf: DEFAULT_ESCALATION_GGUF.into(),
+            slm_escalation_gguf: DEFAULT_ESCALATION_GGUF.into(),
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(None);
+        assert_eq!(cfg.slm_primary_gguf, PathBuf::from(DEFAULT_PRIMARY_GGUF));
+        assert_eq!(cfg.slm_escalation_gguf, cfg.slm_primary_gguf);
+    }
+
+    /// The property the whole model clamp rests on: whatever a tier ships by
+    /// default must fit that tier's own budget, at that tier's own slot counts.
+    ///
+    /// Step 2 of the clamp falls back to `default_primary_gguf_for_ram` /
+    /// `default_escalation_gguf_for_ram` and does not re-check the result,
+    /// because it cannot usefully do anything if that fails. This is what makes
+    /// that safe. It also fails loudly if someone widens a default, raises
+    /// `SLM_CTX_PER_SLOT` again, or lowers a budget without checking the other
+    /// two — the failure mode otherwise is a fresh install clamping itself on
+    /// first launch and logging a warning about a config nobody wrote.
+    #[test]
+    fn every_tier_can_afford_its_own_defaults() {
+        for gib in [
+            None,
+            Some(4u64),
+            Some(8),
+            Some(9),
+            Some(10),
+            Some(14),
+            Some(17),
+            Some(32),
+        ] {
+            let lane = naming_lane_mib(
+                Path::new(default_primary_gguf_for_ram(gib)),
+                Path::new(default_escalation_gguf_for_ram(gib)),
+                slm_parallel_for_ram(gib),
+                slm_escalation_parallel_for_ram(gib),
+            );
+            let budget = naming_lane_budget_mib(gib);
+            assert!(
+                lane <= budget,
+                "{gib:?} GiB defaults hold {lane} MiB against a {budget} MiB budget"
+            );
+        }
+
+        // And the three tier budgets are the numbers the doc comment derives,
+        // so the derivation table cannot drift from the match arms.
+        assert_eq!(naming_lane_budget_mib(Some(8)), 2300);
+        assert_eq!(naming_lane_budget_mib(Some(14)), 5900);
+        assert_eq!(naming_lane_budget_mib(Some(64)), 16600);
+        assert_eq!(
+            naming_lane_budget_mib(None),
+            naming_lane_budget_mib(Some(8)),
+            "unknown RAM gets the smallest machine's budget"
+        );
+    }
+
+    /// The model budget prices the lane at the slot counts this run will
+    /// actually use, which means the slot clamps have to have happened first.
+    ///
+    /// This config is the shipped 16 GB pair — 4815 MiB against a 5900 MiB
+    /// budget, comfortably fine — carrying slot counts from a machine that
+    /// could afford them. Priced at the persisted 4/4 the same pair reads
+    /// 9183 MiB and the models would be needlessly collapsed; priced at the
+    /// clamped 1/1 nothing is wrong with it at all. Only the ordering inside
+    /// `clamp_resources_for_ram` decides which happens.
+    #[test]
+    fn the_model_budget_prices_slots_after_they_are_clamped() {
+        let mut cfg = Config {
+            slm_parallel: 4,
+            slm_escalation_parallel: 4,
+            slm_primary_gguf: DEFAULT_PRIMARY_GGUF.into(),
+            slm_escalation_gguf: DEFAULT_ESCALATION_GGUF.into(),
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(Some(14));
+
+        assert_eq!(cfg.slm_parallel, 1);
+        assert_eq!(cfg.slm_escalation_parallel, 1);
+        assert_eq!(
+            cfg.slm_primary_gguf,
+            PathBuf::from(DEFAULT_PRIMARY_GGUF),
+            "the slot clamp already fixed the overcommitment; the models were never the problem"
+        );
+        assert_eq!(
+            cfg.slm_escalation_gguf,
+            PathBuf::from(DEFAULT_ESCALATION_GGUF),
+            "a separate escalation server must survive a purely slot-shaped overcommitment"
+        );
+
+        // The two prices this test is discriminating between.
+        assert_eq!(
+            naming_lane_mib(
+                Path::new(DEFAULT_PRIMARY_GGUF),
+                Path::new(DEFAULT_ESCALATION_GGUF),
+                4,
+                4
+            ),
+            9183
+        );
+        assert_eq!(
+            naming_lane_mib(
+                Path::new(DEFAULT_PRIMARY_GGUF),
+                Path::new(DEFAULT_ESCALATION_GGUF),
+                1,
+                1
+            ),
+            4815
+        );
+    }
+
+    /// The clamp asks what the machine can hold, not what the tier ships.
+    ///
+    /// A 4B escalation server is not a default any more, and before this
+    /// distinction existed that alone was enough to have it replaced — on a
+    /// 64 GiB workstation with over 20 GiB free. It is a real 5218 MiB and a
+    /// deliberate choice, and the only thing that justifies overriding it is
+    /// the memory not being there.
+    #[test]
+    fn a_hand_configured_model_survives_wherever_the_machine_can_hold_it() {
+        let four_b = "models/Qwen3-4B-Q4_K_M.gguf";
+        // 0.6B primary + 4B escalation: a calculated 7056 MiB.
+        let lane = naming_lane_mib(Path::new(DEFAULT_PRIMARY_GGUF), Path::new(four_b), 1, 1);
+        assert_eq!(lane, 7056);
+
+        // The workstation holds it comfortably, so nothing is touched — not
+        // the escalation model, and not the `slm_parallel` the operator was
+        // running it at.
+        let mut cfg = Config {
+            slm_primary_gguf: DEFAULT_PRIMARY_GGUF.into(),
+            slm_escalation_gguf: four_b.into(),
+            slm_parallel: 1,
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(Some(64));
+        assert_eq!(cfg.slm_primary_gguf, PathBuf::from(DEFAULT_PRIMARY_GGUF));
+        assert_eq!(
+            cfg.slm_escalation_gguf,
+            PathBuf::from(four_b),
+            "7056 MiB against a 16600 MiB budget is not a reason to override anyone"
+        );
+
+        // The 8 GB machine cannot, so it collapses — and lands on a lane it
+        // can actually afford rather than merely a smaller one.
+        let mut cfg = Config {
+            slm_primary_gguf: DEFAULT_PRIMARY_GGUF.into(),
+            slm_escalation_gguf: four_b.into(),
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(Some(8));
+        assert_eq!(cfg.slm_primary_gguf, PathBuf::from(DEFAULT_PRIMARY_GGUF));
+        assert_eq!(
+            cfg.slm_escalation_gguf, cfg.slm_primary_gguf,
+            "8 GB must collapse onto the exact primary path"
+        );
+        assert!(
+            naming_lane_mib(
+                &cfg.slm_primary_gguf,
+                &cfg.slm_escalation_gguf,
+                cfg.slm_parallel,
+                cfg.slm_escalation_parallel,
+            ) <= naming_lane_budget_mib(Some(8))
+        );
+    }
+
+    /// An uncatalogued GGUF is priced pessimistically and replaced never. The
+    /// two are not in tension: the pessimistic price can push the *other* half
+    /// of the pair down, which is the safe direction, while the model the
+    /// operator explicitly named is left exactly where they put it.
+    #[test]
+    fn an_unpriceable_model_is_sized_pessimistically_and_never_replaced() {
+        let mystery = "D:/models/somebody-elses-70b.gguf";
+
+        // Priced as the largest shape we know, so the pair reads 5218 + 2977.
+        assert_eq!(
+            naming_lane_mib(Path::new(mystery), Path::new(DEFAULT_ESCALATION_GGUF), 1, 1),
+            8195
+        );
+
+        // On 8 GB that is far over budget, but the operator's primary survives
+        // — only the half this module can price is given up.
+        let mut cfg = Config {
+            slm_primary_gguf: mystery.into(),
+            slm_escalation_gguf: DEFAULT_ESCALATION_GGUF.into(),
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(Some(8));
+        assert_eq!(
+            cfg.slm_primary_gguf,
+            PathBuf::from(mystery),
+            "a model we cannot price is a model we must not replace"
+        );
+        assert_eq!(
+            cfg.slm_escalation_gguf, cfg.slm_primary_gguf,
+            "the priceable half still comes down, which here means collapsing"
+        );
+
+        // And when it is the only model named, nothing happens at all: there
+        // is no smaller thing to give up that we are entitled to take.
+        let mut cfg = Config {
+            slm_primary_gguf: mystery.into(),
+            slm_escalation_gguf: mystery.into(),
+            ..Default::default()
+        };
+        cfg.clamp_resources_for_ram(Some(8));
+        assert_eq!(cfg.slm_primary_gguf, PathBuf::from(mystery));
+        assert_eq!(cfg.slm_escalation_gguf, PathBuf::from(mystery));
+    }
+
+    /// Every knob at once, from the most overcommitted config a larger machine
+    /// could hand an 8 GB one. The pair it lands on is the 1838 MiB collapsed
+    /// lane, which is the only naming footprint this tier was ever budgeted
+    /// for.
     #[test]
     fn an_eight_gib_machine_clamps_every_process_pool() {
         let mut cfg = Config {
             slm_parallel: 4,
             slm_escalation_parallel: 2,
             convert_workers: 6,
+            slm_primary_gguf: DEFAULT_ESCALATION_GGUF.into(),
+            slm_escalation_gguf: "models/Qwen3-4B-Q4_K_M.gguf".into(),
             ..Default::default()
         };
-        cfg.clamp_resources_for_test(Some(8));
+        cfg.clamp_resources_for_ram(Some(8));
         assert_eq!(cfg.slm_parallel, 1);
         assert_eq!(cfg.slm_escalation_parallel, 1);
         assert_eq!(cfg.convert_workers, 1);
+        assert_eq!(cfg.slm_primary_gguf, PathBuf::from(DEFAULT_PRIMARY_GGUF));
+        assert_eq!(cfg.slm_escalation_gguf, cfg.slm_primary_gguf);
+        assert_eq!(
+            resident_mib(shape_or_largest(&cfg.slm_primary_gguf), cfg.slm_parallel),
+            1838,
+            "the clamped 8 GB config must land on the footprint its tier budgets"
+        );
     }
 
     #[test]

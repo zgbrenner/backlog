@@ -398,8 +398,22 @@ export async function validatePortableTree(
   if (runtimeDlls.length === 0) {
     throw new Error("portable payload has no app-local runtime DLL");
   }
+  // The ZIP carries exactly one GGUF: the 0.6B in PORTABLE_REQUIRED_HASHES.
+  // The optional 1.7B escalation model is downloaded in-app precisely because
+  // carrying it puts this artifact over GitHub's 2 GiB per-release-asset limit,
+  // so finding it here means the tree was staged from a developer's app-data
+  // models folder. Caught here rather than at upload time, where the symptom is
+  // a failed release rather than a named file.
+  //
+  // The 4B is checked too even though nothing ships or downloads it any more:
+  // `config.rs` still catalogues its shape so a hand-configured 4B is sized
+  // correctly, which means a developer can still have one sitting in app-data,
+  // which is exactly the staging accident this guard exists to catch.
   if (actualFiles.some((file) => /(?:^|\/)Qwen3-1\.7B-Q8_0\.gguf$/i.test(file))) {
     throw new Error("portable payload must not include the optional Qwen3 1.7B model");
+  }
+  if (actualFiles.some((file) => /(?:^|\/)Qwen3-4B-Q4_K_M\.gguf$/i.test(file))) {
+    throw new Error("portable payload must not include the Qwen3 4B model");
   }
   if (actualFiles.some((file) => /(?:^|\/)__MACOSX(?:\/|$)/i.test(file))) {
     throw new Error("portable payload must not contain archive metadata");

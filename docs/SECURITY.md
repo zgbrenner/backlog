@@ -96,7 +96,7 @@ folders can contain sensitive documents and are not protected by SQLCipher.
 | `<Local Output>\.backlog\intents\*.json` and `staging\*.part` | Private recovery artifacts. Intents are plaintext metadata; staging files can contain a full document copy. They are normally removed after successful delivery, but may remain after an interruption so receipt-backed recovery can finish safely. |
 | Quarantine directory | Unmodified source documents awaiting review, plus dismissed files. Protect it as you protect the originals; it must be local, not synced. An approved Local correction may consume its pinned copy only after the corrected output and receipt are durable. |
 | `logs\` | Folder paths reduced to drive + depth (`logging::redact_path`); model output replaced with `[model output withheld]`. |
-| `models\` | ~2.4 GB of Apache-2.0 weights. Not sensitive; SHA-256-verified against `models.lock.json`. |
+| `models\` | Up to ~2.5 GB of Apache-2.0 weights, depending on whether the optional backup model is installed. Not sensitive; SHA-256-verified against `models.lock.json`. |
 
 All of the above still require operating-system access controls and full-disk
 encryption. Retention for cache, quarantine, Local Output documents and
@@ -109,7 +109,7 @@ currently prunes the ledger's `events` table (`docs/KNOWN_ISSUES.md` item 5).
 
 The NSIS uninstaller removes the installed program. It deliberately leaves
 **all** user data behind, because deleting it silently would destroy the record
-of what was filed and force a 2.4 GB re-download:
+of what was filed and force a re-download of up to 2.5 GB of weights:
 
 - `%APPDATA%\ai.sonomos.backlog` survives uninstall — the encrypted ledger, the
   DPAPI key blob, the converted-text cache, `backlog.config.json`, the logs, and

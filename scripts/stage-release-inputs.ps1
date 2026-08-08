@@ -4,11 +4,21 @@
   Windows release build.
 
 .DESCRIPTION
-  This script is intentionally release-only. It downloads the exact primary
+  This script is intentionally release-only. It downloads the exact bundled
   naming model, semantic ONNX model/tokenizer, and llama.cpp archive, verifies
   each before copying anything into the Tauri bundle, rejects the development
   marker for executable/model payloads, and stages the Visual C++ runtime files
-  imported by llama.cpp. It never downloads the optional 1.7B escalation model.
+  imported by llama.cpp.
+
+  The bundled model is Qwen3-0.6B-Q8_0 and stays that way. It is every RAM
+  tier's configured primary, so a fresh install names its first document with
+  no network at all. The optional Qwen3-1.7B-Q8_0 escalation model, which
+  machines above 9 GiB use for a third naming attempt, is fetched by the in-app
+  downloader instead: carrying it would put the installer (~2.27 GB) and the
+  portable ZIP (~2.4 GB) over GitHub's 2 GiB per-release-asset limit. So this
+  script does not download it, and $PrimaryModelSha256 below is the 0.6B's
+  digest -- scripts/validate-release-workflow.mjs and
+  docs/RELEASE_CHECKLIST.md gate the release on it by that name.
 #>
 [CmdletBinding()]
 param(

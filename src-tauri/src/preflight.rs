@@ -1029,6 +1029,36 @@ mod tests {
         assert!(detail.contains("primary.gguf") && detail.contains("escalation.gguf"));
     }
 
+    /// The primary is the model the installer carries, so a machine without it
+    /// has nothing to name a document with: the blocker stays fatal, and it
+    /// carries the one action that installs the bundle.
+    #[tokio::test]
+    async fn a_missing_primary_blocks_start_and_offers_the_download() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = workable_cfg(root.path());
+        let models_dir = root.path().join("models");
+        cfg.slm_primary_gguf = models_dir.join(crate::model_download::PRIMARY_GGUF_NAME);
+        cfg.slm_escalation_gguf = models_dir.join(crate::model_download::ESCALATION_GGUF_NAME);
+
+        let status = run_with(&absent_paths(root.path()), &cfg, false, false).await;
+
+        assert!(!status.configured);
+        assert!(!status.primary_model_found);
+        let blocker = status
+            .problems
+            .iter()
+            .find(|problem| problem.code == "models_missing")
+            .expect("no model at all must still block Start");
+        assert_eq!(blocker.severity, ProblemSeverity::Error);
+        assert_eq!(blocker.action, Some(ProblemAction::DownloadModels));
+        // A missing primary is the whole problem, so the optional-model notice
+        // must not also fire and offer the operator a second thing to read.
+        assert!(!status
+            .problems
+            .iter()
+            .any(|problem| problem.code == "escalation_model_missing_using_primary"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn missing_optional_model_is_usable_without_claiming_it_is_installed() {
