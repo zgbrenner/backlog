@@ -184,7 +184,7 @@ pub fn resolve_key(key_path: &Path) -> anyhow::Result<SecretKey> {
         Ok(out)
     } else {
         let mut key = SecretKey([0u8; KEY_LEN]);
-        getrandom::getrandom(&mut key.0)?;
+        getrandom::fill(&mut key.0)?;
         let mut blob = protect(&key.0)?;
         if let Some(parent) = key_path.parent() {
             std::fs::create_dir_all(parent)?;
