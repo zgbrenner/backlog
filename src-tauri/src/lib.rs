@@ -270,7 +270,8 @@ fn model_paths_collide(left: &Path, right: &Path) -> bool {
 
 /// Repair the v0.4.4 state where normalization persisted the installed
 /// primary path into both model fields. The desired optional-model path is
-/// always the canonical 1.7B destination, never the runtime fallback.
+/// always `models_dir/`[`model_download::ESCALATION_GGUF_NAME`], never the
+/// runtime fallback.
 ///
 /// 2026-08-05: path equality alone is not damage. `SlmLane::escalation_collapsed`
 /// exists precisely so an operator can point both tiers at the same existing
@@ -286,7 +287,7 @@ fn model_paths_collide(left: &Path, right: &Path) -> bool {
 /// Anything else is an operator's deliberate choice and is left alone.
 ///
 /// The same logic preserves the mirror case: an operator pointing both
-/// fields at the canonical 1.7B escalation file itself
+/// fields at the canonical escalation file itself
 /// (`models_dir.join(ESCALATION_GGUF_NAME)`) is likewise an intentional
 /// single-model collapse, not v0.4.4 damage, as long as that shared path
 /// exists — it is neither the canonical primary name nor the canonical
@@ -355,11 +356,11 @@ fn migrate_colliding_model_paths(cfg: &mut Config, models_dir: &Path) -> Result<
     }
     let canonical_escalation = models_dir.join(model_download::ESCALATION_GGUF_NAME);
     if model_paths_collide(&cfg.slm_primary_gguf, &canonical_escalation) {
-        return Err(
-            "The everyday and optional model paths must be different. Choose the 0.6B file for \
-             the everyday model; BackLog reserves its canonical 1.7B path for the optional model."
-                .into(),
-        );
+        return Err(format!(
+            "The everyday and optional model paths must be different. Choose a different file \
+             for the everyday model; BackLog reserves {} for the optional one.",
+            canonical_escalation.display()
+        ));
     }
     // If the repair does change a path, log what changed and why: which
     // damage signature fired, not just that a repair happened.
@@ -424,6 +425,61 @@ fn repair_and_persist_startup_model_paths(
     Ok(())
 }
 
+/// Move every GGUF the installer shipped in `bundled_dir` into the one
+/// canonical `models_dir`, so a fresh machine can name its first document
+/// without the 2.4 GB download.
+///
+/// Relocated rather than left where the installer put it, and the config is
+/// never pointed at the install directory. Keeping one canonical models dir is
+/// what makes the rest of the system coherent: `download_models` writes to the
+/// configured path, `BACKLOG_MODELS_DIR` hands that dir to convertd, and
+/// preflight reports on it. A config pointing into the install tree would send
+/// a later "Download models" *back into the install tree*, and would be
+/// silently orphaned by the next upgrade.
+///
+/// `rename` first because per-user installs land under the same
+/// `%LOCALAPPDATA%`/`%APPDATA%` volume as app-data, making this instant and
+/// free rather than a 639 MB copy. Copy is the cross-volume fallback; if both
+/// fail the model simply is not there and preflight says so, which is the same
+/// state as before.
+///
+/// Iterates every member of the bundle rather than assuming which one a build
+/// ships, and takes `bundled_dir` as an argument rather than reaching for the
+/// resource directory itself, so the whole policy is unit-testable without a
+/// Tauri `AppHandle`. `resources/models/` carries only the primary today — the
+/// escalation model would put both the installer and the portable ZIP over
+/// GitHub's 2 GiB per-release-asset limit — but a loop that knew only that one
+/// name would silently leave a second shipped GGUF in the install tree for the
+/// next upgrade to delete.
+fn install_bundled_ggufs(bundled_dir: &Path, models_dir: &Path, cfg: &mut Config) {
+    for (configured, name) in [
+        (&mut cfg.slm_primary_gguf, model_download::PRIMARY_GGUF_NAME),
+        (
+            &mut cfg.slm_escalation_gguf,
+            model_download::ESCALATION_GGUF_NAME,
+        ),
+    ] {
+        // A tier that already has its file needs nothing.
+        if configured.is_file() {
+            continue;
+        }
+        let bundled = bundled_dir.join(name);
+        if !bundled.is_file() {
+            continue;
+        }
+        let dest = models_dir.join(name);
+        if std::fs::rename(&bundled, &dest).is_ok() {
+            log::info!("installed the bundled {name} into the models folder");
+        } else if std::fs::copy(&bundled, &dest).is_ok() {
+            log::info!("copied the bundled {name} into the models folder");
+        } else {
+            log::warn!("could not place the bundled {name} into the models folder");
+            continue;
+        }
+        *configured = dest;
+    }
+}
+
 /// Normalize, validate, and persist an incoming configuration.
 ///
 /// Split out of the command so the policy — not the IPC plumbing — is what
@@ -436,7 +492,6 @@ fn apply_config(
     mut cfg: Config,
 ) -> Result<Config, String> {
     cfg.normalize();
-    cfg.clamp_resources_to_machine();
     if cfg.cache_dir.as_os_str().is_empty() {
         cfg.cache_dir = default_cache_dir.to_path_buf();
     }
@@ -444,7 +499,22 @@ fn apply_config(
         .parent()
         .unwrap_or_else(|| Path::new(""))
         .join("models");
+    // Collision handling runs BEFORE the memory ceilings, and the order is
+    // load-bearing in both directions.
+    //
+    // Clamping first would let a machine-sized model substitution dissolve a
+    // collision the operator actually submitted: a config naming the escalation
+    // model for both tiers gets its primary rewritten to the tier's own model,
+    // the two paths stop colliding, and a submission that should have been
+    // rejected is silently accepted instead. That is the v0.4.4 bug class the
+    // migration exists to catch, reintroduced through a side door.
+    //
+    // The reverse order is safe because the migration already distinguishes a
+    // deliberate single-model lane (byte-identical paths, left in place) from
+    // v0.4.4 damage, so the clamp is still free to collapse the escalation
+    // tier onto the primary afterwards on a machine that cannot hold two.
     migrate_colliding_model_paths(&mut cfg, &models_dir)?;
+    cfg.clamp_resources_to_machine();
     cfg.validate()?;
     cfg.save(cfg_path).map_err(|e| e.to_string())?;
     Ok(cfg)
@@ -1707,47 +1777,11 @@ pub fn run() {
                 });
                 return Ok(());
             }
-            // The installer ships the primary GGUF so a fresh machine can name
-            // its first document without the 2.4 GB download.
-            //
-            // Relocate it into app-data rather than pointing the config at the
-            // install directory. Keeping one canonical models dir is what makes
-            // the rest of the system coherent: `download_models` writes to the
-            // configured path, `BACKLOG_MODELS_DIR` hands that dir to convertd,
-            // and preflight reports on it. A config pointing into the install
-            // tree would send a later "Download models" *back into the install
-            // tree*, and would be silently orphaned by the next upgrade.
-            //
-            // `rename` first because per-user installs land under the same
-            // `%LOCALAPPDATA%`/`%APPDATA%` volume as app-data, making this
-            // instant and free rather than a 639 MB copy. Copy is the
-            // cross-volume fallback; if both fail the model simply is not there
-            // and preflight says so, which is the same state as before.
-            for (path, name) in [
-                (&mut cfg.slm_primary_gguf, model_download::PRIMARY_GGUF_NAME),
-                (
-                    &mut cfg.slm_escalation_gguf,
-                    model_download::ESCALATION_GGUF_NAME,
-                ),
-            ] {
-                if path.is_file() {
-                    continue;
-                }
-                let bundled = resource(app.handle(), &format!("models/{name}"));
-                if !bundled.is_file() {
-                    continue;
-                }
-                let dest = models_dir.join(name);
-                if std::fs::rename(&bundled, &dest).is_ok() {
-                    log::info!("installed the bundled {name} into the models folder");
-                    *path = dest;
-                } else if std::fs::copy(&bundled, &dest).is_ok() {
-                    log::info!("copied the bundled {name} into the models folder");
-                    *path = dest;
-                } else {
-                    log::warn!("could not place the bundled {name} into the models folder");
-                }
-            }
+            install_bundled_ggufs(
+                &resource(app.handle(), "models"),
+                &models_dir,
+                &mut cfg,
+            );
             for (target, expected_sha256) in [
                 (
                     model_download::SEMANTIC_MODEL_TARGET,
@@ -2421,7 +2455,7 @@ mod tests {
     }
 
     /// The mirror of the intentional-custom-collapse case: an operator who
-    /// points both tiers at the canonical 1.7B escalation file itself (not a
+    /// points both tiers at the canonical escalation file itself (not a
     /// custom `.gguf`) is still running the single-model lane on purpose, as
     /// long as that shared file actually exists on disk. It is neither the
     /// canonical primary's name nor its resolved path, so it must be left
@@ -2501,6 +2535,130 @@ mod tests {
             cfg.slm_escalation_gguf,
             models_dir.join(model_download::ESCALATION_GGUF_NAME)
         );
+    }
+
+    /// The GGUF the installer carries must end up in the one canonical
+    /// `models_dir`, with the configuration pointing at the installed copy —
+    /// not at the install-tree path the next upgrade replaces, and not at a
+    /// path nothing was ever written to.
+    #[test]
+    fn the_bundled_gguf_is_relocated_into_app_data_and_the_config_follows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundled_dir = dir.path().join("resources").join("models");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&bundled_dir).unwrap();
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            bundled_dir.join(model_download::PRIMARY_GGUF_NAME),
+            b"the bundled model",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            slm_primary_gguf: models_dir.join(model_download::PRIMARY_GGUF_NAME),
+            slm_escalation_gguf: models_dir.join(model_download::ESCALATION_GGUF_NAME),
+            ..Default::default()
+        };
+
+        install_bundled_ggufs(&bundled_dir, &models_dir, &mut cfg);
+
+        let installed = models_dir.join(model_download::PRIMARY_GGUF_NAME);
+        assert!(installed.is_file(), "the shipped model must reach app-data");
+        assert_eq!(cfg.slm_primary_gguf, installed);
+        // Nothing was shipped for the optional model, so its path is left
+        // naming the file the operator can still download.
+        assert_eq!(
+            cfg.slm_escalation_gguf,
+            models_dir.join(model_download::ESCALATION_GGUF_NAME)
+        );
+        assert!(!cfg.slm_escalation_gguf.is_file());
+    }
+
+    /// Driven by the bundle list, not by one hardcoded filename: a build that
+    /// ships more than the primary must have every shipped GGUF relocated and
+    /// every configured path repointed, or the extras sit in the install tree
+    /// until an upgrade deletes them.
+    #[test]
+    fn install_bundled_ggufs_installs_every_gguf_a_build_ships() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundled_dir = dir.path().join("resources").join("models");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&bundled_dir).unwrap();
+        std::fs::create_dir_all(&models_dir).unwrap();
+        for name in [
+            model_download::PRIMARY_GGUF_NAME,
+            model_download::ESCALATION_GGUF_NAME,
+        ] {
+            std::fs::write(bundled_dir.join(name), b"the bundled model").unwrap();
+        }
+        let mut cfg = Config {
+            slm_primary_gguf: models_dir.join(model_download::PRIMARY_GGUF_NAME),
+            slm_escalation_gguf: models_dir.join(model_download::ESCALATION_GGUF_NAME),
+            ..Default::default()
+        };
+
+        install_bundled_ggufs(&bundled_dir, &models_dir, &mut cfg);
+
+        assert!(cfg.slm_primary_gguf.is_file());
+        assert!(cfg.slm_escalation_gguf.is_file());
+        assert_eq!(
+            cfg.slm_primary_gguf,
+            models_dir.join(model_download::PRIMARY_GGUF_NAME)
+        );
+        assert_eq!(
+            cfg.slm_escalation_gguf,
+            models_dir.join(model_download::ESCALATION_GGUF_NAME)
+        );
+    }
+
+    /// An operator who pointed a tier at their own GGUF keeps it: a file that
+    /// is already there is never replaced by the shipped one, and the path is
+    /// never rewritten out from under them.
+    #[test]
+    fn install_bundled_ggufs_leaves_a_tier_that_already_has_its_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundled_dir = dir.path().join("resources").join("models");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&bundled_dir).unwrap();
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            bundled_dir.join(model_download::PRIMARY_GGUF_NAME),
+            b"the bundled model",
+        )
+        .unwrap();
+        let chosen = dir.path().join("operators-own.gguf");
+        std::fs::write(&chosen, b"the operator's own model").unwrap();
+        let mut cfg = Config {
+            slm_primary_gguf: chosen.clone(),
+            slm_escalation_gguf: models_dir.join(model_download::ESCALATION_GGUF_NAME),
+            ..Default::default()
+        };
+
+        install_bundled_ggufs(&bundled_dir, &models_dir, &mut cfg);
+
+        assert_eq!(cfg.slm_primary_gguf, chosen);
+        assert_eq!(
+            std::fs::read(&chosen).unwrap(),
+            b"the operator's own model".to_vec()
+        );
+    }
+
+    /// Nothing bundled is nothing installed — and specifically not an empty
+    /// or truncated destination file, which preflight would then certify.
+    #[test]
+    fn install_bundled_ggufs_does_nothing_when_the_installer_shipped_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundled_dir = dir.path().join("resources").join("models");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let mut cfg = Config {
+            slm_primary_gguf: models_dir.join(model_download::PRIMARY_GGUF_NAME),
+            slm_escalation_gguf: models_dir.join(model_download::ESCALATION_GGUF_NAME),
+            ..Default::default()
+        };
+
+        install_bundled_ggufs(&bundled_dir, &models_dir, &mut cfg);
+
+        assert_eq!(std::fs::read_dir(&models_dir).unwrap().count(), 0);
     }
 
     /// Distinct paths never collide in the first place, so the function must
@@ -2669,11 +2827,20 @@ mod tests {
 
     #[test]
     fn diagnostics_config_carries_no_folder_names() {
+        // The model paths are pinned in the fixture rather than defaulted:
+        // `Config::default()` picks the escalation GGUF from installed RAM (a
+        // machine at or below 9 GiB collapses onto the primary), so asserting
+        // on the default basenames would make this redaction test pass or fail
+        // according to how much memory the build machine has.
         let cfg = Config {
             processing_dir: "C:\\Users\\jane\\OneDrive\\2024 Terminations".into(),
             outbox_dir: "C:\\Users\\jane\\Outbox".into(),
             quarantine_dir: "C:\\Quarantine".into(),
             cache_dir: "C:\\Cache".into(),
+            slm_primary_gguf: Path::new("C:\\Users\\jane\\models")
+                .join(model_download::PRIMARY_GGUF_NAME),
+            slm_escalation_gguf: Path::new("C:\\Users\\jane\\models")
+                .join(model_download::ESCALATION_GGUF_NAME),
             ..Default::default()
         };
         let redacted = redacted_config(&cfg).to_string();
@@ -2681,7 +2848,8 @@ mod tests {
         assert!(!redacted.contains("jane"), "got: {redacted}");
         // The parts support actually needs are still there.
         assert!(redacted.contains("llama_port"));
-        assert!(redacted.contains("Qwen3-0.6B-Q8_0.gguf"));
+        assert!(redacted.contains(model_download::PRIMARY_GGUF_NAME));
+        assert!(redacted.contains(model_download::ESCALATION_GGUF_NAME));
     }
 
     #[test]

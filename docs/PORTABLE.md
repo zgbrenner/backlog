@@ -5,7 +5,7 @@ x64 laptop. It is a ZIP, not an installer: extract it anywhere you can write
 files and double-click **`BackLog-Portable.cmd`**.
 
 The ZIP includes the BackLog app, the document-conversion runtime, the CPU
-llama server and its runtime DLLs, the verified everyday Qwen3 0.6B model, the
+llama server and its runtime DLLs, the verified bundled Qwen3 0.6B model, the
 semantic evidence model, and a pinned fixed WebView2 runtime. It does not need
 Python, Visual C++ Redistributable, an administrator password, or a separate
 WebView2 download to launch.
@@ -42,9 +42,12 @@ in the current Windows user's app-data directory, not beside the executable.
 Extract the runtime to a local writable NTFS directory; network/UNC locations
 are not supported by fixed WebView2 deployment.
 
-The optional Qwen3 1.7B model is not included. It can still be downloaded from
-Settings when needed; the everyday 0.6B model is enough to start on an 8 GB
-machine. For the measured memory guidance, see [`SIZING.md`](SIZING.md).
+The optional Qwen3 1.7B backup model is not included, for the same
+release-asset size limit that keeps it out of the installer. It can be
+downloaded from Settings when needed. The bundled 0.6B is the everyday model on
+every machine, and on an 8 GB machine it handles backup naming attempts too.
+For the memory arithmetic — including which parts of it are measured and which
+are calculated — see [`SIZING.md`](SIZING.md).
 
 ## Troubleshooting
 

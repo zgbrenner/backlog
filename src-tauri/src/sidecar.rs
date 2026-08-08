@@ -1615,7 +1615,10 @@ mod pool_tests {
     /// look for it. This measures the conversion stage on its own.
     ///
     /// ```powershell
-    /// $env:BACKLOG_E2E_CONVERTD = "$env:LOCALAPPDATA\BackLog\convertd.exe"
+    /// # The ONEDIR build. A stale ONEFILE `convertd.exe` may sit beside this
+    /// # directory from an older install; it predates the semantic evidence
+    /// # ops and degrades silently rather than failing. See `e2e_real_batch`.
+    /// $env:BACKLOG_E2E_CONVERTD = "$env:LOCALAPPDATA\BackLog\convertd\convertd.exe"
     /// $env:BACKLOG_E2E_DOCS     = "C:\path\to\a\folder\of\documents"
     /// cargo test -p backlog --lib convert_throughput -- --ignored --nocapture
     /// ```

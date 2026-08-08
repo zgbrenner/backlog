@@ -166,9 +166,18 @@ const CLAIM_STALE_MULTIPLE: u64 = 6;
 /// exists to save.
 ///
 /// `per_file_wall_clock_secs` stands in for one naming request because the
-/// naming lane has no timeout knob of its own; its default (90s) is already
-/// above `SlmLane`'s 60s HTTP timeout, so the substitution is conservative and
-/// the knob keeps its meaning — raising it raises the backstop.
+/// naming lane has no timeout knob of its own. That substitution only means
+/// anything while `SlmLane`'s `NAMING_HTTP_TIMEOUT` (300s) sits ABOVE this knob
+/// (default 180s), and the ordering is the whole point: whichever of the two is
+/// tighter is the real deadline, so if the HTTP client were the tighter one the
+/// configured number would be decorative and the actual limit would be a
+/// constant in another module. It also decides how the failure reads — a
+/// request ended by the wall-clock cap is quarantined with the elapsed time and
+/// the stage it died in, whereas one ended by the HTTP client surfaces as
+/// `SLM_FAIL`, blaming the model for a deadline the client imposed. The pair
+/// was inverted once (90s knob, 60s client) and cost exactly that. Raising this
+/// knob raises the backstop, up to 300s; past that `NAMING_HTTP_TIMEOUT` has to
+/// move with it.
 fn wall_clock_cap(cfg: &Config) -> u64 {
     let attempts = cfg.max_stage_attempts.max(1) as u32;
     let base = std::time::Duration::from_secs(cfg.sidecar_timeout_secs);
@@ -1302,6 +1311,15 @@ impl Pipeline {
     /// SLM_FAIL when a wider bundle would have named it. Being a plain function
     /// of the config and the Evidence, it is also the part that can be proved
     /// without a live llama-server.
+    ///
+    /// What changed is where rung 3's width comes from, not that it is wider.
+    /// It used to be `budget * 2` computed here, which made this line the only
+    /// place the two budgets were related — invisible from the config, and
+    /// unbounded, so raising `evidence_token_budget` silently doubled a request
+    /// that has to fit one llama-server slot.
+    /// `Config::escalation_evidence_token_budget` now owns the ratio and clamps
+    /// it, so the operator still turns one knob and both bundles scale off it,
+    /// and neither can outgrow the context it is sent to.
     fn rung(&self, attempt: u8, ev: &Evidence) -> (Tier, String) {
         let budget = self.cfg.evidence_token_budget;
         match attempt {
@@ -1309,10 +1327,10 @@ impl Pipeline {
             // Attempt 2: primary again, evidence trimmed to 5a-only. If a
             // validator rejected attempt 1, the caller quotes the violation.
             2 => (Tier::Primary, filter::trimmed_bundle(ev, budget)),
-            // Attempt 3: escalate to Qwen3-1.7B AND widen the evidence.
+            // Attempt 3: escalate to the larger model AND widen the evidence.
             _ => (
                 Tier::Escalation,
-                filter::widened_bundle(ev, budget.saturating_mul(2)),
+                filter::widened_bundle(ev, self.cfg.escalation_evidence_token_budget()),
             ),
         }
     }
@@ -5705,6 +5723,53 @@ mod tests {
             "convertd did not answer `versions`; a manifest cannot carry provenance without it: {model_versions}"
         );
 
+        // A sidecar that predates the semantic evidence pipeline answers
+        // `unknown op` to `rank_paragraphs`, and the filter treats that as
+        // data rather than an error: it records `semantic_available: false`
+        // and falls back to a deterministic paragraph slice. The batch then
+        // completes, reports healthy totals, and every naming number it
+        // produced describes the fallback instead of the product.
+        //
+        // That is not hypothetical. A whole 1.7B-vs-0.6B comparison was run
+        // against `%LOCALAPPDATA%\BackLog\convertd.exe`, a stale PyInstaller
+        // ONEFILE build reporting version 0.2.0 that sat beside the current
+        // ONEDIR one, and every bundle in it came from the fallback — bundles
+        // pinned near 6,000 characters regardless of a 10,000-character
+        // budget, 12 of 95 paragraphs selected, both models fed identical
+        // impoverished evidence. The run looked entirely healthy.
+        //
+        // So fail here, loudly, rather than let a silent capability gap
+        // masquerade as a measurement. One trivial paragraph is enough: this
+        // asks whether the op EXISTS, not whether it ranks well.
+        let probe_text = "Probe paragraph for the semantic capability check.".to_string();
+        let probe = vec![crate::sidecar::SourceParagraph {
+            index: 0,
+            end_char: probe_text.chars().count(),
+            start_char: 0,
+            text: probe_text,
+        }];
+        match sidecar.rank_paragraphs(&probe, &["date".to_string()], 1, 0.0, 0.0) {
+            Ok(result) => assert!(
+                result.available,
+                "convertd {} answered `rank_paragraphs` but reported the semantic \
+                 model unavailable ({:?}). Every bundle would come from the \
+                 deterministic fallback, so naming numbers from this run would \
+                 describe the fallback, not the product. Check BACKLOG_MODELS_DIR \
+                 and models/semantic/all-MiniLM-L6-v2/.",
+                model_versions["convertd"], result.reason
+            ),
+            Err(error) => panic!(
+                "convertd {} cannot rank paragraphs ({error}). This is almost \
+                 certainly a stale sidecar: the ONEFILE build at \
+                 %LOCALAPPDATA%\\BackLog\\convertd.exe predates the semantic \
+                 evidence pipeline and answers `unknown op`. Point \
+                 BACKLOG_E2E_CONVERTD at the ONEDIR build \
+                 (%LOCALAPPDATA%\\BackLog\\convertd\\convertd.exe) or at \
+                 src-tauri/binaries/convertd/convertd.exe.",
+                model_versions["convertd"]
+            ),
+        }
+
         let pipeline = Arc::new(Pipeline {
             convert_slots: Arc::new(Semaphore::new(cfg.convert_workers.max(1))),
             slm_slots: Arc::new(Semaphore::new(cfg.slm_parallel.max(1) as usize)),
@@ -8262,6 +8327,14 @@ server.serve_forever()
 
         assert_eq!(tier_one, Tier::Primary);
         assert_eq!(tier_three, Tier::Escalation);
+        // The widening ratio lives in Config now; if it ever resolved to the
+        // base budget the assertions below would still pass on a bundle that
+        // merely differed, so pin the input to `widened_bundle` too.
+        assert!(
+            h.pipeline.cfg.escalation_evidence_token_budget()
+                > h.pipeline.cfg.evidence_token_budget,
+            "rung 3 is decorative unless its budget is genuinely wider"
+        );
         assert_ne!(
             rung_three, rung_one,
             "rung 3 must not send a byte-identical bundle to a different model"

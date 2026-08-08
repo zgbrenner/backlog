@@ -149,10 +149,10 @@ const DRIVERS = {
       window.__harness.emit("model-download-progress", {
         current_file: "Qwen3-1.7B-Q8_0.gguf",
         file_bytes_done: 812_000_000,
-        file_bytes_total: 1_890_000_000,
+        file_bytes_total: 1_834_426_016,
         files_done: 1,
         files_total: 2,
-        overall_percent: 61.4,
+        overall_percent: 61.1,
       });
     });
     await page.waitForTimeout(200);
@@ -539,14 +539,14 @@ const CHECKS = [
       await folder.fill("");
       await page.keyboard.type("D:\\Scans\\Intake");
 
-      // The backend throttles to ~200ms/file for ~2.4 GB; five in a row is a
+      // The backend throttles to ~200ms/file for ~2.5 GB; five in a row is a
       // second of a twenty-minute download.
       for (let i = 1; i <= 5; i++) {
         await page.evaluate((n) => {
           window.__harness.emit("model-download-progress", {
             current_file: "Qwen3-0.6B-Q8_0.gguf",
             file_bytes_done: n * 40_000_000,
-            file_bytes_total: 640_000_000,
+            file_bytes_total: 639_446_688,
             files_done: 0,
             files_total: 2,
             overall_percent: n * 4,
@@ -1231,7 +1231,7 @@ const CHECKS = [
     name: "the activity bar goes stalled on the clock, with no events",
     async run(page) {
       // Drive a fake clock rather than sleeping. The threshold is
-      // per_file_wall_clock_secs * 3 = 270s and the fixture stamps the job 262s
+      // per_file_wall_clock_secs * 3 = 540s and the fixture stamps the job 532s
       // in, so a real-time version has to sit out an 8s margin and trust that a
       // headless page's setInterval is not being throttled — which it is, the
       // moment this suite shares a machine with a cargo build. Installing the

@@ -25,8 +25,9 @@ looks can. The rule that matters —
 `CheckError::DateNotInEvidence` — is a set membership test against dates
 harvested by regex from the document text and the file's metadata. It is
 trivially auditable, it cannot be talked out of its answer, and it is the same
-function whether the proposal came from a 0.6B model, a 1.7B model, or the
-person in the review pane.
+function whether the proposal came from a 0.6B model, a 4B model, or the
+person in the review pane. Changing the model tiers, as the 1.7B/4B move did,
+changes nothing about what may ship.
 
 The corollary is the reason `backlog-core` is a separate crate: the trust core
 must be testable with no Tauri, no sidecar binaries, no icon and no GGUF, on a
@@ -154,8 +155,8 @@ most likely to need it: managed fleets with egress filtering, and Win10 LTSC
 images that ship no Evergreen WebView2. `offlineInstaller` embeds the runtime
 (about 127 MB) so the install completes with no network at all.
 
-**Cost, accepted.** ~127 MB of installer, against 2.4 GB of model weights the
-same machine will download anyway. The size is not the binding constraint.
+**Cost, accepted.** ~127 MB of installer, against up to 2.5 GB of model weights
+the same machine will download anyway. The size is not the binding constraint.
 
 ## 6. Source-available, not open source
 

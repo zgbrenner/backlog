@@ -35,13 +35,19 @@ evidence attached to the release record.
 - [ ] The installer download is `BackLog_0.8.0_x64-setup.exe`; the
       installer-free option is `BackLog_0.8.0_x64-portable.zip`.
 - [ ] The installer contains the app, `convertd` with its Python runtime,
-      `llama-server` and every imported runtime DLL, Qwen3 0.6B Q8_0, the
+      `llama-server` and every imported runtime DLL, the bundled Qwen3 0.6B Q8_0, the
       pinned MiniLM semantic model/tokenizer, and the offline WebView2 runtime.
-- [ ] The primary model hash is
-      `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`.
-- [ ] The Qwen3 1.7B Q8_0 model is not in the installer. Settings presents it
-      as an optional, cancellable, resumable in-app download for difficult
-      documents.
+- [ ] The bundled model hash is
+      `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`
+      (Qwen3-0.6B-Q8_0). This is the one GGUF in the installer and the
+      configured primary on every RAM tier.
+- [ ] Qwen3-1.7B-Q8_0 is not in the installer or the portable ZIP — including
+      it would take each over GitHub's 2 GiB per-release-asset limit. Settings
+      presents it as a cancellable, resumable in-app download.
+- [ ] A machine above 9 GiB of RAM that has not run that download still names
+      documents and readiness shows the
+      `escalation_model_missing_using_primary` warning rather than a blocking
+      error.
 - [ ] A clean install can process a document with the network disabled and
       without Python, a VC++ redistributable, a model script, or any second
       installer.
@@ -83,8 +89,10 @@ evidence attached to the release record.
       folders before readiness runs.
 - [ ] An active optional-model transfer can be cancelled; Cancelled and Failed
       states offer Resume; Completed state survives navigation.
-- [ ] With the optional 1.7B model absent, readiness says it is absent, stays
-      usable, and safely uses the primary model for backup naming attempts.
+- [ ] With the optional escalation model absent, readiness says it is absent,
+      stays usable, and safely uses the primary model for backup naming
+      attempts. Same expectation on a machine at 9 GiB or less, where the
+      collapsed pair is the configured shape rather than a missing file.
 - [ ] Quitting during work releases claims; restart immediately reclaims and
       resumes them without waiting for a stale timeout.
 - [ ] A background model request cannot respawn `llama-server` after shutdown

@@ -15,6 +15,233 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [Unreleased] — the coverage fix, and the model swap that measurement did not support
+
+> Not a release. `package.json`, `src-tauri/tauri.conf.json` and
+> `src-tauri/Cargo.toml` are all still on 0.9.1; this section collects what has
+> landed on `feat/model-tier-1.7b-4b` and gets a version number when one is cut.
+>
+> **The branch set out to make naming better by making the model bigger. It
+> ends up making it better by fixing what the model was allowed to read.** The
+> evidence-coverage fix below is the change that paid; the model swap it was
+> written to support was measured, cost 2.0x the wall clock for nothing that
+> survives the sample, and is not merged.
+>
+> **Two earlier sets of figures published from this branch are withdrawn.**
+> Both came from batches run against a stale sidecar that silently disabled the
+> semantic evidence lane; every naming number in them described a fallback path
+> rather than the product. See `docs/KNOWN_ISSUES.md` item 15. Separately: the
+> semantic lane costs 58–82% of wall clock, so any throughput figure in this
+> repository from before 2026-08-07 may have been taken with it off, with no
+> way to tell after the fact.
+
+### Changed
+
+- **`evidence_token_budget` now buys evidence coverage instead of verbosity.**
+  `SEMANTIC_TOP_K` was a hardcoded 12 with no relationship to the budget, and
+  the semantic lane got 35% of the character budget; `semantic_top_k(char_budget)`
+  now derives the count and the lane's share is 60%. Both had to move together,
+  which is why the ceiling survived so long: 12 paragraphs rendered at ~350
+  characters each want ~4,200 characters against a 3,500-character lane, so
+  raising either alone changed nothing measurable and looked like a dead end.
+
+  Measured on the same corpus with the same models: evidence bundles go from
+  **6,526–7,652 to 9,277–10,000 characters** (65–76% → 92–100% of the budget),
+  ranked paragraphs from **12 to 17** at the shipped budget and 27 at the
+  rung-3 budget, and the shipped pair got **19% faster — 24.69 → 20.03 s/file,
+  5.6 hours per 1,000**. Wider and cheaper at once, because the lane had been
+  assembling an oversized selection and then truncating it.
+
+  **20.03 s/file is the fastest end-to-end figure this project has recorded**,
+  and it is a coverage change rather than a performance one. `docs/SIZING.md`
+  carries it with its configuration attached.
+- **The 1.7B/4B model swap was measured and rejected.** It is recorded here in
+  full so nobody re-proposes it without new evidence. Same corpus, same code,
+  semantic lane confirmed live in every arm, both pairs run at both coverage
+  settings so the two changes separate:
+
+  | config | s/file | h/1000 | FAITHFUL | NAMES PARTY | TOP ENTITY |
+  |---|---|---|---|---|---|
+  | 0.6B/1.7B, top_k 12 | 24.69 | 6.9 | 24/25 | 25/26 | 19/26 |
+  | **0.6B/1.7B, top_k 17** | **20.03** | **5.6** | 23/25 | 25/26 | 19/26 |
+  | 1.7B/4B, top_k 12 | 38.47 | 10.7 | 24/24 | 24/26 | 16/26 |
+  | 1.7B/4B, top_k 17 | 40.11 | 11.1 | 25/25 | 25/26 | 13/26 |
+
+  At matched coverage the swap costs **2.0x the wall clock** — 40.11 against
+  20.03 s/file — for a **two-document** faithfulness difference at n=26, inside
+  this project's own documented run-to-run variance. **Rejected on
+  quality-per-second, not on memory**: the 1.7B primary fits the 16 GB class
+  comfortably, and that was never the objection.
+
+  One signal did distinguish them and is recorded rather than buried: under
+  raised coverage the 0.6B began **fabricating by concatenation** — welding two
+  real parties into `'Termination of Employment - Blue Harbor Systems Ironquill
+  Corporation (Ironquill Corporation)'` — where the 1.7B stayed 100% faithful.
+  Two documents is not enough to buy 2x wall clock, but it is the thread to
+  pull if this is ever revisited with a corpus that can discriminate.
+
+  Also worth knowing before designing that corpus: `date_source` came out 29/30
+  in **all four** configurations. The corpus is saturated, which is why nothing
+  separates on it.
+- **`--ctx-size` is `6656 * slm_parallel`, up from `4096 * slm_parallel`.** It
+  is derived rather than chosen: rung 3's 16,000 characters of evidence at a
+  pessimistic 3 real characters per token is 5,334 tokens, plus 640 reserved
+  for the system prompt, the operator's naming notes and the chat template,
+  plus 220 for the answer, rounded up to llama.cpp's next 256-token KV block.
+  `slm.rs` holds it as `SLM_CTX_PER_SLOT` with the derivation in a doc comment
+  and a unit test that fails if the parts stop summing to it.
+- **The evidence budget is 2,500 tokens, up from 1,500, and the escalation rung
+  stopped being a second knob.** `Config::escalation_evidence_token_budget()`
+  derives rung 3's budget as 8/5 of the configured one — 4,000 at the default —
+  and clamps it to what a slot can hold, so raising the one visible setting
+  raises both together and the two can no longer be configured into an
+  inversion where the retry sees *less* than the attempt it is retrying. The
+  Settings range is now 400–2,700 rather than 400–4,000, because 2,700 is the
+  largest value whose escalation budget still fits a slot. Measured on the
+  corpus afterwards: the worst observed prompt used **60.1% of the slot**, and
+  real evidence text tokenizes at 4.71 characters per token against the 3.0 the
+  ceiling is derived at. The reserve is doing its job and nothing is being
+  truncated.
+- **KV-cache arithmetic is per model shape rather than one constant.** Through
+  0.9.x the 0.6B and the 1.7B shared 28 layers, 8 KV heads and head_dim 128, so
+  a single 448 MiB-per-slot figure covered both and `docs/SIZING.md` said so.
+  Qwen3-4B is a **36-layer** model: it pays 1.286x more KV per token, 936 MiB
+  per slot at the new context against the 28-layer 728 MiB. `config.rs` now
+  keys a shape table on GGUF basename and takes the shape as an argument
+  (`kv_bytes_per_token(layers, kv_heads, head_dim)`), so the RAM ceilings
+  cannot silently under-count a model whose attention stack is a different
+  shape — which is exactly what they would have done here.
+- **Timeouts get real headroom.** `per_file_wall_clock_secs` 90 → 180,
+  `NAMING_HTTP_TIMEOUT` 120 s → 300 s, `HEALTH_TIMEOUT` 60 s → 180 s. The
+  health deadline is the one that mattered: 60 s was sized for a 640 MB GGUF at
+  a 4,096-token slot, and the slot is now 6,656 with the whole KV cache
+  preallocated before `/health` answers at all. Losing that race is not a slow
+  first document but a permanent one — the child is killed, the slot is
+  cleared, and the next attempt starts the same load and fails identically.
+  These are ceilings, not waits: a warm load measures 3.5–3.6 s, so raising
+  them costs a healthy machine nothing. `sidecar_timeout_secs` is unchanged at
+  45.
+- **The RAM tiers are recomputed rather than restored.** The shipped pair is
+  unchanged — Qwen3-0.6B primary everywhere, optional Qwen3-1.7B escalation
+  above 9 GiB, collapsed at or below it and on unknown RAM — but the footprints
+  behind the tier choices are not: the context moved 4,096 → 6,656 and
+  `overhead_bytes` replaced the flat 200 MiB, so the pre-branch numbers were
+  wrong. Recalculated from `resident_mib`: **1,838 MiB** for the collapsed
+  single server, **4,815 MiB** for both servers on the 16 GB class, **5,543 MiB**
+  at `slm_parallel: 2` above 17 GiB. The 8 GB class picks up about 280 MiB more
+  KV from the wider context and is otherwise untouched.
+- **`convert_workers` drops from 4 to 3 on the 16 GB tier, and
+  `slm_escalation_idle_secs` from 600 to 300.** The worker ceiling's old
+  justification ("~8.3 GB left after OS/app/SLM@2") no longer holds, and it is
+  worth being honest that the at-rest arithmetic alone does not force three
+  either — four workers fit on paper. Two things say three anyway: at-rest is
+  not steady state (the 1.7B measured 2,860 → 5,785 MiB over 16 requests, and
+  recycling bounds that drift rather than removing it), and the fourth worker
+  buys throughput the pipeline cannot use while `Sidecar` serialises
+  conversions. Releasing the escalation server after five idle minutes rather
+  than ten keeps a batch with sparse escalations resting at **1,838 MiB**
+  instead of **4,815**; reaping stays completion-timestamped and still cannot
+  fire mid-request. How often the escalation server actually starts on a real corpus
+  is **not established** — an earlier version of this entry said it never did,
+  on the strength of a batch since withdrawn, and that claim is retracted
+  rather than restated.
+- **`slm_recycle_after_requests` drops from 64 to 8, and recycling now applies
+  to both model slots rather than only the primary.** llama.cpp's Windows RSS
+  growth (ggml-org/llama.cpp#24356) is not a slow leak on this workload: the 4B
+  went from 2,842 MiB private at rest to 3,880 MiB across **three** requests,
+  and reached a 9,258 MiB working set by request 16; the 1.7B peaked at
+  5,785 MiB over the same run. The escalation server was previously governed by
+  idle-reaping alone, which by construction never fires on a server that is
+  busy — that is, never on the server that is actually growing. A warm reload
+  measures 3.5–3.6 s against requests of 35–84 s, so recycling every 8 requests
+  costs about **1.3% of wall clock** and buys a bound on resident memory that
+  llama.cpp does not otherwise provide. The growth figures come from the direct
+  model benchmark and stand; an earlier claim that recycling had been confirmed
+  live over a full batch rested on a withdrawn run and is not repeated here.
+- **The flat 200 MiB `COMPUTE_BUFFER_BYTES` allowance is gone**, replaced by a
+  per-model `overhead_bytes` in the same shape table that carries the attention
+  dimensions. The measured remainder after weights and KV is **~383 MiB for the
+  1.7B and ~1,750 MiB for the 4B** — 4.6x the overhead for 1.25x the hidden
+  size. No flat constant can be pessimistic enough for the 4B without being
+  absurd for the 1.7B, which is the same lesson as the KV shape table one bullet
+  up: this pipeline had two per-model constants pretending to be universal, and
+  the 4B found both.
+- **`max_head_pages` (10) and `max_tail_pages` (3) are unchanged, on purpose.**
+  Raising the evidence budget is not a reason to widen the page window: PDF
+  truncation only engages past both `head + tail` pages and 40,000 characters,
+  and past that the character budget binds first. A wider window would add
+  mid-document candidates competing for the same 10,000 characters, against
+  identifying signal that is front-loaded in real documents. Recorded because it
+  gets re-proposed every time the budget moves — with the caveat that no corpus
+  document exercises the truncation path at all, so this is an argument rather
+  than a measurement. See `docs/SIZING.md`.
+
+### Added
+
+- **A ceiling rung 3 cannot overrun.** llama.cpp does not refuse an over-length
+  prompt; it drops what does not fit, and the model then names the document
+  from evidence with a hole in it — a wrong answer that looks like a normal
+  one. `filter::max_bundle_chars` derives the enforced character ceiling from
+  `SLM_CTX_PER_SLOT` minus the prompt reserve and the answer, at the
+  pessimistic 3 chars/token, and every path from a configured token budget to a
+  character budget goes through one clamp so a third caller cannot bypass it.
+  `Config::validate` refuses a config that would exceed it, so the failure
+  surfaces at save time in Settings rather than as a quietly truncated bundle
+  mid-batch.
+
+### Documentation
+
+- **`docs/KNOWN_ISSUES.md` item 15: the semantic evidence lane degrades
+  silently.** `filter.rs` folds a `rank_paragraphs` failure into
+  `available: false` and falls back to a deterministic paragraph slice, so a
+  missing, stale or incapable sidecar disables semantic ranking with no error,
+  no flag and healthy-looking totals. It invalidated two full measurement
+  batches here: both ran against a 23 July PyInstaller *onefile* `convertd.exe`
+  reporting version 0.2.0, sitting beside the current *onedir* build, which
+  answers `unknown op` to `rank_paragraphs` and `extract_entities`. The tell
+  was visible only in the evidence cache (`routing: semantic_unavailable`,
+  bundles pinned near 6,000 chars from a 27,366-char source, 12 of 95
+  paragraphs selected). `e2e_real_batch` now probes the capability at startup
+  and panics with the onedir/onefile explanation; **the production path still
+  degrades silently**, which is the intended behaviour for an optional
+  capability but leaves an operator with a stale sidecar getting quietly worse
+  names and no signal.
+- **`docs/KNOWN_ISSUES.md` item 16 is now a resolved entry** describing the
+  ceiling that was and what replaced it. It is kept rather than deleted because
+  it is the most instructive result on this branch: a constant nobody had
+  questioned was silently capping what every naming attempt could see, and the
+  setting that appeared to control coverage did not. It is also a reminder that
+  the fix needed two constants moved together — either one alone measured as no
+  change, which is how a ceiling survives being looked at.
+- **`docs/KNOWN_ISSUES.md` item 13: a document with no content can be named
+  from the naming prompt's own example.** A deliberately contentless fixture
+  came back as "Shareholder's register - John Smith" — the prompt's
+  description-rule example, verbatim — and shipped `ok` rather than flagged,
+  because an mtime date is legitimate for an undated document and the subject
+  was well-formed, so no tripwire had grounds to fire. Pre-existing, the same
+  class as the 0.4.2 subject-example parroting fixed in 0.8.3, present in the
+  v0.9.0 run too, and confined to documents where every possible name is wrong
+  anyway. **Deliberately not fixed here**: deleting the example is one line,
+  but that example is what stops descriptions opening "The document…", so it
+  needs its own A/B over the full sample rather than a reflex edit inside a
+  model-tier change where the two effects could not be told apart. The stale
+  comment in `slm.rs` claiming this example "was never observed to parrot" is
+  corrected — measurement falsified it.
+- **`docs/KNOWN_ISSUES.md` item 14: the screenshot harness picks its port
+  unreliably.** `shoot.mjs` asks Vite for an ephemeral port and Vite 8 does not
+  honour it, so a second concurrent run — or any dev server already on 5173 —
+  lands on a port that may be bound IPv6-only while Playwright navigates to
+  `localhost`, and every scenario fails with a navigation timeout that reads as
+  a UI fault. Dev tooling only; recorded rather than fixed.
+- **`docs/KNOWN_ISSUES.md` item 11 is resolved and says so.** It described an
+  esbuild advisory in a Vite 5 tree with the major upgrade deferred; the tree
+  is on Vite 8.2.0 and `npm audit` reports zero vulnerabilities. Kept as a
+  numbered entry because earlier changelog entries reference it by number.
+- `docs/SIZING.md` is restructured around which figures are measured, which are
+  budgeted, and which are neither: the 0.9.x captures are retained and labelled
+  as the old pair at the old context, and the 0.4.3 naming-quality section is
+  marked as the baseline the new pair still has to be scored against.
+
 ## [0.9.1] — dependency hygiene
 
 ### Fixed

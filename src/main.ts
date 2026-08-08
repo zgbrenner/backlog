@@ -355,16 +355,22 @@ const SOFT_FLAG_COPY: Record<string, string> = {
 const RECOMMENDED_TUNING: Record<string, number> = {
   convert_workers: 2,
   slm_parallel: 1,
-  evidence_token_budget: 1500,
+  evidence_token_budget: 2500,
   manifest_emit_per_min: 0,
   max_stage_attempts: 3,
-  per_file_wall_clock_secs: 90,
+  per_file_wall_clock_secs: 180,
 };
 
 /** Expected model basenames. These duplicate model_download::PRIMARY_GGUF_NAME
  *  and ESCALATION_GGUF_NAME — see `cross_workstream_requests`: the honest fix
  *  is for the backend to ship them in a command so the label can never drift
- *  from what the downloader actually fetches again. */
+ *  from what the downloader actually fetches again.
+ *
+ *  The primary is the model the installer bundles, so it is present on every
+ *  install. The escalation is an optional download: a machine at 9 GiB or less,
+ *  and one that will not report its RAM, collapses the escalation onto the
+ *  primary instead and never fetches it. Preflight, not this label, is what
+ *  reports whether the configured file is actually there. */
 const PRIMARY_GGUF_NAME = "Qwen3-0.6B-Q8_0.gguf";
 const ESCALATION_GGUF_NAME = "Qwen3-1.7B-Q8_0.gguf";
 
@@ -989,12 +995,20 @@ function paintActivity(): void {
       + `<button type="button" id="start-hint" class="start-hint">${label}</button>.</span>`);
   }
 
+  // 300_000 tracks slm.rs's NAMING_HTTP_TIMEOUT, which is the longest the first
+  // request can legitimately take. This is an upper bound, not an expectation:
+  // a cold load is separately allowed up to HEALTH_TIMEOUT (180 s) before the
+  // server answers at all, and llama.cpp preallocates the whole KV cache at
+  // startup. Typical is far quicker — the shipped 0.6B primary measures
+  // 20.03 s/file end to end — but this line has to stay up for the slow case,
+  // and a window shorter than the timeout it shadows would hide it while the
+  // engine was still genuinely starting. See docs/SIZING.md.
   if (runtime.running && coldStart && (stats["named"] ?? 0) + (stats["validated"] ?? 0)
-    + (stats["emitted"] ?? 0) <= coldStart.namedBaseline && Date.now() - coldStart.at < 180_000) {
+    + (stats["emitted"] ?? 0) <= coldStart.namedBaseline && Date.now() - coldStart.at < 300_000) {
     parts.push(`<span class="coldstart"><span class="spinner-dot"></span>Starting the naming `
-      + `engine — the first file can take up to a minute and a half.</span>`);
+      + `engine — the first file can take a few minutes.</span>`);
   } else if (activeJob && runtime.running && !runtime.paused) {
-    const stalledAfter = (cfg?.per_file_wall_clock_secs ?? 90) * 3 * 1000;
+    const stalledAfter = (cfg?.per_file_wall_clock_secs ?? 180) * 3 * 1000;
     const age = Date.now() - Date.parse(activeJob.updated_at);
     parts.push(Number.isFinite(age) && age > stalledAfter
       ? `<span class="warnish">Stalled on <b>${esc(activeJob.original_name)}</b> for `
@@ -2660,7 +2674,7 @@ function buildSettings(): Node[] {
           <div class="grid3">
             ${num("Convert workers", "convert_workers", 1, 12, "More than your core count will freeze this computer.")}
             ${num("Naming requests at once", "slm_parallel", 1, 8, "Higher uses more memory.")}
-            ${num("Evidence tokens", "evidence_token_budget", 400, 4000, "How much of each document is read.")}
+            ${num("Evidence tokens", "evidence_token_budget", 400, 2700, "How much of each document is read — raise it if names miss things buried deep in long documents.")}
             ${num("Manifests per minute", "manifest_emit_per_min", 0, null, "0 means as fast as possible.")}
             ${num("Attempts per step", "max_stage_attempts", 1, 5, "Before a file is sent to review.")}
             ${num("Seconds per file", "per_file_wall_clock_secs", 30, null, "Time budget for one document.")}

@@ -38,8 +38,10 @@
 - runtime configuration validation and live preflight;
 - backend-owned running and paused state in the desktop UI;
 - accessible review controls and inline deterministic validation errors;
-- Qwen3-0.6B primary and Qwen3-1.7B escalation through llama.cpp chat
-  completions with JSON Schema output and thinking disabled;
+- RAM-tiered naming models through llama.cpp chat completions with JSON Schema
+  output and thinking disabled: the bundled Qwen3-0.6B as primary on every
+  tier, with an optional Qwen3-1.7B escalation above 9 GiB of installed RAM and
+  a collapsed escalation at or below it;
 - RapidOCR 3 compatibility, enhanced 600-DPI final retry, and offline Lingua
   language identification;
 - removal of Liquid model weights, fastText `lid.176`, shell permission, opener
@@ -51,7 +53,7 @@
   diagnostics, and a Windows NSIS packaging procedure (`RELEASING.md`) whose
   binaries are gated by `scripts/verify-binaries.ps1`;
 - in-app, hash-verified downloader (and the equivalent `models/download_models.py`
-  staging script) for the two Qwen3 GGUFs and `models.lock.json`, landing under
+  staging script) for the three Qwen3 GGUFs and `models.lock.json`, landing under
   the installed app's data directory (the slim, torch-free sidecar profile
   fetches no GLiClass/Granite snapshots -- see `docs/DEPENDENCY_COMPATIBILITY.md`);
 - documentation for each audience it has: `docs/USER_GUIDE.md` and
