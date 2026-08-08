@@ -2307,11 +2307,24 @@ mod tests {
             .join("models")
             .join(model_download::ESCALATION_GGUF_NAME);
         assert_eq!(saved.slm_primary_gguf, shared_primary);
-        assert_eq!(saved.slm_escalation_gguf, expected_escalation);
 
-        let reloaded = Config::load(&cfg_path);
+        // `apply_config` repairs the collision and THEN applies the machine's
+        // memory ceilings, which collapse the pair again wherever a second
+        // server does not fit — including every non-Windows machine, since
+        // `total_ram_gib()` reports `None` there and the conservative branch
+        // applies. So `saved.slm_escalation_gguf` is machine-dependent and
+        // asserting it here made this test pass on a 32 GiB Windows box and
+        // fail on Linux CI.
+        //
+        // The collapse is config.rs's decision and has its own tests. What
+        // THIS test is about is the readiness story: once a distinct
+        // escalation path is configured and its file is absent, preflight must
+        // stay green and say so rather than blocking. Pin that state
+        // explicitly so the question being asked does not depend on how much
+        // memory the runner happens to report.
+        let mut reloaded = Config::load(&cfg_path);
+        reloaded.slm_escalation_gguf = expected_escalation.clone();
         assert_ne!(reloaded.slm_primary_gguf, reloaded.slm_escalation_gguf);
-        assert_eq!(reloaded.slm_escalation_gguf, expected_escalation);
         assert_eq!(
             reloaded.effective_escalation_gguf(),
             shared_primary.as_path()
@@ -2396,10 +2409,33 @@ mod tests {
         let expected_escalation = models_dir.join(model_download::ESCALATION_GGUF_NAME);
         assert_eq!(cfg.slm_primary_gguf, shared_primary);
         assert_eq!(cfg.slm_escalation_gguf, expected_escalation);
-        let reloaded = Config::load(&cfg_path);
-        assert_eq!(reloaded.slm_primary_gguf, shared_primary);
-        assert_eq!(reloaded.slm_escalation_gguf, expected_escalation);
-        assert_ne!(reloaded.slm_primary_gguf, reloaded.slm_escalation_gguf);
+
+        // Assert what reached DISK, which is this test's actual claim, rather
+        // than what `Config::load` hands back.
+        //
+        // `load` re-applies the machine's memory ceilings, and those collapse
+        // the escalation tier back onto the primary wherever a second server
+        // does not fit — including every non-Windows machine, since
+        // `total_ram_gib()` reports `None` there and the conservative branch
+        // applies. Asserting on the reloaded value made this test pass on a
+        // 32 GiB Windows box and fail on Linux CI for a reason that had
+        // nothing to do with the repair it was written to prove. The repair
+        // is the thing that must persist; whether a given machine then chooses
+        // to run one server or two is config.rs's decision and its own tests.
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["slm_primary_gguf"].as_str().unwrap(),
+            shared_primary.to_str().unwrap()
+        );
+        assert_eq!(
+            persisted["slm_escalation_gguf"].as_str().unwrap(),
+            expected_escalation.to_str().unwrap()
+        );
+        assert_ne!(
+            persisted["slm_primary_gguf"], persisted["slm_escalation_gguf"],
+            "the v0.4.4 collision must not survive on disk"
+        );
     }
 
     /// The exact v0.4.4 damage signature: both fields hold the canonical
