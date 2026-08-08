@@ -29,7 +29,7 @@ jobs:
       tag: ${{ steps.release-metadata.outputs.tag }}
       portable: ${{ steps.release-metadata.outputs.portable }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_SHA }}
       - name: Wait for exact successful main CI
@@ -60,7 +60,7 @@ jobs:
       SIGNATURE: "src-tauri/target/release/bundle/nsis/BackLog_${{ needs.release-check.outputs.version }}_x64-setup.exe.sig"
       MANIFEST: "src-tauri/target/release/bundle/nsis/latest.json"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ env.RELEASE_SHA }}

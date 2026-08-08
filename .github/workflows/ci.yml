@@ -46,7 +46,7 @@ jobs:
     name: Trust core (checker + harvest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # rust-toolchain.toml pins the channel and pulls rustfmt + clippy; rustup
       # on the runner image honors it, so there is no toolchain action here to
       # disagree with the file.
@@ -69,7 +69,7 @@ jobs:
     name: Workspace (app crate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The Tauri app crate links against webkit2gtk even on a test-only build,
       # so these are required before `cargo test`, not just before `tauri build`.
       - name: Install Tauri system dependencies
@@ -114,7 +114,7 @@ jobs:
     name: Frontend (types, bundle, UI harness)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -147,7 +147,7 @@ jobs:
     name: Sidecar and tooling (Python 3.11)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Exactly 3.11: onnxruntime and rapidocr publish no 3.13/3.14 wheels and
       # scripts/build-sidecar.ps1 hard-throws on anything else, so testing on a
       # newer interpreter would test something we cannot ship.
@@ -180,7 +180,7 @@ jobs:
     name: Release version agreement
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
