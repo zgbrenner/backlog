@@ -2752,9 +2752,24 @@ fn cache_artifact_sha(path: &Path) -> Option<&str> {
 
 pub fn hash_file(path: &Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    // Read in fixed chunks rather than `std::io::copy` into the hasher.
+    // digest 0.11 dropped the blanket `io::Write` impl on digests, so
+    // `copy` no longer accepts a `Sha256` as a sink. Streaming is the point
+    // either way: this hashes whole documents, and the GGUFs the model
+    // downloader verifies are gigabytes — reading one into memory to hash it
+    // would be a regression whatever the trait situation.
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 
