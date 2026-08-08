@@ -47,7 +47,7 @@ getrandom = { version = "0.2", features = ["std"] }
 # "stream" backs model_download.rs's chunked GGUF/safetensors downloads
 # (Response::bytes_stream) so a multi-GB file is never buffered whole in
 # memory.
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 anyhow = "1"
 log = "0.4"
