@@ -337,7 +337,7 @@ impl SlmLane {
         tuning: SlmTuning,
     ) -> Self {
         let mut token = [0u8; 32];
-        getrandom::getrandom(&mut token).expect("CSPRNG for the llama-server API key");
+        getrandom::fill(&mut token).expect("CSPRNG for the llama-server API key");
         Self {
             _fallback_grammar: grammar,
             llama_server_exe,

@@ -43,7 +43,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # what's already resolved transitively so this doesn't pull in a second copy.
 # "std" is required explicitly (not on by default) so getrandom::Error
 # implements std::error::Error and `?` can convert it into anyhow::Error.
-getrandom = { version = "0.2", features = ["std"] }
+getrandom = { version = "0.4", features = ["std"] }
 # "stream" backs model_download.rs's chunked GGUF/safetensors downloads
 # (Response::bytes_stream) so a multi-GB file is never buffered whole in
 # memory.
