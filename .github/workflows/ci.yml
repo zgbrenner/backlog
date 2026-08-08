@@ -151,7 +151,7 @@ jobs:
       # Exactly 3.11: onnxruntime and rapidocr publish no 3.13/3.14 wheels and
       # scripts/build-sidecar.ps1 hard-throws on anything else, so testing on a
       # newer interpreter would test something we cannot ship.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install test dependencies
