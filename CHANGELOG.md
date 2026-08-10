@@ -171,9 +171,8 @@ field of `latest.json` should quote it.
   document exercises the truncation path at all, so this is an argument rather
   than a measurement. See `docs/SIZING.md`.
 - **The local-first, CPU-only tier decisions remain bounded.** Deterministic
-  tier tests cover the 14 GiB classification; measured runtime evidence is from
-  a 16 GB-class machine. This release does not claim a physical 14 GB hardware
-  run.
+  tier tests cover the 14 GiB classification. This task's verification host
+  has 32 GB RAM; it did not perform a physical 14 GB hardware run.
 
 ### Added
 
