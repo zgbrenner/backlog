@@ -15,19 +15,14 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
-## [Unreleased] — the coverage fix, and the model swap that measurement did not support
+## [0.10.0] — 2026-08-10
 
-> Not a release. `package.json`, `src-tauri/tauri.conf.json` and
-> `src-tauri/Cargo.toml` are all still on 0.9.1; this section collects what has
-> landed on `feat/model-tier-1.7b-4b` and gets a version number when one is cut.
+> **This release makes naming better by fixing what the model is allowed to
+> read.** The evidence-coverage fix below is the change that paid; a larger
+> model pair was measured, cost 2.0x the wall clock for no result that survives
+> the sample, and is not part of this release.
 >
-> **The branch set out to make naming better by making the model bigger. It
-> ends up making it better by fixing what the model was allowed to read.** The
-> evidence-coverage fix below is the change that paid; the model swap it was
-> written to support was measured, cost 2.0x the wall clock for nothing that
-> survives the sample, and is not merged.
->
-> **Two earlier sets of figures published from this branch are withdrawn.**
+> **Two earlier sets of figures from this work are withdrawn.**
 > Both came from batches run against a stale sidecar that silently disabled the
 > semantic evidence lane; every naming number in them described a fallback path
 > rather than the product. See `docs/KNOWN_ISSUES.md` item 15. Separately: the
@@ -175,6 +170,10 @@ field of `latest.json` should quote it.
   gets re-proposed every time the budget moves — with the caveat that no corpus
   document exercises the truncation path at all, so this is an argument rather
   than a measurement. See `docs/SIZING.md`.
+- **The local-first, CPU-only tier decisions remain bounded.** Deterministic
+  tier tests cover the 14 GiB classification; measured runtime evidence is from
+  a 16 GB-class machine. This release does not claim a physical 14 GB hardware
+  run.
 
 ### Added
 
@@ -188,6 +187,29 @@ field of `latest.json` should quote it.
   `Config::validate` refuses a config that would exceed it, so the failure
   surfaces at save time in Settings rather than as a quietly truncated bundle
   mid-batch.
+
+### Fixed
+
+- **SLM startup health probes are bounded by the remaining startup deadline.**
+  A server that accepts a silent `/health` connection cannot extend recovery
+  beyond that deadline.
+- **Converted Markdown now respects its exact response cap.** The retained head
+  and tail reserve room for the elision marker, so the marker cannot push a
+  response past the advertised maximum.
+- **Negative salience limits normalize to zero selections.** This prevents
+  Python's negative-slice behavior from selecting most ranked sentences while
+  the deterministic fallback selects none.
+- **A recoverable initial read failure is announced as an alert.** The visible
+  retry path is unchanged, while assistive technology receives the failure
+  promptly.
+- **The horizontally scrollable document queue describes its overflow help to
+  keyboard and assistive-technology users.**
+
+### Dependency maintenance
+
+- Vite is updated to **8.2.1** for development and build tooling.
+- Rust content-type detection is consolidated on **infer 0.19.0**, removing the
+  older resolved infer package.
 
 ### Documentation
 
@@ -235,8 +257,11 @@ field of `latest.json` should quote it.
   a UI fault. Dev tooling only; recorded rather than fixed.
 - **`docs/KNOWN_ISSUES.md` item 11 is resolved and says so.** It described an
   esbuild advisory in a Vite 5 tree with the major upgrade deferred; the tree
-  is on Vite 8.2.0 and `npm audit` reports zero vulnerabilities. Kept as a
+  is on Vite 8.2.1 and `npm audit` reports zero vulnerabilities. Kept as a
   numbered entry because earlier changelog entries reference it by number.
+- **Signed-release instructions derive asset names from the validated release
+  version.** Operators use `BackLog_<version>` names rather than copying a
+  previous release number; existing published tags remain immutable.
 - `docs/SIZING.md` is restructured around which figures are measured, which are
   budgeted, and which are neither: the 0.9.x captures are retained and labelled
   as the old pair at the old context, and the 0.4.3 naming-quality section is
