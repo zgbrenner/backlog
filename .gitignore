@@ -52,6 +52,7 @@ Thumbs.db
 
 # Agent worktrees / scratch
 .claude/
+.worktrees/
 sidecar/*.spec
 
 # PyInstaller's intermediate build tree. `dist/` above already covers
