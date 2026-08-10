@@ -1,4 +1,4 @@
-# BackLog v0.8.0 release checklist
+# BackLog release checklist
 
 A release remains a pilot candidate until every applicable item has fresh
 evidence attached to the release record.
@@ -26,14 +26,15 @@ evidence attached to the release record.
 
 - [ ] `python power-automate/validate_examples.py` passes after installing
       `power-automate/requirements-dev.txt`.
-- [ ] `node .github/scripts/check-versions.mjs` reports 0.8.0, the `backlog`
-      package in `src-tauri/Cargo.lock` is 0.8.0, and `CHANGELOG.md` has the
-      0.8.0 section.
+- [ ] `node .github/scripts/check-versions.mjs` reports the planned release
+      version in every required package file and `CHANGELOG.md` has its matching
+      section.
 
 ## One-download package
 
-- [ ] The installer download is `BackLog_0.8.0_x64-setup.exe`; the
-      installer-free option is `BackLog_0.8.0_x64-portable.zip`.
+- [ ] The installer download is `BackLog_<version>_x64-setup.exe`; the
+      installer-free option is `BackLog_<version>_x64-portable.zip`, where
+      `<version>` is the version validated from the release commit.
 - [ ] The installer contains the app, `convertd` with its Python runtime,
       `llama-server` and every imported runtime DLL, the bundled Qwen3 0.6B Q8_0, the
       pinned MiniLM semantic model/tokenizer, and the offline WebView2 runtime.
@@ -164,16 +165,13 @@ evidence attached to the release record.
 
 ## Publication guard
 
-- [ ] `v0.8.0` remains permanently attached to commit
-      `74e31fbd2b31ad99ceaf5390bb27fb197fc706a7`; the repair workflow never
-      moves, deletes, or recreates the tag.
 - [ ] `TAURI_SIGNING_PRIVATE_KEY` is present and matches the updater public
       key embedded in the tagged app. A missing or mismatched key fails the
       workflow without changing the published release.
 - [ ] The stable release contains exactly these four downloadable assets:
-      `BackLog_0.8.0_x64-setup.exe`,
-      `BackLog_0.8.0_x64-portable.zip`,
-      `BackLog_0.8.0_x64-setup.exe.sig`, and `latest.json`.
+      `BackLog_<version>_x64-setup.exe`,
+      `BackLog_<version>_x64-portable.zip`,
+      `BackLog_<version>_x64-setup.exe.sig`, and `latest.json`.
 - [ ] The detached signature matches `latest.json`, cryptographically
       verifies against the updater public key embedded in the tagged app,
       and covers the exact published installer bytes.

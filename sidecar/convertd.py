@@ -634,8 +634,12 @@ def _check_input_size(path: str) -> None:
 def _cap_markdown(markdown: str) -> str:
     if len(markdown) <= MAX_MARKDOWN_CHARS:
         return markdown
-    head = MAX_MARKDOWN_CHARS * 3 // 4
-    tail = MAX_MARKDOWN_CHARS - head
+    # The elision marker is part of the protocol response too. Reserve its
+    # characters before splitting the retained source so the advertised cap
+    # is a real upper bound rather than ``MAX_MARKDOWN_CHARS + len(_ELISION)``.
+    retained = MAX_MARKDOWN_CHARS - len(_ELISION)
+    head = retained * 3 // 4
+    tail = retained - head
     return markdown[:head] + _ELISION + markdown[len(markdown) - tail :]
 
 
@@ -987,7 +991,10 @@ def op_classify(args: dict) -> dict:
 def op_salience(args: dict) -> dict:
     sentences = args.get("sentences") or []
     probes = args.get("probes") or []
-    top_k = int(args.get("top_k", 12))
+    # Negative Python slices select almost the entire ranked array, whereas
+    # the deterministic fallback correctly returns none. Normalize once so
+    # both routes preserve the caller's bounded-result contract.
+    top_k = max(0, int(args.get("top_k", 12)))
     if not sentences:
         return {"indices": []}
 

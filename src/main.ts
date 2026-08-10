@@ -1454,7 +1454,9 @@ function fillQueueRow(row: HTMLTableRowElement, job: Job): void {
 function buildErrorState(heading: string, raw: string): HTMLElement {
   const { message, raw: detail } = friendlyError(raw);
   const box = el(`
-    <div class="empty err-state">
+    <!-- This replaces the main view after a bounded read fails. It needs the
+         same immediate announcement as a toast, plus its visible retry path. -->
+    <div class="empty err-state" role="alert">
       <strong></strong>
       <p class="msg"></p>
       <details class="tech"><summary>Technical detail</summary><code class="reason"></code></details>
@@ -1510,7 +1512,8 @@ function buildQueue(data: { jobs: Job[]; total: number; error?: string }): Node[
   }
   const table = el(`
     <div class="queue-table">
-      <div class="table-wrap" role="region" aria-label="Document queue" tabindex="0">
+      <div class="table-wrap" role="region" aria-label="Document queue"
+        aria-describedby="queue-scroll-note" tabindex="0">
         <table>
           <thead><tr>
             <th scope="col">Original</th><th scope="col">New name</th>
@@ -1519,7 +1522,7 @@ function buildQueue(data: { jobs: Job[]; total: number; error?: string }): Node[
           <tbody></tbody>
         </table>
       </div>
-      <p class="table-scroll-note">On a narrow window, scroll horizontally to see all queue columns.</p>
+      <p id="queue-scroll-note" class="table-scroll-note">On a narrow window, scroll horizontally to see all queue columns.</p>
     </div>`);
   const body = q<HTMLTableSectionElement>(table, "tbody");
   for (const job of data.jobs) {

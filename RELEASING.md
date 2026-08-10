@@ -1,13 +1,16 @@
 # Releasing BackLog
 
-BackLog v0.8.0 is built on a clean `windows-2022` GitHub-hosted runner by
+BackLog releases are built on a clean `windows-2022` GitHub-hosted runner by
 `.github/workflows/release.yml`. This public repository uses standard public
 Actions runners, which do not consume billable minutes.
 
 The release produces two Windows x64 downloads:
 
-- `BackLog_0.8.0_x64-setup.exe`
-- `BackLog_0.8.0_x64-portable.zip`
+- `BackLog_<version>_x64-setup.exe`
+- `BackLog_<version>_x64-portable.zip`
+
+Here, `<version>` is the matching version validated from the release commit's
+package metadata; never substitute a previous release version.
 
 Both contain the app, `convertd` and its Python runtime, `llama-server` and its
 runtime DLLs, the verified Qwen3 0.6B primary model, and the pinned MiniLM
@@ -18,7 +21,7 @@ in-app download.
 
 ## Delivery-mode release gates
 
-v0.8.0 preserves **Power Automate / SharePoint** as the default manifest
+Each release preserves **Power Automate / SharePoint** as the default manifest
 handoff to Outbox for Flow 2 and adds **Local folder** direct delivery. Record
 fresh Local Output evidence: the Processing, Local Output, and Quarantine roots
 are distinct and non-nested; each completed delivery has its renamed output
@@ -40,8 +43,8 @@ Before merging or pushing a normal release commit to `main`:
 3. CI must be green on `main`.
 4. The target tag must not already be published. The normal workflow can resume
    only an interrupted draft whose tag still points at the exact CI-tested
-   commit. The already-published v0.8.0 prerelease is handled only by the
-   dedicated immutable-tag repair workflow described below.
+   commit. A published tag is a clean skip, not authorization to overwrite or
+   retarget that release.
 5. Complete the source and security portions of
    `docs/RELEASE_CHECKLIST.md`.
 
@@ -55,8 +58,8 @@ npm run check
 python power-automate/validate_examples.py
 ```
 
-`npm run check:release` validates the signed artifact contract, rejects an
-unsigned publication fallback, and checks the workflow structure.
+`npm run check:release` validates the signed artifact contract and checks the
+workflow structure.
 
 ## Immutable build inputs
 
@@ -97,23 +100,15 @@ updater public key embedded in `src-tauri/tauri.conf.json`; set
 
 The release workflow fails closed when the key is absent. It does not publish
 an unsigned fallback, synthesize a signature, or rotate the updater key. A
-signed release must contain the installer, portable ZIP, detached `.sig`, and
-`latest.json`. The workflow verifies the detached signature against the public
-key embedded in the exact app build before publication.
+signed release must contain `BackLog_<version>_x64-setup.exe`,
+`BackLog_<version>_x64-portable.zip`,
+`BackLog_<version>_x64-setup.exe.sig`, and `latest.json`. The workflow verifies
+the detached signature against the public key embedded in the exact app build
+before publication.
 
 Never rotate this updater key casually. Existing installations verify updates
 against the public key they already contain; losing or replacing its private
 half breaks that update chain.
-
-### One-time v0.8.0 repair
-
-`.github/workflows/repair-v0.8.0.yml` repairs the already-published unsigned
-v0.8.0 prerelease. It checks out the immutable `v0.8.0` tag at
-`74e31fbd2b31ad99ceaf5390bb27fb197fc706a7`, rebuilds and signs those exact
-sources, verifies the signature against the tagged app's embedded public key,
-replaces the two existing downloads, adds the `.sig` and `latest.json`, and
-promotes the same release to stable Latest. It never moves or recreates the
-tag. A missing or mismatched private key leaves the prerelease unchanged.
 
 Tauri updater signing and Windows Authenticode remain separate trust
 boundaries. BackLog does not yet have a trusted Authenticode certificate, so
@@ -173,15 +168,16 @@ python power-automate/validate_examples.py
 npm run tauri build
 $webview2 = Join-Path $env:TEMP "backlog-webview2-fixed"
 ./scripts/stage-webview2-runtime.ps1 -Destination $webview2 -Clean
-./scripts/package-portable.ps1 -Version 0.8.0 -WebView2RuntimeDir $webview2
+$version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+./scripts/package-portable.ps1 -Version $version -WebView2RuntimeDir $webview2
 ./scripts/validate-portable-package.ps1 `
-  -Archive "src-tauri/target/release/BackLog_0.8.0_x64-portable.zip" `
-  -Version 0.8.0
+  -Archive "src-tauri/target/release/BackLog_$($version)_x64-portable.zip" `
+  -Version $version
 ```
 
 This reproduces packaging but does not authorize publication. Use the guarded
-workflow to create a new release, or the dedicated repair workflow for the
-existing immutable v0.8.0 tag.
+workflow to create a new release; never recreate, move, or overwrite a
+published tag.
 
 ## Two separate trust boundaries
 
