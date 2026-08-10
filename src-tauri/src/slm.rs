@@ -36,6 +36,7 @@
 use crate::checker::SlmOutput;
 use crate::sidecar::log_child_stderr;
 use serde_json::{json, Value};
+use std::future::Future;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -132,6 +133,19 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// timeout that fires is the one whose expiry the pipeline can attribute. Past
 /// 300 the ordering inverts again and this constant has to move with it.
 const NAMING_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Await one startup probe only for the portion of [`HEALTH_TIMEOUT`] that is
+/// still available. The shared HTTP client deliberately allows a naming
+/// request to use the longer [`NAMING_HTTP_TIMEOUT`], but that client-wide
+/// timeout must not let one accepted-yet-silent `/health` connection extend a
+/// server startup beyond its recovery deadline.
+async fn await_before_startup_deadline<T>(
+    deadline: Instant,
+    future: impl Future<Output = T>,
+) -> Option<T> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    tokio::time::timeout(remaining, future).await.ok()
+}
 
 /// How far above the configured base port `reserve_port` will look for a free
 /// one before giving up.
@@ -621,12 +635,11 @@ impl SlmLane {
                     "llama-server exited during startup ({exit}); its output is in the log file"
                 );
             }
-            if let Ok(response) = self
-                .http
-                .get(&health_url)
-                .bearer_auth(&self.api_key)
-                .send()
-                .await
+            if let Some(Ok(response)) = await_before_startup_deadline(
+                deadline,
+                self.http.get(&health_url).bearer_auth(&self.api_key).send(),
+            )
+            .await
             {
                 if response.status().is_success() {
                     self.requests_served(resolved)
@@ -1079,6 +1092,16 @@ mod tests {
         assert!(
             error.to_string().contains("shutting down"),
             "shutdown must fail before inspecting or spawning any binary: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_deadline_cancels_a_stalled_health_request() {
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let outcome = await_before_startup_deadline(deadline, std::future::pending::<()>()).await;
+        assert!(
+            outcome.is_none(),
+            "a silent health connection must not outlive the startup deadline"
         );
     }
 

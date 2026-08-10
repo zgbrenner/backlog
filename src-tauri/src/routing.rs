@@ -137,3 +137,72 @@ pub fn extension_of(path: &Path) -> String {
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_else(|| "bin".into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{detect, Route};
+
+    fn detect_bytes(bytes: &[u8]) -> super::RouteDecision {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magic-bytes-only");
+        std::fs::write(&path, bytes).unwrap();
+        detect(&path)
+    }
+
+    #[test]
+    fn routes_pdf_magic_to_native_pdf() {
+        let decision = detect_bytes(b"%PDF-1.7\n");
+
+        assert_eq!(decision.route, Route::Native);
+        assert_eq!(decision.detected_type, "application/pdf");
+        assert_eq!(decision.flag_reason, None);
+    }
+
+    #[test]
+    fn routes_png_magic_to_scanned_png() {
+        let decision = detect_bytes(b"\x89PNG\r\n\x1a\n");
+
+        assert_eq!(decision.route, Route::Scanned);
+        assert_eq!(decision.detected_type, "image/png");
+        assert_eq!(decision.flag_reason, None);
+    }
+
+    #[test]
+    fn routes_jpeg_magic_to_scanned_jpeg() {
+        let decision = detect_bytes(b"\xff\xd8\xff\xe0");
+
+        assert_eq!(decision.route, Route::Scanned);
+        assert_eq!(decision.detected_type, "image/jpeg");
+        assert_eq!(decision.flag_reason, None);
+    }
+
+    #[test]
+    fn routes_zip_magic_to_native_zip() {
+        let decision = detect_bytes(b"PK\x03\x04");
+
+        assert_eq!(decision.route, Route::Native);
+        assert_eq!(decision.detected_type, "application/zip");
+        assert_eq!(decision.flag_reason, None);
+    }
+
+    #[test]
+    fn routes_plain_text_to_native_text_plain() {
+        let decision = detect_bytes(b"A plain text document\n");
+
+        assert_eq!(decision.route, Route::Native);
+        assert_eq!(decision.detected_type, "text/plain");
+        assert_eq!(decision.flag_reason, None);
+    }
+
+    #[test]
+    fn flags_unsupported_gif_magic_with_stable_reason() {
+        let decision = detect_bytes(b"GIF89a");
+
+        assert_eq!(decision.route, Route::Flag);
+        assert_eq!(decision.detected_type, "image/gif");
+        assert_eq!(
+            decision.flag_reason.as_deref(),
+            Some("UNSUPPORTED_TYPE:image/gif")
+        );
+    }
+}

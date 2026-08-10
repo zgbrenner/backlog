@@ -275,6 +275,68 @@ class SalienceGracefulDegradationTests(unittest.TestCase):
         self.assertEqual(result["indices"], [0, 1])
         self.assertFalse(result["available"])
 
+    def test_negative_top_k_returns_no_live_model_results(self):
+        """A caller-supplied negative limit must not become ``[:-1]``.
+
+        The slim fallback already returns no indices for a negative value, but
+        NumPy slicing in the live-model route used to return every index except
+        the final one. The tiny stand-in keeps this contract test independent
+        of an optional local NumPy installation.
+        """
+
+        class Scores(list):
+            def __neg__(self):
+                return self
+
+            def __iadd__(self, _other):
+                return self
+
+            def __rmul__(self, _other):
+                return self
+
+        class Vector:
+            def __itruediv__(self, _other):
+                return self
+
+        class Embeddings:
+            def __init__(self, count):
+                self.count = count
+
+            def mean(self, axis=0):
+                assert axis == 0
+                return Vector()
+
+            def __matmul__(self, _other):
+                return Scores([0.0] * self.count)
+
+        class SortOrder(list):
+            def __getitem__(self, index):
+                value = super().__getitem__(index)
+                return SortOrder(value) if isinstance(index, slice) else value
+
+            def tolist(self):
+                return list(self)
+
+        fake_numpy = types.SimpleNamespace(
+            zeros=lambda count: Scores([0.0] * count),
+            argsort=lambda scores: SortOrder(range(len(scores))),
+            linalg=types.SimpleNamespace(norm=lambda _vector: 1.0),
+        )
+
+        class LiveModel:
+            def encode(self, texts, normalize_embeddings=True):
+                assert normalize_embeddings
+                return Embeddings(len(texts))
+
+        with mock.patch.dict(sys.modules, {"numpy": fake_numpy}), mock.patch.object(
+            CONVERTD, "_granite", return_value=LiveModel()
+        ):
+            result = CONVERTD.op_salience(
+                {"sentences": ["a", "b", "c", "d", "e"], "top_k": -1}
+            )
+        self.assertEqual(result["indices"], [])
+        self.assertTrue(result["available"])
+
 
 class SemanticEvidenceGracefulDegradationTests(unittest.TestCase):
     def setUp(self):
@@ -593,10 +655,7 @@ class StdoutIsolationTests(unittest.TestCase):
 class MarkdownCeilingTests(unittest.TestCase):
     def test_oversized_markdown_is_capped_on_every_route(self):
         result = CONVERTD._conversion_result("missing.docx", "z" * 900_000)
-        self.assertLessEqual(
-            len(result["markdown"]),
-            CONVERTD.MAX_MARKDOWN_CHARS + len(CONVERTD._ELISION),
-        )
+        self.assertLessEqual(len(result["markdown"]), CONVERTD.MAX_MARKDOWN_CHARS)
         self.assertIn("[...]", result["markdown"])
 
     def test_short_markdown_is_untouched(self):

@@ -247,6 +247,9 @@ const CHECKS = [
       if (!/taking too long to answer/i.test(await error.innerText())) {
         problems.push("the hung read did not become a plain-language timeout");
       }
+      if ((await error.getAttribute("role")) !== "alert") {
+        problems.push("the recoverable read failure was not announced as an alert");
+      }
       const before = await page.evaluate(() =>
         window.__harness.invocations.filter((i) => i.cmd === "get_stats").length
       );
@@ -472,8 +475,13 @@ const CHECKS = [
       if (metrics.tableWidth <= metrics.wrapWidth) problems.push("the narrow table had no reachable overflow");
       if (metrics.pageWidth > metrics.viewportWidth + 1) problems.push("the page itself overflowed horizontally");
       if (metrics.wordBreak === "break-word") problems.push("filenames still break into narrow fragments");
-      if (!(await page.getByText("On a narrow window, scroll horizontally to see all queue columns.").isVisible())) {
+      const scrollNote = page.getByText("On a narrow window, scroll horizontally to see all queue columns.");
+      if (!(await scrollNote.isVisible())) {
         problems.push("the narrow queue did not explain how to reach the remaining columns");
+      }
+      if ((await page.getByRole("region", { name: "Document queue" }).getAttribute("aria-describedby"))
+        !== "queue-scroll-note") {
+        problems.push("the keyboard-focusable queue region did not describe its horizontal overflow help");
       }
       return problems;
     },

@@ -96,15 +96,19 @@ test("the retired v0.8.0 repair workflow stays retired", () => {
   );
 });
 
-test("the release checklist requires all four signed downloadable assets", () => {
+test("release operator guides use version-derived signed-only asset names", () => {
+  const guide = read("RELEASING.md");
   const checklist = read("docs/RELEASE_CHECKLIST.md");
   const publication = checklist.slice(checklist.indexOf("## Publication guard"));
   for (const asset of [
-    "BackLog_0.8.0_x64-setup.exe",
-    "BackLog_0.8.0_x64-portable.zip",
-    "BackLog_0.8.0_x64-setup.exe.sig",
+    "BackLog_<version>_x64-setup.exe",
+    "BackLog_<version>_x64-portable.zip",
+    "BackLog_<version>_x64-setup.exe.sig",
     "latest.json",
   ]) {
+    assert.match(guide, new RegExp(asset.replaceAll(".", "\\.")));
     assert.match(publication, new RegExp(asset.replaceAll(".", "\\.")));
   }
+  assert.doesNotMatch(guide, /repair-v0\.8\.0\.yml/);
+  assert.doesNotMatch(guide, /dedicated repair workflow/i);
 });
