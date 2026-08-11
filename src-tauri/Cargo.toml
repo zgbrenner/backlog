@@ -1,6 +1,6 @@
 [package]
 name = "backlog"
-version = "0.10.3"
+version = "0.10.4"
 edition = "2021"
 description = "Local document naming and indexing pipeline"
 

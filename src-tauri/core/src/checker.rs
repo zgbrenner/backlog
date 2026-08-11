@@ -274,7 +274,7 @@ static RE_DESCRIPTION_DATE: Lazy<Regex> = Lazy::new(|| {
 /// every description rule below; this only drops text and cannot invent facts.
 static RE_DESCRIPTION_DATE_GLUE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?ix)(?:\s*[,;]\s*)?\b(?:effective(?:\s+as\s+of)?|as\s+of|dated|on|by|before|after|from|until|through|filed|issued|executed|signed)\s+\x{1f}(?:\s*[,;]\s*)?",
+        r"(?ix)(?:\s*[,;]\s*)?\b(?:with\s+payment\s+due|payment\s+due|effective(?:\s+as\s+of)?|as\s+of|dated|on|by|before|after|from|until|through|filed|issued|executed|signed|due)\s+\x{1f}(?:\s*[,;]\s*)?",
     )
     .unwrap()
 });
@@ -594,6 +594,12 @@ impl Checker {
             // One build, two verdicts — the set is the expensive part.
             let evidence_text_owned = evidence_text(harvest);
             let evidence_set = evidence_token_set(&evidence_text_owned);
+            if subject_contradicts_evidence_bigram(&subject, &evidence_text_owned) {
+                return Err(CheckError::BadSubject(
+                    "subject contains a party or matter word contradicted by document evidence"
+                        .into(),
+                ));
+            }
             if subject_grounded_with_evidence(&subject, &evidence_set) == Some(false) {
                 soft_flags.push("SUBJECT_UNGROUNDED".into());
             }
@@ -1132,6 +1138,11 @@ impl Checker {
                 "must be exactly one sentence ending in terminal punctuation".into(),
             ));
         }
+        if description_has_dangling_tail(&d) {
+            return Err(CheckError::BadDescription(
+                "description ends with an incomplete clause".into(),
+            ));
+        }
         let dl = d.to_lowercase();
         let sl = subject.to_lowercase();
         if dl == sl || dl.trim_end_matches(['.', '。']) == sl {
@@ -1541,6 +1552,70 @@ fn eligible_tokens(s: &str) -> Vec<String> {
         .filter(|t| !t.chars().all(|c| c.is_ascii_digit()))
         .filter(|t| !UNGROUNDING_TOKENS.contains(&t.as_str()))
         .collect()
+}
+
+fn content_tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Catch a narrow fabricated-name shape that majority grounding cannot see.
+///
+/// If a grounded content word is followed by an ungrounded content word in
+/// the subject, and every occurrence of the first word in evidence has the
+/// same next content word, the model contradicted a directly observable
+/// phrase. For example, evidence consistently says `Vistage Worldwide` while
+/// the model writes `Vistage Widows`. Ambiguous evidence produces no verdict.
+fn subject_contradicts_evidence_bigram(subject: &str, evidence_text: &str) -> bool {
+    let subject_tokens = content_tokens(subject);
+    let evidence_tokens = content_tokens(evidence_text);
+    if subject_tokens.len() < 2 || evidence_tokens.len() < 2 {
+        return false;
+    }
+    let evidence_set = evidence_token_set(evidence_text);
+
+    subject_tokens.windows(2).any(|pair| {
+        let first = &pair[0];
+        let second = &pair[1];
+        let second_is_content = second.chars().count() >= 4
+            && !second.chars().all(|c| c.is_ascii_digit())
+            && !UNGROUNDING_TOKENS.contains(&second.as_str());
+        if !second_is_content
+            || !evidence_set.contains(first.as_str())
+            || evidence_set.contains(second.as_str())
+        {
+            return false;
+        }
+
+        let mut followers = std::collections::HashSet::new();
+        for (index, token) in evidence_tokens.iter().enumerate() {
+            if token != first {
+                continue;
+            }
+            if let Some(follower) = evidence_tokens[index + 1..].iter().find(|candidate| {
+                candidate.chars().count() >= 3
+                    && !candidate.chars().all(|c| c.is_ascii_digit())
+                    && !UNGROUNDING_TOKENS.contains(&candidate.as_str())
+            }) {
+                followers.insert(follower.as_str());
+            }
+        }
+        followers.len() == 1 && !followers.contains(second.as_str())
+    })
+}
+
+fn description_has_dangling_tail(description: &str) -> bool {
+    let without_terminal = description.trim_end_matches(['.', '!', '?', '。', '！', '？']);
+    let Some(last) = without_terminal
+        .split(|c: char| !c.is_alphanumeric())
+        .rfind(|word| !word.is_empty())
+        .map(str::to_lowercase)
+    else {
+        return false;
+    };
+    DANGLING_TAIL_WORDS.contains(&last.as_str()) || DANGLING_PAIR_HEADS.contains(&last.as_str())
 }
 
 /// Does the proposed subject actually come from the document?
@@ -3582,6 +3657,15 @@ mod tests {
     fn date_repair_handles_leading_and_embedded_temporal_phrases() {
         assert_eq!(
             strip_description_calendar_dates(
+                "Apex Analytics LLC billed Vistage Worldwide for data engineering services, effective September 1, 2024, with payment due September 9, 2026."
+            )
+            .as_deref(),
+            Some(
+                "Apex Analytics LLC billed Vistage Worldwide for data engineering services."
+            )
+        );
+        assert_eq!(
+            strip_description_calendar_dates(
                 "Effective June 30, 2026, outlines the termination terms between John Smith and Vistage Worldwide."
             )
             .as_deref(),
@@ -3612,6 +3696,31 @@ mod tests {
         o.description = "Effective June 30, 2026.".into();
         let error = c.check(&o, &h, &[], "2026-07-01", None).unwrap_err();
         assert_eq!(error.code(), "BAD_DESCRIPTION");
+    }
+
+    #[test]
+    fn description_ending_in_an_auxiliary_is_rejected_as_incomplete() {
+        let c = Checker::new(220);
+        let h = harvest_with(&["2026-07-20"]);
+        let mut o = ok_out();
+        o.description = "The court orders Vistage Worldwide to comply with discovery requests and the motion was."
+            .into();
+        let error = c.check(&o, &h, &[], "2026-07-21", None).unwrap_err();
+        assert_eq!(error.code(), "BAD_DESCRIPTION");
+    }
+
+    #[test]
+    fn a_party_word_contradicted_by_a_unique_evidence_phrase_is_rejected() {
+        let c = Checker::new(220);
+        let mut h = harvest_with(&["2026-07-20"]);
+        h.head_excerpt = "Vistage Worldwide must comply with discovery requests.".into();
+        let mut o = ok_out();
+        o.subject = "Order Granting Motion to Compel Vistage Widows to Comply".into();
+        let error = c.check(&o, &h, &[], "2026-07-21", None).unwrap_err();
+        assert_eq!(error.code(), "BAD_SUBJECT");
+
+        o.subject = "Order Granting Motion to Compel Vistage Worldwide to Comply".into();
+        assert!(c.check(&o, &h, &[], "2026-07-21", None).is_ok());
     }
 
     #[test]
