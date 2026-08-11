@@ -15,6 +15,16 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.10.5] - 2026-08-11
+
+### Changed
+
+- Description cleanup now removes month-year and bare-year date references as
+  well as date clauses introduced by `in`, `during`, or `delivered`.
+- Incomplete temporal tails are rejected so a model retry or Needs Review is
+  preferred over filenames ending in `effective as` or descriptions ending in
+  words such as `starting`.
+
 ## [0.10.4] - 2026-08-11
 
 ### Changed

@@ -264,7 +264,7 @@ static RE_MASK_INITIAL: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[A-Z]\.").unwr
 // gate is intentionally pragmatic: it is broader than perfect parser coverage and
 // aims to reject date leaks, not to prove that every date mention is valid.
 static RE_DESCRIPTION_DATE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?ix)\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}[./-](?:\d{2}|\d{4})\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{2,4}\b|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?[,]?\s+\d{2,4}\b").unwrap()
+    Regex::new(r"(?ix)\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}[./-](?:\d{2}|\d{4})\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{2,4}\b|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?[,]?\s+\d{2,4}\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+(?:19|20)\d{2}\b|\b(?:19|20)\d{2}\b").unwrap()
 });
 /// Calendar dates are forbidden in descriptions, but the small local model
 /// often repeats an otherwise-correct effective date despite the prompt and
@@ -274,7 +274,7 @@ static RE_DESCRIPTION_DATE: Lazy<Regex> = Lazy::new(|| {
 /// every description rule below; this only drops text and cannot invent facts.
 static RE_DESCRIPTION_DATE_GLUE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?ix)(?:\s*[,;]\s*)?\b(?:with\s+payment\s+due|payment\s+due|effective(?:\s+as\s+of)?|as\s+of|dated|on|by|before|after|from|until|through|filed|issued|executed|signed|due)\s+\x{1f}(?:\s*[,;]\s*)?",
+        r"(?ix)(?:\s*[,;]\s*)?\b(?:with\s+payment\s+due|payment\s+due|effective(?:\s+as\s+of)?|as\s+of|dated|on|in|by|before|after|from|during|until|through|delivered|filed|issued|executed|signed|due)\s+\x{1f}(?:\s*[,;]\s*)?",
     )
     .unwrap()
 });
@@ -1439,14 +1439,19 @@ fn strip_trailing_dates(s: &str) -> Option<String> {
 /// the schema's character cap stopping generation, leaves tails like
 /// "… - Effective" or "… shall recover". Trailing-position only — every one of
 /// these words is legitimate mid-subject.
-const DANGLING_TAIL_WORDS: [&str; 26] = [
+const DANGLING_TAIL_WORDS: [&str; 32] = [
     "a",
     "an",
     "and",
+    "as",
     "at",
+    "beginning",
     "but",
     "by",
+    "commencing",
     "dated",
+    "during",
+    "ending",
     "effective",
     "for",
     "from",
@@ -1459,6 +1464,7 @@ const DANGLING_TAIL_WORDS: [&str; 26] = [
     "re",
     "regarding",
     "shall",
+    "starting",
     "the",
     "to",
     "was",
@@ -3651,6 +3657,43 @@ mod tests {
         assert!(validated
             .soft_flags
             .contains(&"DESCRIPTION_DATE_REMOVED".to_string()));
+    }
+
+    #[test]
+    fn date_repair_removes_month_year_and_delivery_clauses() {
+        assert_eq!(
+            strip_description_calendar_dates(
+                "Professional Services Invoice: Apex Analytics LLC bills Vistage Worldwide for support provided during July 2026."
+            )
+            .as_deref(),
+            Some(
+                "Professional Services Invoice: Apex Analytics LLC bills Vistage Worldwide for support provided."
+            )
+        );
+        assert_eq!(
+            strip_description_calendar_dates(
+                "The amendment expands managed support and refers to a pricing schedule delivered August 19, 2026."
+            )
+            .as_deref(),
+            Some(
+                "The amendment expands managed support and refers to a pricing schedule."
+            )
+        );
+    }
+
+    #[test]
+    fn temporal_fragments_cannot_end_subjects_or_descriptions() {
+        assert_eq!(
+            strip_dangling_words(
+                "Master Services Agreement Vistage Worldwide effective as",
+                SUBJECT_MIN_WORDS
+            )
+            .as_deref(),
+            Some("Master Services Agreement Vistage Worldwide")
+        );
+        assert!(description_has_dangling_tail(
+            "The agreement covers pricing and services starting."
+        ));
     }
 
     #[test]
