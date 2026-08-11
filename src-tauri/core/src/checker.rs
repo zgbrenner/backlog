@@ -628,10 +628,11 @@ impl Checker {
     }
 
     fn compose_subject_for_name(subject: &str, doc_type: Option<&str>) -> String {
-        let Some(doc_type) = doc_type
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("unknown"))
-        else {
+        let Some(doc_type) = doc_type.map(str::trim).filter(|value| {
+            !value.is_empty()
+                && !value.eq_ignore_ascii_case("unknown")
+                && !value.eq_ignore_ascii_case("document")
+        }) else {
             return subject.to_string();
         };
         let normalized_doc_type = normalize_name_component(doc_type);
@@ -3761,6 +3762,10 @@ mod tests {
         );
         assert_eq!(
             Checker::compose_subject_for_name("Service Terms", Some("unknown")),
+            "Service Terms".to_string()
+        );
+        assert_eq!(
+            Checker::compose_subject_for_name("Service Terms", Some("document")),
             "Service Terms".to_string()
         );
     }

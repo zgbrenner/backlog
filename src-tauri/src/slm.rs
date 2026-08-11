@@ -90,10 +90,10 @@ pub const SLM_CTX_PER_SLOT: u32 = 6656;
 pub const SLM_PROMPT_RESERVE_TOKENS: u32 = 640;
 
 /// `max_tokens` for one naming response (see `request_body`). The answer is a
-/// small JSON object — date, subject, description — so 220 is generous for it;
-/// the value is unchanged and only named here because the slot ceiling has to
-/// reserve it, and a literal buried inside a `json!` body cannot be derived
-/// from.
+/// small JSON object — date, a longer subject, and a richer description. 400
+/// prevents mid-sentence truncation while remaining explicitly reserved inside
+/// the per-slot context ceiling; a literal buried inside a `json!` body could
+/// drift from that memory calculation silently.
 pub const SLM_MAX_OUTPUT_TOKENS: u32 = 400;
 
 /// How long a freshly spawned llama-server gets to answer `/health` before
