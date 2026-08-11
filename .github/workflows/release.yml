@@ -207,17 +207,23 @@ jobs:
           if (-not (Test-Path $env:PORTABLE)) { throw "Expected portable ZIP missing: $env:PORTABLE" }
           $sha = (Get-FileHash $env:INSTALLER -Algorithm SHA256).Hash.ToLowerInvariant()
           $portableSha = (Get-FileHash $env:PORTABLE -Algorithm SHA256).Hash.ToLowerInvariant()
+          $changelog = Get-Content CHANGELOG.md -Raw
+          $sectionStart = $changelog.IndexOf("## [$env:VERSION]")
+          if ($sectionStart -lt 0) { throw "CHANGELOG.md has no section for $env:VERSION" }
+          $nextSection = $changelog.IndexOf("`n## [", $sectionStart + 1)
+          if ($nextSection -lt 0) { $nextSection = $changelog.Length }
+          $releaseChanges = $changelog.Substring($sectionStart, $nextSection - $sectionStart).Trim()
           @"
           BackLog $env:VERSION includes a one-download Windows installer and an
           installer-free portable ZIP. Both include the primary model, conversion
           runtime, llama server, and app-local runtime DLLs.
 
-          This release adds Local Output: BackLog can write finished renamed
-          documents directly to a selected local folder with one receipt per
-          delivery under .backlog/receipts. The existing Power Automate /
-          SharePoint mode is preserved and continues to write the Flow 2
-          handoff manifest to Outbox. Local Output does not validate or replace
-          a target tenant's Flow 1/Flow 2 configuration.
+          Local Output continues to write one delivery receipt under
+          .backlog/receipts. The existing Power Automate / SharePoint mode and
+          its Flow 1/Flow 2 manifest handoff remain available. Release-specific
+          changes follow from CHANGELOG.md.
+
+          $releaseChanges
 
           Installer SHA-256: $sha
           Portable ZIP SHA-256: $portableSha
@@ -337,3 +343,36 @@ jobs:
             --notes-file "$env:RUNNER_TEMP\release-notes.md"
           if ($LASTEXITCODE -ne 0) { throw "Stable release publication failed" }
           ./scripts/assert-release-tag.ps1 -Tag $env:TAG -ExpectedSha $env:RELEASE_SHA
+
+      - name: Verify published updater endpoint
+        if: steps.release-mode.outputs.signed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $endpoint = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/latest.json?current=$env:VERSION"
+          $local = Get-Content $env:MANIFEST -Raw | ConvertFrom-Json
+          $verified = $false
+          $lastError = "no response"
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            try {
+              $response = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 10 -Uri $endpoint
+              $content = if ($response.Content -is [byte[]]) {
+                [Text.Encoding]::UTF8.GetString($response.Content)
+              } else {
+                [string]$response.Content
+              }
+              $remote = $content | ConvertFrom-Json
+              if ($remote.version -ne $env:VERSION) { throw "latest version is $($remote.version)" }
+              $remotePlatform = $remote.platforms.'windows-x86_64'
+              $localPlatform = $local.platforms.'windows-x86_64'
+              if (-not $remotePlatform) { throw "windows-x86_64 platform is missing" }
+              if ($remotePlatform.url -ne $localPlatform.url) { throw "installer URL differs from the signed manifest" }
+              if ($remotePlatform.signature -ne $localPlatform.signature) { throw "signature differs from the signed manifest" }
+              $verified = $true
+              break
+            } catch {
+              $lastError = $_.Exception.Message
+              if ($attempt -lt 12) { Start-Sleep -Seconds 10 }
+            }
+          }
+          if (-not $verified) { throw "Published updater endpoint was not valid after retries: $lastError" }

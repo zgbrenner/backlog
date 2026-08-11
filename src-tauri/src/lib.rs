@@ -1705,30 +1705,80 @@ fn claim_single_instance() -> bool {
 }
 
 #[cfg(windows)]
+struct BacklogWindowSearch {
+    found: Option<isize>,
+    executable: Option<std::path::PathBuf>,
+}
+
+#[cfg(windows)]
+fn window_belongs_to_backlog(hwnd: isize, executable: &Path) -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetWindowThreadProcessId(hwnd: isize, process_id: *mut u32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
+        fn QueryFullProcessImageNameW(
+            process: isize,
+            flags: u32,
+            executable_name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+        fn CloseHandle(object: isize) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const MAX_WINDOWS_PATH: usize = 32_768;
+
+    let mut process_id = 0u32;
+    if unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) } == 0 || process_id == 0 {
+        return false;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process == 0 {
+        return false;
+    }
+    let mut buffer = vec![0u16; MAX_WINDOWS_PATH];
+    let mut size = buffer.len() as u32;
+    let queried = unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size) };
+    let _ = unsafe { CloseHandle(process) };
+    if queried == 0 || size == 0 {
+        return false;
+    }
+    let process_path = std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..size as usize]));
+    windows_paths_equivalent(&process_path, executable)
+}
+
+#[cfg(windows)]
 extern "system" fn find_backlog_window(hwnd: isize, lparam: isize) -> i32 {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetWindowTextLengthW(hwnd: isize) -> i32;
         fn GetWindowTextW(hwnd: isize, buffer: *mut u16, max_count: i32) -> i32;
     }
-    let Some(found) = (unsafe { (lparam as *mut Option<isize>).as_mut() }) else {
+    let Some(search) = (unsafe { (lparam as *mut BacklogWindowSearch).as_mut() }) else {
         return 0;
     };
-    if found.is_some() {
+    if search.found.is_some() {
         return 0;
     }
     let len = unsafe { GetWindowTextLengthW(hwnd) };
-    if len <= 0 {
-        return 1;
-    }
-    let mut buf = vec![0u16; (len + 1) as usize];
-    let got = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
-    if got <= 0 {
-        return 1;
-    }
-    let title = String::from_utf16_lossy(&buf[..got as usize]);
-    if title.to_lowercase().contains("backlog") {
-        *found = Some(hwnd);
+    let title_matches = if len > 0 {
+        let mut buf = vec![0u16; (len + 1) as usize];
+        let got = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        got > 0
+            && String::from_utf16_lossy(&buf[..got as usize])
+                .to_lowercase()
+                .contains("backlog")
+    } else {
+        false
+    };
+    let process_matches = search
+        .executable
+        .as_deref()
+        .is_some_and(|executable| window_belongs_to_backlog(hwnd, executable));
+    if title_matches || process_matches {
+        search.found = Some(hwnd);
         return 0;
     }
     1
@@ -1739,7 +1789,10 @@ fn focus_existing_backlog_window() {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn FindWindowW(class_name: *const u16, window_name: *const u16) -> isize;
-        fn EnumWindows(enum_proc: Option<extern "system" fn(isize, isize) -> i32>, lparam: isize) -> i32;
+        fn EnumWindows(
+            enum_proc: Option<extern "system" fn(isize, isize) -> i32>,
+            lparam: isize,
+        ) -> i32;
         fn IsIconic(hwnd: isize) -> i32;
         fn ShowWindow(hwnd: isize, cmd_show: i32) -> i32;
         fn SetWindowPos(
@@ -1764,26 +1817,26 @@ fn focus_existing_backlog_window() {
     const ASFW_ANY: u32 = u32::MAX;
     const HWND_TOP: isize = -1;
 
-    let title: Vec<u16> = "BackLog"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let title: Vec<u16> = "BackLog".encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: pointers are valid for the duration of the call and Win32 keeps
     // the returned HWND stable for the UI thread that owns the window.
     let mut hwnd = 0;
     for _ in 0..RETRY_ATTEMPTS {
         hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
         if hwnd == 0 {
-            let mut fallback: Option<isize> = None;
+            let mut fallback = BacklogWindowSearch {
+                found: None,
+                executable: std::env::current_exe().ok(),
+            };
             // SAFETY: callback follows the documented API shape and never
             // dereferences user data after it is set or out of bounds.
             let _ = unsafe {
                 EnumWindows(
                     Some(find_backlog_window),
-                    &mut fallback as *mut Option<isize> as isize,
+                    &mut fallback as *mut BacklogWindowSearch as isize,
                 )
             };
-            if let Some(found) = fallback {
+            if let Some(found) = fallback.found {
                 hwnd = found;
             }
         }

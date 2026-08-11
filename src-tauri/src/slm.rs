@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 /// names, case captions, currency, table fragments and this module's own label
 /// prefixes — so the slot is sized at a pessimistic 3 real chars/token: 5334
 /// tokens. Add [`SLM_PROMPT_RESERVE_TOKENS`] (640) and [`SLM_MAX_OUTPUT_TOKENS`]
-/// (220) and one slot must hold 6194 tokens; rounded up to the next multiple of
+/// (400) and one slot must hold 6374 tokens; rounded up to the next multiple of
 /// 256, because llama.cpp allocates KV in blocks and a ragged number buys
 /// nothing, that is 6656.
 ///
@@ -94,7 +94,7 @@ pub const SLM_PROMPT_RESERVE_TOKENS: u32 = 640;
 /// the value is unchanged and only named here because the slot ceiling has to
 /// reserve it, and a literal buried inside a `json!` body cannot be derived
 /// from.
-pub const SLM_MAX_OUTPUT_TOKENS: u32 = 220;
+pub const SLM_MAX_OUTPUT_TOKENS: u32 = 400;
 
 /// How long a freshly spawned llama-server gets to answer `/health` before
 /// the child is killed and the slot cleared. Being wedged forever is not
@@ -747,8 +747,8 @@ impl SlmLane {
                 },
                 "description": {
                     "type": "string",
-                    "minLength": 15,
-                    "maxLength": 320
+                    "minLength": 25,
+                    "maxLength": 420
                 }
             }
         })
@@ -849,13 +849,13 @@ impl SlmLane {
         // said the opposite. Re-run `e2e_real_batch` over the whole sample and
         // compare the party buckets; ten documents will mislead you.
         //
-            // Known noise this leaves behind: `SUBJECT_TRUNCATED` fires on many
-            // documents because the model writes past the trusted word ceiling and
-            // the checker trims at a word boundary. That keeps the filename
-            // behavior explicit.
-            // This is the flagged, clean outcome replacing a silent
-            // mid-word cut, but it is loud. See docs/KNOWN_ISSUES.md item 0h.
-            // No "Today's date" line, deliberately. Nothing downstream consumes it —
+        // Known noise this leaves behind: `SUBJECT_TRUNCATED` fires on many
+        // documents because the model writes past the trusted word ceiling and
+        // the checker trims at a word boundary. That keeps the filename
+        // behavior explicit.
+        // This is the flagged, clean outcome replacing a silent
+        // mid-word cut, but it is loud. See docs/KNOWN_ISSUES.md item 0h.
+        // No "Today's date" line, deliberately. Nothing downstream consumes it —
         // the checker computes its own now() for the future-date ceiling, and the
         // metadata fallback comes from the file's mtime — so the only thing the
         // line ever did was hand a weak model a concrete, salient date string
@@ -895,12 +895,12 @@ impl SlmLane {
              Document language: {language}. Classified type: {doc_type}.\n\
              Do not reveal reasoning. Return only the requested JSON object.\n\
              Rules:\n\
-              - date: extract the date written IN the document body (for example a letter date, filing date, or effective date), formatted YYYY-MM-DD. Never invent a date that is not present in the text. If there are multiple body dates, choose the date that appears on the first 1500 chars or the one you judge best reflects the effective date. Use none only if the body contains no date at all.\n\
+              - date: return the controlling date written IN the document, formatted YYYY-MM-DD. Prefer an explicitly labeled effective/as-of or commencement date; for court filings prefer the filing date; for notices prefer the issuance date; use an execution, signature, or termination date only when it is the controlling date. Never choose a date merely referenced in recitals, deadlines, exhibits, prior agreements, or correspondence. Never invent a date. Use none only if the text contains no date at all.\n\
               - date_source: use document when the date appears in the body text; use metadata only when the body has no date of its own; use none when no date exists.\n\
-             - subject: start with the document type, then the phrase that distinguishes this file from others. At most 48 words.\n\
+             - subject: start with the classified document type, then the parties, matter, or outcome that distinguishes this file from others. At most 64 words.\n\
              - subject: every word of the subject must come from this document. Add nothing else — no tax year, no EIN, no address, no generic word such as Document or Scan, and never the labels Taxpayer or Entity.\n\
-             - description: exactly ONE sentence, 15 to 320 characters, adding useful information beyond the subject. It must end with a single full stop. Do not write a second sentence, and do not stop mid-sentence. Include what this document is, who is involved, what changed, why this matters, and the key outcome.\n\
-             - description: begin with the document type or action itself, for example `Shareholder's register transferring 40,000 shares to John Smith.` — never open with `The document`, `This document`, `This is`, `This was`, `The file`, `Details`, `Outlines`, `Summary`, or `Contains`. Do not include dates in the description (including month/day/year text).\n\
+             - description: exactly ONE complete sentence, 25 to 420 characters, adding useful information beyond the subject. It must say what the item is, identify the principal parties, and state the most noteworthy grounded action, obligation, allegation, or outcome. It must end with a single full stop. Do not write a second sentence or stop mid-sentence.\n\
+             - description: begin with the document type, a precise action verb such as Details or Outlines, or the legal action itself. Never open with `The document`, `This document`, `This is`, `This was`, `The file`, `Summary`, or `Contains`. Do not include any date, deadline, document identifier, or routine boilerplate in the description.\n\
               Never invent dates, parties, or facts."
         );
         let notes = naming_notes.trim();

@@ -1392,8 +1392,7 @@ impl Pipeline {
                     modified_iso,
                     ettin_date,
                     Some(doc_type_for_prompt),
-                )
-                {
+                ) {
                     Ok(mut v) => {
                         // Ettin/SLM hard disagreement path: one re-prompt with
                         // spans pinned; after that it stays a soft flag.
@@ -2302,14 +2301,8 @@ impl Pipeline {
         // model's rules to the human's answer, which meant the one surface a
         // user is left alone with could refuse the correct name and leave the
         // file with no path forward.
-        let v = checker.check_human_with_doc_type(
-            &out,
-            &h,
-            &[date],
-            &today,
-            None,
-            Some(doc_type),
-        )?;
+        let v =
+            checker.check_human_with_doc_type(&out, &h, &[date], &today, None, Some(doc_type))?;
 
         // ONE value for the file's identity, not two independent
         // reconstructions: the flagged manifest's id, its `original_relpath`,

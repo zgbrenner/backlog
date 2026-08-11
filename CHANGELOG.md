@@ -15,6 +15,31 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.10.2] — 2026-08-11
+
+### Changed
+
+- Renamed files now keep the classified document type immediately after the
+  ISO date and allow subjects up to 64 words so material party and matter
+  details are not cut off prematurely.
+- Naming instructions now prioritize controlling effective, filing,
+  commencement, issuance, execution, termination, or signature dates and
+  explicitly reject dates that merely appear in recitals, deadlines, exhibits,
+  prior agreements, or correspondence.
+- Descriptions may be more detailed, but must remain one grounded sentence
+  that identifies what the item is, the principal parties, and the key action
+  or outcome. Dates and file/document preambles remain prohibited.
+
+### Fixed
+
+- Multi-date files without an identifiable controlling date now fail closed to
+  review instead of allowing an arbitrary date from the body into the name.
+- Starting BackLog while its existing window is hidden now finds that window by
+  executable identity and restores it instead of silently exiting.
+- Update checks retry transient GitHub failures, use a version-specific cache
+  key, show actionable error text, and verify the published `latest.json`
+  endpoint after every signed stable release.
+
 ## [0.10.0] — 2026-08-10
 
 > **This release makes naming better by fixing what the model is allowed to
