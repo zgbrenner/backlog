@@ -1030,17 +1030,17 @@ fn naming_lane_budget_mib(gib: Option<u64>) -> u64 {
 }
 
 /// The largest `evidence_token_budget` that still fits in one llama-server
-/// slot beside the prompt and the answer — 4347 at today's constants.
+/// slot beside the prompt and the answer — 4212 at today's constants.
 ///
 /// Composed from other modules' constants, never written down here.
 /// [`max_bundle_chars`] is
 /// `(SLM_CTX_PER_SLOT - SLM_PROMPT_RESERVE_TOKENS - SLM_MAX_OUTPUT_TOKENS) *
-/// CONSERVATIVE_CHARS_PER_TOKEN`, i.e. `(6656 - 640 - 220) * 3` = 17388
+/// CONSERVATIVE_CHARS_PER_TOKEN`, i.e. `(6656 - 640 - 400) * 3` = 16848
 /// characters; [`BUDGET_CHARS_PER_TOKEN`] converts that into the optimistic
-/// chars/4 unit `evidence_token_budget` is expressed in, so 17388 / 4 = 4347.
+/// chars/4 unit `evidence_token_budget` is expressed in, so 16848 / 4 = 4212.
 ///
 /// Every one of those numbers is imported rather than restated. That is the
-/// whole point: a second copy of 6656/640/220/3/4 living here would let a
+/// whole point: a second copy of 6656/640/400/3/4 living here would let a
 /// future retune of the slot size move one home and not the other, and the
 /// symptom would be `validate` accepting a budget that `filter.rs` then
 /// silently truncates. Truncation is the failure worth engineering against
@@ -1770,7 +1770,7 @@ mod tests {
     }
 
     /// The evidence ceiling is what makes a slot overflow structurally
-    /// impossible, so it is asserted twice over: once against the literal 4347
+    /// impossible, so it is asserted twice over: once against the literal 4212
     /// that the doc comments and the Settings range are written against, and
     /// once against the slot arithmetic itself, so that a change to
     /// `SLM_CTX_PER_SLOT` fails here rather than silently redefining what
@@ -1778,7 +1778,7 @@ mod tests {
     #[test]
     fn the_evidence_budgets_always_fit_one_llama_server_slot() {
         let max = max_evidence_token_budget();
-        assert_eq!(max, 4347, "the constants no longer produce the pinned 4347");
+        assert_eq!(max, 4212, "the constants no longer produce the pinned 4212");
 
         // The ceiling the bundle builder actually enforces, in characters.
         // The conversion back has to land inside it: integer division is what

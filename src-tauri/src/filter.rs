@@ -55,7 +55,7 @@ pub(crate) const CONSERVATIVE_CHARS_PER_TOKEN: usize = 3;
 ///
 /// `slm::SLM_CTX_PER_SLOT` minus the prompt reserve and the answer allowance,
 /// converted at
-/// `CONSERVATIVE_CHARS_PER_TOKEN`: `(6656 - 640 - 220) * 3` = 17388 characters
+/// `CONSERVATIVE_CHARS_PER_TOKEN`: `(6656 - 640 - 400) * 3` = 16848 characters
 /// at today's constants, and it moves with them rather than restating them.
 ///
 /// This is enforced, not documented, because the failure is silent. llama.cpp

@@ -384,8 +384,8 @@ const UNDO_SECONDS = 10;
  *  authority: for a HUMAN it deliberately does not enforce the word count
  *  (checker.rs gates that on Source::Model), so these counters advise and only
  *  the genuinely impossible cases disable Approve. */
-const SUBJECT_WORDS = [2, 48] as const;
-const DESCRIPTION_CHARS = [15, 320] as const;
+const SUBJECT_WORDS = [2, 64] as const;
+const DESCRIPTION_CHARS = [25, 420] as const;
 
 // ---------------------------------------------------------------------------
 // Small DOM helpers
@@ -469,7 +469,9 @@ function friendlyError(raw: string): { message: string; raw: string | null } {
     [/^description invalid:/i,
       "The description has to be one sentence, ending in a full stop, "
       + `between ${DESCRIPTION_CHARS[0]} and ${DESCRIPTION_CHARS[1]} characters. `
-      + "It should state what this document is and name the parties before this document."],
+      + "It should state what it is, name the parties, and include the most important outcome without listing dates."],
+    [/Could not fetch a valid release JSON from the remote|valid release JSON|latest\.json/i,
+      "BackLog could not read the update information from GitHub. Check your internet connection and try again; if it continues, install the latest release manually from GitHub."],
     [/composed filename too long/i,
       "Date plus subject is too long for a file name. Try a shorter subject."],
     [/no longer flagged|already moved on|already been dismissed/i,
@@ -1303,19 +1305,28 @@ function paintUpdateBanner(): void {
  *  tauri.conf.json. Must never block or break startup: no releases yet, no
  *  network, or a misbehaving endpoint all just leave the app quiet. */
 async function checkForUpdates(announce = false): Promise<void> {
-  try {
-    const update = await check();
-    if (update) {
-      pendingUpdate = update;
-      updateDismissed = false;
-      paintUpdateBanner();
-    } else if (announce) {
-      showSuccess("BackLog is up to date.");
+  const attempts = announce ? 3 : 2;
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const update = await check();
+      if (update) {
+        pendingUpdate = update;
+        updateDismissed = false;
+        paintUpdateBanner();
+      } else if (announce) {
+        showSuccess("BackLog is up to date.");
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+      const transient = /Could not fetch a valid release JSON from the remote|network|timed? out|fetch/i.test(String(error));
+      if (!transient || attempt === attempts) break;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 750));
     }
-  } catch (e) {
-    // Silent on startup; explicit when the user pressed the button.
-    if (announce) showError(e);
   }
+  // Silent on startup; explicit when the user pressed the button.
+  if (announce) showError(lastError);
 }
 
 let updateProgressRenderQueued = false;

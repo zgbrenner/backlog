@@ -1392,8 +1392,7 @@ impl Pipeline {
                     modified_iso,
                     ettin_date,
                     Some(doc_type_for_prompt),
-                )
-                {
+                ) {
                     Ok(mut v) => {
                         // Ettin/SLM hard disagreement path: one re-prompt with
                         // spans pinned; after that it stays a soft flag.
@@ -2302,14 +2301,8 @@ impl Pipeline {
         // model's rules to the human's answer, which meant the one surface a
         // user is left alone with could refuse the correct name and leave the
         // file with no path forward.
-        let v = checker.check_human_with_doc_type(
-            &out,
-            &h,
-            &[date],
-            &today,
-            None,
-            Some(doc_type),
-        )?;
+        let v =
+            checker.check_human_with_doc_type(&out, &h, &[date], &today, None, Some(doc_type))?;
 
         // ONE value for the file's identity, not two independent
         // reconstructions: the flagged manifest's id, its `original_relpath`,
@@ -4888,7 +4881,7 @@ mod tests {
             "the regression must begin without a masked reservation"
         );
         let quarantined = PathBuf::from(flagged.quarantine_path.as_ref().unwrap());
-        let base_name = "2024-03-05 document Acme Corporation Invoice March.pdf";
+        let base_name = "2024-03-05 Acme Corporation Invoice March.pdf";
         std::fs::write(
             h.pipeline.cfg.local_output_dir.join(base_name),
             b"unrelated operator file",
@@ -4911,7 +4904,7 @@ mod tests {
             .contains("injected correction source-delete failure"));
 
         let pending = h.pipeline.ledger.get(&sha).unwrap().unwrap();
-        let corrected_name = "2024-03-05 document Acme Corporation Invoice March (2).pdf";
+        let corrected_name = "2024-03-05 Acme Corporation Invoice March (2).pdf";
         assert_eq!(pending.state, JobState::Flagged);
         assert_eq!(pending.final_filename.as_deref(), Some(corrected_name));
         assert_eq!(
@@ -7471,7 +7464,7 @@ server.serve_forever()
         assert!(job.flag_reason.is_none());
         assert_eq!(
             job.final_filename.as_deref(),
-            Some("2024-03-05 document Acme Corporation Invoice March.pdf")
+            Some("2024-03-05 Acme Corporation Invoice March.pdf")
         );
 
         // The flagged manifest was replaced in place, keeping its identity.

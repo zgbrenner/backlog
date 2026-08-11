@@ -114,13 +114,13 @@ const FILENAME_TAIL_RESERVE: usize = 14;
 
 // --- subject shape -------------------------------------------------------
 const SUBJECT_MIN_WORDS: usize = 2;
-const SUBJECT_MAX_WORDS: usize = 48;
+const SUBJECT_MAX_WORDS: usize = 64;
 /// Han/Kana/Thai do not put spaces between words, so a whitespace word count is
 /// structurally incapable of passing them. Bound characters instead.
 const SUBJECT_MIN_CHARS_UNSPACED: usize = 4;
 const SUBJECT_MAX_CHARS_UNSPACED: usize = 40;
-const DESCRIPTION_MAX_CHARS: usize = 320;
-const DESCRIPTION_MIN_WORDS: usize = 6;
+const DESCRIPTION_MAX_CHARS: usize = 420;
+const DESCRIPTION_MIN_WORDS: usize = 4;
 const EFFECTIVE_DATE_CONTEXT_RADIUS: usize = 120;
 
 // The sidecar schema and review command normally keep these fields small, but
@@ -264,22 +264,26 @@ static RE_MASK_INITIAL: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[A-Z]\.").unwr
 // gate is intentionally pragmatic: it is broader than perfect parser coverage and
 // aims to reject date leaks, not to prove that every date mention is valid.
 static RE_DESCRIPTION_DATE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?ix)\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}[./-](?:\d{2}|\d{4})\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{2,4}\b|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*[,]?\s+\d{2,4}\b").unwrap()
+    Regex::new(r"(?ix)\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}[./-](?:\d{2}|\d{4})\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{2,4}\b|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?[,]?\s+\d{2,4}\b").unwrap()
 });
 
-const DATE_LABEL_HINTS: [&str; 10] = [
+const DATE_LABEL_HINTS: [&str; 15] = [
+    "effective date",
+    "effective as of",
     "as of",
-    "commencement",
-    "effective",
+    "commencement date",
+    "commences on",
+    "termination date",
+    "terminates on",
+    "filing date",
+    "filed on",
+    "date filed",
+    "issued on",
     "execution date",
-    "signed",
+    "executed on",
     "signed on",
-    "dated",
-    "date of",
-    "dated as of",
-    "issued",
+    "date of issuance",
 ];
-
 
 pub struct Checker {
     pub max_filename_len: usize,
@@ -299,7 +303,14 @@ impl Checker {
         file_modified_iso: &str,
         ettin_date: Option<&str>, // top DATE span from the Ettin lane, if any
     ) -> Result<Validated, CheckError> {
-        self.check_with_doc_type(out, harvest, file_metadata_dates, file_modified_iso, ettin_date, None)
+        self.check_with_doc_type(
+            out,
+            harvest,
+            file_metadata_dates,
+            file_modified_iso,
+            ettin_date,
+            None,
+        )
     }
 
     pub fn check_with_doc_type(
@@ -364,6 +375,7 @@ impl Checker {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_with(
         &self,
         out: &SlmOutput,
@@ -451,7 +463,8 @@ impl Checker {
                 harvest.dates.iter().filter(|f| f.iso == out.date).collect();
             let in_doc = !evidence.is_empty();
             let in_meta = file_metadata_dates.iter().any(|m| m == &out.date);
-            let multiple_doc_dates = in_doc && harvest.dates.iter().any(|date| date.iso != out.date);
+            let multiple_doc_dates =
+                in_doc && harvest.dates.iter().any(|date| date.iso != out.date);
             if !in_doc && !in_meta {
                 // The proposal is unsupported. Whether that is a hallucination or
                 // simply an undated document turns on whether the document had
@@ -471,6 +484,16 @@ impl Checker {
                     return Err(CheckError::DateNotInEvidence(out.date.clone()));
                 }
             } else if source == Source::Model
+                && in_doc
+                && evidence
+                    .iter()
+                    .all(|date| !Self::is_unambiguous_date_reading(harvest, date))
+            {
+                return Err(CheckError::BadDate(
+                    "document date is ambiguous and has no unambiguous corroborating occurrence; review is required"
+                        .to_string(),
+                ));
+            } else if source == Source::Model
                 && multiple_doc_dates
                 && !evidence.iter().all(|f| f.ambiguous)
             {
@@ -481,6 +504,11 @@ impl Checker {
                             out.date, preferred.iso
                         )));
                     }
+                } else {
+                    return Err(CheckError::BadDate(
+                        "document contains multiple dates but no controlling effective, filing, issuance, execution, commencement, or termination date can be identified; review is required"
+                            .to_string(),
+                    ));
                 }
                 (out.date.clone(), "document".to_string())
             } else if let Some(preferred) = (!in_doc && source == Source::Model)
@@ -576,7 +604,8 @@ impl Checker {
         } else {
             out.description.clone()
         };
-        let description = Self::validate_description(&described, &subject, doc_type, &mut soft_flags)?;
+        let description =
+            Self::validate_description(&described, &subject, doc_type, &mut soft_flags)?;
 
         // ---- compose -------------------------------------------------------
         let subject_for_name = Self::compose_subject_for_name(&subject, doc_type);
@@ -599,12 +628,12 @@ impl Checker {
     }
 
     fn compose_subject_for_name(subject: &str, doc_type: Option<&str>) -> String {
-        let doc_type = doc_type.unwrap_or("document");
-        let doc_type = doc_type.trim();
-        let doc_type = if doc_type.is_empty() || doc_type.eq_ignore_ascii_case("unknown") {
-            "document"
-        } else {
-            doc_type
+        let Some(doc_type) = doc_type.map(str::trim).filter(|value| {
+            !value.is_empty()
+                && !value.eq_ignore_ascii_case("unknown")
+                && !value.eq_ignore_ascii_case("document")
+        }) else {
+            return subject.to_string();
         };
         let normalized_doc_type = normalize_name_component(doc_type);
         if normalized_doc_type.is_empty() {
@@ -612,7 +641,8 @@ impl Checker {
         }
         let subject = Self::strip_doc_type_from_subject_edges(subject, &normalized_doc_type);
         let subject_no_leading_fillers = strip_leading_fillers_for_prefix(&subject);
-        let subject_normalized = normalize_name_component(subject_no_leading_fillers).to_lowercase();
+        let subject_normalized =
+            normalize_name_component(subject_no_leading_fillers).to_lowercase();
         let normalized_doc_type = normalized_doc_type.to_lowercase();
         if subject_normalized == normalized_doc_type
             || subject_normalized.starts_with(&(normalized_doc_type.clone() + " "))
@@ -624,16 +654,15 @@ impl Checker {
             return subject_no_leading_fillers.to_string();
         }
         let display_doc_type = normalize_name_component(doc_type);
-        if subject_no_leading_fillers.is_empty() {
+        if subject_no_leading_fillers.is_empty()
+            || subject_no_leading_fillers.eq_ignore_ascii_case("the")
+        {
             return display_doc_type;
         }
-        format!("{display_doc_type} {subject}")
+        format!("{display_doc_type} {subject_no_leading_fillers}")
     }
 
-    fn strip_doc_type_from_subject_edges(
-        subject: &str,
-        normalized_doc_type: &str,
-    ) -> String {
+    fn strip_doc_type_from_subject_edges(subject: &str, normalized_doc_type: &str) -> String {
         let words = subject_words(subject);
         if words.is_empty() {
             return subject.to_string();
@@ -677,7 +706,8 @@ impl Checker {
         for d in harvest
             .dates
             .iter()
-            .filter(|f| !f.ambiguous && f.offset <= HEAD_REGION_BYTES)
+            .filter(|f| Self::is_unambiguous_date_reading(harvest, f))
+            .filter(|f| f.offset <= HEAD_REGION_BYTES)
         {
             let score = Self::effective_date_score(&harvest.head_excerpt, d);
             match picked {
@@ -698,6 +728,15 @@ impl Checker {
         picked
     }
 
+    fn is_unambiguous_date_reading(harvest: &Harvest, candidate: &harvest::FoundDate) -> bool {
+        !candidate.ambiguous
+            && !harvest.dates.iter().any(|other| {
+                other.offset == candidate.offset
+                    && other.raw == candidate.raw
+                    && other.iso != candidate.iso
+            })
+    }
+
     fn effective_date_score(head_excerpt: &str, candidate: &harvest::FoundDate) -> u32 {
         if head_excerpt.is_empty() {
             return 0;
@@ -708,7 +747,10 @@ impl Checker {
         let mut scan = 0usize;
         while let Some(found) = haystack[scan..].find(&raw) {
             let found = scan + found;
-            let start = floor_char_boundary(&haystack, found.saturating_sub(EFFECTIVE_DATE_CONTEXT_RADIUS));
+            let start = floor_char_boundary(
+                &haystack,
+                found.saturating_sub(EFFECTIVE_DATE_CONTEXT_RADIUS),
+            );
             let end = floor_char_boundary(
                 &haystack,
                 (found + raw.len() + EFFECTIVE_DATE_CONTEXT_RADIUS).min(haystack.len()),
@@ -744,14 +786,15 @@ impl Checker {
     /// deep body references. It is intentionally conservative and scoped to
     /// checker behavior, not semantic truth.
     fn preferred_effective_date(harvest: &Harvest) -> Option<&harvest::FoundDate> {
-        if let Some(preferred) = Self::date_printed_on_the_page(harvest) {
-            return Some(preferred);
-        }
-        harvest
+        let mut unambiguous = harvest
             .dates
             .iter()
-            .filter(|f| !f.ambiguous)
-            .min_by_key(|f| f.offset)
+            .filter(|date| Self::is_unambiguous_date_reading(harvest, date));
+        let first = unambiguous.next()?;
+        if unambiguous.all(|date| date.iso == first.iso) {
+            return Some(first);
+        }
+        Self::date_printed_on_the_page(harvest)
     }
 
     /// Name the document from its own modified time, and say so.
@@ -1017,7 +1060,7 @@ impl Checker {
             )));
         }
         let description_tokens = eligible_tokens(&d);
-        if description_tokens.len() < DESCRIPTION_MIN_WORDS {
+        if !unspaced_script_majority(&d) && description_tokens.len() < DESCRIPTION_MIN_WORDS {
             return Err(CheckError::BadDescription(format!(
                 "description must include at least {DESCRIPTION_MIN_WORDS} meaningful words"
             )));
@@ -1097,7 +1140,7 @@ impl Checker {
 
     fn description_starts_with_model_intro(s: &str) -> bool {
         let lower = s.trim_start().to_lowercase();
-        const PREFIXES: [&str; 18] = [
+        const PREFIXES: [&str; 16] = [
             "the document",
             "this document",
             "this is",
@@ -1109,8 +1152,6 @@ impl Checker {
             "this section",
             "the file",
             "this file",
-            "details",
-            "outlines",
             "summary",
             "contains",
             "the following",
@@ -1221,10 +1262,7 @@ fn normalize_name_component(value: &str) -> String {
             }
         })
         .collect::<String>();
-    normalized
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn parse_subject_parts(subject: &str) -> Option<(String, String)> {
@@ -1805,8 +1843,8 @@ fn dedup_dates(mut dates: Vec<String>) -> Vec<String> {
 /// "Shareholder's register transferring 40,000 shares to John Smith." — not
 /// "The document is a shareholder's register transferring 40,000 shares…".
 ///
-    /// Deliberately narrow: only a leading model-signature phrase is removed.
-    /// A mid-sentence mention or
+/// Deliberately narrow: only a leading model-signature phrase is removed.
+/// A mid-sentence mention or
 /// "The documentation …" is left alone (the prefixes carry their own trailing
 /// space, which is the word boundary). If what remains would fall under the
 /// 15-character floor `validate_description` enforces, the original is kept —
@@ -1829,8 +1867,6 @@ pub fn strip_document_preamble(description: &str) -> String {
         "the enclosed ",
         "the file ",
         "this file ",
-        "details ",
-        "outlines ",
         "summary ",
         "contains ",
     ];
@@ -1857,8 +1893,6 @@ pub fn strip_document_preamble(description: &str) -> String {
         }
     }
     for opener in [
-        "details ",
-        "outlines ",
         "summary ",
         "contains ",
         "the ",
@@ -1906,7 +1940,9 @@ mod tests {
             date: "2026-07-20".into(),
             date_source: "document".into(),
             subject: "Termination Notice for John Smith".into(),
-            description: "Letter from Acme Corporation notifying John Smith of employment termination.".into(),
+            description:
+                "Letter from Acme Corporation notifying John Smith of employment termination."
+                    .into(),
         }
     }
 
@@ -2304,7 +2340,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_only_evidence_is_flagged() {
+    fn ambiguous_only_evidence_requires_review() {
         let c = Checker::new(120);
         let mut o = ok_out();
         // 03/04/2026: US reading 2026-03-04, day-first alternate 2026-04-03.
@@ -2314,16 +2350,13 @@ mod tests {
             dates: harvest::extract_dates("effective 03/04/2026"),
             ..Default::default()
         };
-        let v = c.check(&o, &h, &[], "2026-07-21", None).unwrap();
-        assert!(
-            v.soft_flags.contains(&"DATE_AMBIGUOUS_FORMAT".to_string()),
-            "{:?}",
-            v.soft_flags
-        );
+        let error = c.check(&o, &h, &[], "2026-07-21", None).unwrap_err();
+        assert_eq!(error.code(), "BAD_DATE");
+        assert!(error.to_string().contains("review is required"));
 
         o.date = "2026-03-04".into();
-        let v = c.check(&o, &h, &[], "2026-07-21", None).unwrap();
-        assert!(!v.soft_flags.contains(&"DATE_AMBIGUOUS_FORMAT".to_string()));
+        let error = c.check(&o, &h, &[], "2026-07-21", None).unwrap_err();
+        assert_eq!(error.code(), "BAD_DATE");
     }
 
     #[test]
@@ -2412,11 +2445,10 @@ mod tests {
                 "Notice of Proposed Rulemaking on Wage and Hour Compliance Rules",
                 Some("Notice of Proposed Rulemaking on Wage and Hour Compliance Rules"),
             ), // 10
-            // 19 words: trimmed to the ceiling rather than refused. The
-            // guarantee is the word ceiling, not that the model hits it exactly.
+            // 19 words: the expanded ceiling keeps the complete useful subject.
             (
                 "Notice of Proposed Rulemaking on Wage and Hour Compliance Rules Today for all employees and vendors in the state",
-                Some("Notice of Proposed Rulemaking on Wage and Hour Compliance Rules Today for all employees and vendors"),
+                Some("Notice of Proposed Rulemaking on Wage and Hour Compliance Rules Today for all employees and vendors in the state"),
             ),
             // C14: unspaced scripts can never reach 2 whitespace words, so they
             // are judged by character count instead.
@@ -2434,7 +2466,7 @@ mod tests {
             // it is judged as English and trimmed to sixteen words like any other.
             (
                 "Alpha Beta Gamma Delta Epsilon Zeta Eta Theta Iota Kappa 株",
-                Some("Alpha Beta Gamma Delta Epsilon Zeta Eta Theta Iota Kappa"),
+                Some("Alpha Beta Gamma Delta Epsilon Zeta Eta Theta Iota Kappa 株"),
             ),
         ];
         for (raw, want) in cases {
@@ -2453,7 +2485,7 @@ mod tests {
     #[test]
     fn word_count_boundaries() {
         let c = Checker::new(200);
-        for n in 1..=20usize {
+        for n in 1..=70usize {
             let subject = vec!["Alpha"; n].join(" ");
             let got = c.sanitize_subject(&subject);
             if n < 2 {
@@ -2470,8 +2502,7 @@ mod tests {
                 assert_eq!(kept, subject, "{n} words must pass through unchanged");
             } else {
                 assert_eq!(
-                    words,
-                    SUBJECT_MAX_WORDS,
+                    words, SUBJECT_MAX_WORDS,
                     "an over-long subject keeps the first {SUBJECT_MAX_WORDS} words"
                 );
             }
@@ -2643,6 +2674,36 @@ mod tests {
         assert_eq!(ok.date_iso, "2021-01-20");
     }
 
+    #[test]
+    fn model_date_cannot_pick_an_arbitrary_deep_body_date() {
+        let c = Checker::new(200);
+        let mut out = ok_out();
+        out.date = "2021-04-03".into();
+        let deep_dates = Harvest {
+            dates: vec![
+                harvest::FoundDate {
+                    iso: "2021-01-20".into(),
+                    raw: "January 20, 2021".into(),
+                    offset: HEAD_REGION_BYTES + 200,
+                    ambiguous: false,
+                },
+                harvest::FoundDate {
+                    iso: "2021-04-03".into(),
+                    raw: "April 3, 2021".into(),
+                    offset: HEAD_REGION_BYTES + 800,
+                    ambiguous: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let error = c
+            .check(&out, &deep_dates, &[], "2026-07-21", None)
+            .unwrap_err();
+        assert_eq!(error.code(), "BAD_DATE");
+        assert!(error.to_string().contains("review is required"));
+    }
+
     /// The length budget must cover the widest suffix the ledger can actually
     /// append, and nothing else connects the two numbers.
     ///
@@ -2675,13 +2736,16 @@ mod tests {
         let c = Checker::new(200);
         let h = harvest_with(&["2026-07-20"]);
         let mut out = ok_out();
-        out.description = "This document contains the payroll worksheets. The return was ".into();
+        out.description =
+            "Details payroll worksheets for John Smith's compensation calculations. The return was "
+                .into();
         let v = c
             .check(&out, &h, &[], "2026-07-21", None)
             .expect("a trailing fragment must not quarantine the document");
-        // The "This document" preamble is stripped first, then the trailing
-        // fragment is trimmed to the one complete sentence.
-        assert_eq!(v.description, "The payroll worksheets.");
+        assert_eq!(
+            v.description,
+            "Details payroll worksheets for John Smith's compensation calculations."
+        );
         assert!(
             v.soft_flags
                 .contains(&"DESCRIPTION_TRIMMED_TO_ONE_SENTENCE".to_string()),
@@ -2715,11 +2779,12 @@ mod tests {
     /// quietly different from what the model proposed.
     #[test]
     fn an_over_long_subject_is_truncated_and_flagged() {
-        let c = Checker::new(200);
+        let c = Checker::new(1000);
         let mut out = ok_out();
-        out.subject =
-            "Wage and Tax Statement, Form W-2, Internal Revenue Service, Elena Hutchins, 2023"
-                .into();
+        out.subject = format!(
+            "Wage and Tax Statement {}",
+            vec!["Supplemental"; SUBJECT_MAX_WORDS + 1].join(" ")
+        );
         let v = c
             .check(
                 &out,
@@ -2734,7 +2799,11 @@ mod tests {
             "truncation must be recorded: {:?}",
             v.soft_flags
         );
-        assert!(subject_words(&v.subject).len() <= SUBJECT_MAX_WORDS, "got {:?}", v.subject);
+        assert!(
+            subject_words(&v.subject).len() <= SUBJECT_MAX_WORDS,
+            "got {:?}",
+            v.subject
+        );
         // The informative head survives, and no dangling separator with it.
         assert!(
             v.subject.starts_with("Wage and Tax Statement"),
@@ -2756,14 +2825,27 @@ mod tests {
     #[test]
     fn a_subject_that_arrives_ending_in_a_separator_is_tidied() {
         let c = Checker::new(200);
-        for raw in [
-            "Tax Return - Supplemental Income and Loss (Rental Real Estate) -",
-            "Form 1099-MISC - Kessler & Sons Contracting -",
-            "Schedule E for Patrick Chen &",
-            "Form 4562 Depreciation,",
+        for (raw, description) in [
+            (
+                "Tax Return - Supplemental Income and Loss (Rental Real Estate) -",
+                "Details a tax return with supplemental income and rental real estate schedules.",
+            ),
+            (
+                "Form 1099-MISC - Kessler & Sons Contracting -",
+                "Details Form 1099-MISC reporting for Kessler and Sons Contracting.",
+            ),
+            (
+                "Schedule E for Patrick Chen &",
+                "Details Schedule E income and loss reporting for Patrick Chen.",
+            ),
+            (
+                "Form 4562 Depreciation,",
+                "Details Form 4562 depreciation and amortization calculations for reported assets.",
+            ),
         ] {
             let mut out = ok_out();
             out.subject = raw.into();
+            out.description = description.into();
             let v = c
                 .check(
                     &out,
@@ -2813,7 +2895,7 @@ mod tests {
     /// documents that quarantine on length.
     #[test]
     fn the_schema_subject_cap_still_composes_at_the_filename_budget() {
-        const SCHEMA_SUBJECT_MAX: usize = 150; // slm.rs naming_schema()
+        const SCHEMA_SUBJECT_MAX: usize = 150; // conservative emitted-name budget
         const DATE_PREFIX: usize = 11; // "YYYY-MM-DD "
         let c = Checker::new(180); // config.rs default max_filename_len
         assert!(
@@ -3015,7 +3097,9 @@ mod tests {
 
         let mut o = ok_out();
         o.subject = "Form 8829 - Marcus Alvarez - Hooli Inc.".into();
-        o.description = "Home office expense worksheet filed with the return.".into();
+        o.description =
+            "Details a home office expense worksheet involving Marcus Alvarez and Hooli Inc."
+                .into();
         let v = c.check(&o, &h, &[], "2026-07-21", None).unwrap();
 
         // The whole-subject check is fooled: "hooli" and "inc" are real, and
@@ -3054,7 +3138,9 @@ mod tests {
 
         let mut o = ok_out();
         o.subject = "Master Services Agreement - Nakatomi Trading LLC".into();
-        o.description = "Services agreement executed with the vendor named above.".into();
+        o.description =
+            "Details a services agreement with Nakatomi Trading LLC covering vendor obligations."
+                .into();
         let v = c.check(&o, &h, &[], "2026-07-21", None).unwrap();
         assert!(
             !v.soft_flags
@@ -3146,6 +3232,9 @@ mod tests {
         let mut o = ok_out();
         o.date = "2026-07-20".into();
         o.subject = "Form 8829 - Marcus Alvarez - Hooli Inc.".into();
+        o.description =
+            "Details a home office expense worksheet involving Marcus Alvarez and Hooli Inc."
+                .into();
         let v = c
             .check_human(&o, &h, &["2026-07-20".to_string()], "2026-07-21", None)
             .unwrap();
@@ -3303,7 +3392,7 @@ mod tests {
                 true,
             ),
             (
-                "Letter signed by J. Smith confirming receipt of the notice.",
+                "Letter signed by J. Smith confirming receipt of the compliance notice and its stated obligations.",
                 true,
             ),
             (
@@ -3320,7 +3409,10 @@ mod tests {
                 true,
             ),
             ("Purchase order for parts from Wilson Bros. Ltd.", true),
-            ("Rent statement for the property at 4 Elm St.", true),
+            (
+                "Rent statement for the property at 4 Elm St. covering tenant charges and payment obligations.",
+                true,
+            ),
             (
                 "Notice of hearing set for 10 a.m. before Judge Alvarez.",
                 true,
@@ -3355,19 +3447,22 @@ mod tests {
             // Trimmed to the first sentence, same as the two-sentence case. Note
             // the first sentence must still clear the 15-character floor on its
             // own — "First sentence." does, barely.
-            ("First sentence. Second sentence. Third one here.", true),
+            (
+                "Summarizes the principal filing obligations. Second sentence. Third one here.",
+                true,
+            ),
             // No terminal anywhere means there is no complete sentence to keep,
             // so there is nothing to repair and this stays a rejection.
             ("no terminal punctuation at all here sadly", false),
             // The shape observed in production: a complete first sentence, then
             // a fragment where generation stopped. The first sentence is kept.
             (
-                "Ends mid-sentence. Then trails off with no closing mark",
+                "Summarizes the principal filing obligations. Then trails off with no closing mark",
                 true,
             ),
             ("Too short.", false),
             // 15-char floor, exactly.
-            ("Acme wage note.", true),
+            ("Summarizes Acme wage compliance obligations.", true),
         ];
         for (desc, accept) in cases {
             let mut o = ok_out();
@@ -3415,8 +3510,8 @@ mod tests {
         let h = harvest_with(&["2026-07-20"]);
         let mut o = ok_out();
         o.subject = "Master Services Agreement - Jane Doe".into();
-        o.description = "This agreement covers project support terms and confidentiality obligations."
-            .into();
+        o.description =
+            "This agreement covers project support terms and confidentiality obligations.".into();
         let e = c.check(&o, &h, &[], "2026-07-21", None).unwrap_err();
         assert_eq!(e.code(), "BAD_DESCRIPTION");
         o.description = "This agreement between Jane Doe covers project support terms and confidentiality obligations."
@@ -3612,13 +3707,13 @@ mod tests {
             strip_document_preamble(
                 "Details a termination agreement between Vistage Worldwide and John Smith."
             ),
-            "Termination agreement between Vistage Worldwide and John Smith."
+            "Details a termination agreement between Vistage Worldwide and John Smith."
         );
         assert_eq!(
             strip_document_preamble(
                 "Outlines the shareholders' transfer of shares to Jane Doe for Vistage Worldwide."
             ),
-            "Shareholders' transfer of shares to Jane Doe for Vistage Worldwide."
+            "Outlines the shareholders' transfer of shares to Jane Doe for Vistage Worldwide."
         );
         assert_eq!(
             strip_document_preamble(
@@ -3627,7 +3722,9 @@ mod tests {
             "The board-approved shares given to Jane Doe for Vistage Worldwide."
         );
         assert_eq!(
-            strip_document_preamble("This is a shareholder's register transferring 40,000 shares to John Smith."),
+            strip_document_preamble(
+                "This is a shareholder's register transferring 40,000 shares to John Smith."
+            ),
             "Shareholder's register transferring 40,000 shares to John Smith."
         );
     }
@@ -3635,7 +3732,10 @@ mod tests {
     #[test]
     fn compose_subject_for_name_inserts_doc_type_when_needed() {
         assert_eq!(
-            Checker::compose_subject_for_name("Master Services Agreement - Jane Doe", Some("Master Services Agreement")),
+            Checker::compose_subject_for_name(
+                "Master Services Agreement - Jane Doe",
+                Some("Master Services Agreement")
+            ),
             "Master Services Agreement - Jane Doe".to_string()
         );
         assert_eq!(
@@ -3646,7 +3746,10 @@ mod tests {
             "Master Services Agreement Jane Doe".to_string()
         );
         assert_eq!(
-            Checker::compose_subject_for_name("the Master Services Agreement", Some("Master Services Agreement")),
+            Checker::compose_subject_for_name(
+                "the Master Services Agreement",
+                Some("Master Services Agreement")
+            ),
             "Master Services Agreement".to_string()
         );
         assert_eq!(
@@ -3655,11 +3758,15 @@ mod tests {
         );
         assert_eq!(
             Checker::compose_subject_for_name("Service Terms", None),
-            "document Service Terms".to_string()
+            "Service Terms".to_string()
         );
         assert_eq!(
             Checker::compose_subject_for_name("Service Terms", Some("unknown")),
-            "document Service Terms".to_string()
+            "Service Terms".to_string()
+        );
+        assert_eq!(
+            Checker::compose_subject_for_name("Service Terms", Some("document")),
+            "Service Terms".to_string()
         );
     }
 
@@ -3681,10 +3788,7 @@ mod tests {
                 "John Smith and Vistage Worldwide".to_string()
             ))
         );
-        assert_eq!(
-            parse_subject_parts("Notice of Breach of Contract"),
-            None
-        );
+        assert_eq!(parse_subject_parts("Notice of Breach of Contract"), None);
     }
 
     #[test]
@@ -3703,4 +3807,3 @@ mod tests {
         assert_eq!(strip_document_preamble(mid), mid);
     }
 }
-
