@@ -161,12 +161,72 @@ struct Server {
     child: Child,
     port: u16,
     _stderr: std::thread::JoinHandle<()>,
+    #[cfg(windows)]
+    _kill_on_parent_exit: KillOnCloseJob,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// A private Windows Job Object whose last handle belongs to BackLog. Closing
+/// the app normally, crashing it, or force-terminating it closes that handle;
+/// `KILL_ON_JOB_CLOSE` then terminates the attached llama-server in the kernel.
+/// This covers the one path Rust `Drop` cannot: abrupt parent-process death.
+#[cfg(windows)]
+struct KillOnCloseJob(usize);
+
+#[cfg(windows)]
+impl KillOnCloseJob {
+    fn attach(child: &Child) -> anyhow::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let job = unsafe { CreateJobObjectW(None, PCWSTR::null())? };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        };
+        if let Err(error) = configured {
+            unsafe {
+                let _ = CloseHandle(job);
+            }
+            return Err(error.into());
+        }
+
+        let process = HANDLE(child.as_raw_handle());
+        if let Err(error) = unsafe { AssignProcessToJobObject(job, process) } {
+            unsafe {
+                let _ = CloseHandle(job);
+            }
+            return Err(error.into());
+        }
+        Ok(Self(job.0 as usize))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        unsafe {
+            let _ = CloseHandle(HANDLE(self.0 as *mut core::ffi::c_void));
+        }
     }
 }
 
@@ -473,6 +533,17 @@ impl SlmLane {
             command.creation_flags(CREATE_NO_WINDOW);
         }
         let mut child = command.spawn()?;
+        #[cfg(windows)]
+        let kill_on_parent_exit = match KillOnCloseJob::attach(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "could not attach llama-server to crash-safe Windows process ownership: {error}"
+                );
+            }
+        };
         let stderr = child
             .stderr
             .take()
@@ -482,6 +553,8 @@ impl SlmLane {
             child,
             port,
             _stderr: stderr_thread,
+            #[cfg(windows)]
+            _kill_on_parent_exit: kill_on_parent_exit,
         })
     }
 
