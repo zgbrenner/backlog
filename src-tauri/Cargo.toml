@@ -1,6 +1,6 @@
 [package]
 name = "backlog"
-version = "0.10.2"
+version = "0.10.3"
 edition = "2021"
 description = "Local document naming and indexing pipeline"
 
@@ -74,6 +74,9 @@ minisign-verify = "=0.2.5"
 windows = { version = "0.61", features = [
     "Win32_Security_Cryptography",
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
     # watcher.rs reads reparse TAGS (WIN32_FIND_DATAW.dwReserved0) to tell a
     # OneDrive Files On-Demand placeholder from a symlink/junction.
     "Win32_Storage_FileSystem",

@@ -15,6 +15,20 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.10.3] - 2026-08-11
+
+### Changed
+
+- Model descriptions that repeat an otherwise valid calendar date now have
+  only that date phrase removed before the complete description policy is
+  revalidated, avoiding needless review while keeping dates out of summaries.
+
+### Fixed
+
+- Windows now owns every `llama-server` child through a kill-on-close Job
+  Object, preventing a crash or forced app termination from leaving a stale
+  model process that can block or confuse the next launch.
+
 ## [0.10.2] — 2026-08-11
 
 ### Changed

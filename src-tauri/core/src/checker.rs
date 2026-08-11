@@ -266,6 +266,18 @@ static RE_MASK_INITIAL: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[A-Z]\.").unwr
 static RE_DESCRIPTION_DATE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?ix)\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}[./-](?:\d{2}|\d{4})\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{2,4}\b|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?[,]?\s+\d{2,4}\b").unwrap()
 });
+/// Calendar dates are forbidden in descriptions, but the small local model
+/// often repeats an otherwise-correct effective date despite the prompt and
+/// retry note. Mark the date first, then remove its adjacent temporal
+/// connector and comma-delimited clause as one unit so the trusted result is
+/// grammatical rather than `effective ,`. The repaired sentence still passes
+/// every description rule below; this only drops text and cannot invent facts.
+static RE_DESCRIPTION_DATE_GLUE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?ix)(?:\s*[,;]\s*)?\b(?:effective(?:\s+as\s+of)?|as\s+of|dated|on|by|before|after|from|until|through|filed|issued|executed|signed)\s+\x{1f}(?:\s*[,;]\s*)?",
+    )
+    .unwrap()
+});
 
 const DATE_LABEL_HINTS: [&str; 15] = [
     "effective date",
@@ -600,7 +612,14 @@ impl Checker {
         // wants register style, so strip that deterministically rather than
         // hoping the prompt sticks. Human-typed descriptions pass untouched.
         let described = if source == Source::Model {
-            strip_document_preamble(&out.description)
+            let described = strip_document_preamble(&out.description);
+            match strip_description_calendar_dates(&described) {
+                Some(repaired) => {
+                    soft_flags.push("DESCRIPTION_DATE_REMOVED".into());
+                    repaired
+                }
+                None => described,
+            }
         } else {
             out.description.clone()
         };
@@ -1920,6 +1939,43 @@ pub fn strip_document_preamble(description: &str) -> String {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => description.to_string(),
     }
+}
+
+/// Remove calendar-date phrases from model prose before validating it.
+///
+/// `None` means no calendar date was present. Returning the repaired text
+/// separately lets the caller record the correction in the manifest. A date
+/// that occupied essential sentence structure can still leave an invalid
+/// result; `validate_description` rejects that result normally rather than
+/// weakening the one-sentence or meaningful-content gates.
+fn strip_description_calendar_dates(description: &str) -> Option<String> {
+    if !RE_DESCRIPTION_DATE.is_match(description) {
+        return None;
+    }
+
+    const DATE_MARKER: &str = "\u{1f}";
+    let marked = RE_DESCRIPTION_DATE
+        .replace_all(description, DATE_MARKER)
+        .to_string();
+    let repaired = RE_DESCRIPTION_DATE_GLUE.replace_all(&marked, " ");
+    if repaired.contains(DATE_MARKER) {
+        return None;
+    }
+    let repaired = RE_MULTISPACE.replace_all(repaired.trim(), " ");
+    let mut repaired = repaired
+        .replace(" ,", ",")
+        .replace(" ;", ";")
+        .replace(" .", ".")
+        .replace("..", ".")
+        .trim_start_matches([',', ';', ' '])
+        .to_string();
+
+    if let Some(first) = repaired.chars().next() {
+        if first.is_ascii_lowercase() {
+            repaired.replace_range(0..first.len_utf8(), &first.to_ascii_uppercase().to_string());
+        }
+    }
+    Some(repaired)
 }
 
 #[cfg(test)]
@@ -3502,6 +3558,60 @@ mod tests {
         too_long.description = format!("{}.", "Word ".repeat(90).trim_end());
         let too_long_err = c.check(&too_long, &h, &[], "2026-07-21", None).unwrap_err();
         assert_eq!(too_long_err.code(), "BAD_DESCRIPTION");
+    }
+
+    #[test]
+    fn model_description_dates_are_removed_then_fully_revalidated() {
+        let c = Checker::new(220);
+        let h = harvest_with(&["2026-07-20"]);
+        let mut o = ok_out();
+        o.subject = "Termination Agreement - John Smith - Vistage Worldwide".into();
+        o.description = "Details a termination agreement between John Smith and Vistage Worldwide, effective June 30, 2026.".into();
+
+        let validated = c.check(&o, &h, &[], "2026-07-01", None).unwrap();
+        assert_eq!(
+            validated.description,
+            "Details a termination agreement between John Smith and Vistage Worldwide."
+        );
+        assert!(validated
+            .soft_flags
+            .contains(&"DESCRIPTION_DATE_REMOVED".to_string()));
+    }
+
+    #[test]
+    fn date_repair_handles_leading_and_embedded_temporal_phrases() {
+        assert_eq!(
+            strip_description_calendar_dates(
+                "Effective June 30, 2026, outlines the termination terms between John Smith and Vistage Worldwide."
+            )
+            .as_deref(),
+            Some("Outlines the termination terms between John Smith and Vistage Worldwide.")
+        );
+        assert_eq!(
+            strip_description_calendar_dates(
+                "Outlines the services Vistage Worldwide will provide to Jane Doe on 2026-09-01 and the related payment obligations."
+            )
+            .as_deref(),
+            Some(
+                "Outlines the services Vistage Worldwide will provide to Jane Doe and the related payment obligations."
+            )
+        );
+        assert_eq!(
+            strip_description_calendar_dates(
+                "Details a termination agreement between John Smith and Vistage Worldwide."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn removing_a_date_does_not_allow_an_empty_description() {
+        let c = Checker::new(160);
+        let h = harvest_with(&["2026-07-20"]);
+        let mut o = ok_out();
+        o.description = "Effective June 30, 2026.".into();
+        let error = c.check(&o, &h, &[], "2026-07-01", None).unwrap_err();
+        assert_eq!(error.code(), "BAD_DESCRIPTION");
     }
 
     #[test]
