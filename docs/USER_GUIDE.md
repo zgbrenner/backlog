@@ -185,7 +185,7 @@ filter by reason and sort oldest or newest first.
   Quarantine for manual handling, but the dismissal cannot currently be
   reversed inside BackLog.
 
-A good subject is two to ten words and says what the document is. A good
+A good subject is two to forty-eight words and says what the document is, starting with the document type when you know it. A good
 description is one sentence. If a correction breaks a rule, BackLog explains
 which rule.
 

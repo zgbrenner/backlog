@@ -264,7 +264,7 @@ impl Default for Config {
             manifest_emit_per_min: 0,
             max_head_pages: 10,
             max_tail_pages: 3,
-            max_filename_len: 120,
+            max_filename_len: 180,
             max_stage_attempts: 3,
             per_file_wall_clock_secs: 180,
             retain_cache: false,

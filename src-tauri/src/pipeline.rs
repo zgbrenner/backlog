@@ -1354,7 +1354,12 @@ impl Pipeline {
         let mut last_code: Option<&'static str> = None;
         // No classifier ran means no type to declare; saying so beats naming a
         // type the sidecar never actually decided on.
-        let doc_type_hint = ev.doc_type.as_deref().unwrap_or("unknown");
+        let doc_type_hint = ev
+            .doc_type
+            .as_deref()
+            .filter(|doc_type| !doc_type.trim().is_empty())
+            .filter(|doc_type| !doc_type.eq_ignore_ascii_case("unknown"));
+        let doc_type_for_prompt = doc_type_hint.unwrap_or("document");
         for attempt in 1..=self.cfg.max_stage_attempts.max(1) {
             let (tier, bundle) = self.rung(attempt, ev);
             // Gates concurrent Tier::Escalation HTTP calls independently of
@@ -1374,13 +1379,20 @@ impl Pipeline {
                 .name_document(
                     tier,
                     &bundle,
-                    doc_type_hint,
+                    doc_type_for_prompt,
                     &ev.language,
                     violation.as_deref(),
                 )
                 .await;
             match out {
-                Ok(o) => match checker.check(&o, &ev.harvest, meta_dates, modified_iso, ettin_date)
+                Ok(o) => match checker.check_with_doc_type(
+                    &o,
+                    &ev.harvest,
+                    meta_dates,
+                    modified_iso,
+                    ettin_date,
+                    Some(doc_type_for_prompt),
+                )
                 {
                     Ok(mut v) => {
                         // Ettin/SLM hard disagreement path: one re-prompt with
@@ -1405,18 +1417,19 @@ impl Pipeline {
                                 .name_document(
                                     tier,
                                     &bundle,
-                                    doc_type_hint,
+                                    doc_type_for_prompt,
                                     &ev.language,
                                     violation.as_deref(),
                                 )
                                 .await;
                             if let Ok(o2) = retry {
-                                if let Ok(v2) = checker.check(
+                                if let Ok(v2) = checker.check_with_doc_type(
                                     &o2,
                                     &ev.harvest,
                                     meta_dates,
                                     modified_iso,
                                     ettin_date,
+                                    Some(doc_type_for_prompt),
                                 ) {
                                     if !v2.soft_flags.iter().any(|f| f.starts_with("SPAN_MISMATCH"))
                                     {
@@ -1454,7 +1467,7 @@ impl Pipeline {
                             // FIRST rejection — the old `attempt >= 2` guard meant
                             // a TooLong on attempt 1 escalated to the 1.7B without
                             // the primary ever hearing the length-specific ask.
-                            violation = Some("subject too long; use at most 6 short words".into());
+                            violation = Some("subject too long; use at most 48 short words".into());
                         }
                     }
                 },
@@ -2272,6 +2285,12 @@ impl Pipeline {
             subject,
             description,
         };
+        let doc_type = job
+            .doc_type
+            .as_deref()
+            .filter(|doc_type| !doc_type.trim().is_empty())
+            .filter(|doc_type| !doc_type.eq_ignore_ascii_case("unknown"))
+            .unwrap_or("document");
         let today = chrono::Utc::now()
             .date_naive()
             .format("%Y-%m-%d")
@@ -2283,7 +2302,14 @@ impl Pipeline {
         // model's rules to the human's answer, which meant the one surface a
         // user is left alone with could refuse the correct name and leave the
         // file with no path forward.
-        let v = checker.check_human(&out, &h, &[date], &today, None)?;
+        let v = checker.check_human_with_doc_type(
+            &out,
+            &h,
+            &[date],
+            &today,
+            None,
+            Some(doc_type),
+        )?;
 
         // ONE value for the file's identity, not two independent
         // reconstructions: the flagged manifest's id, its `original_relpath`,
@@ -4862,7 +4888,7 @@ mod tests {
             "the regression must begin without a masked reservation"
         );
         let quarantined = PathBuf::from(flagged.quarantine_path.as_ref().unwrap());
-        let base_name = "2024-03-05 Acme Corporation Invoice March.pdf";
+        let base_name = "2024-03-05 document Acme Corporation Invoice March.pdf";
         std::fs::write(
             h.pipeline.cfg.local_output_dir.join(base_name),
             b"unrelated operator file",
@@ -4885,7 +4911,7 @@ mod tests {
             .contains("injected correction source-delete failure"));
 
         let pending = h.pipeline.ledger.get(&sha).unwrap().unwrap();
-        let corrected_name = "2024-03-05 Acme Corporation Invoice March (2).pdf";
+        let corrected_name = "2024-03-05 document Acme Corporation Invoice March (2).pdf";
         assert_eq!(pending.state, JobState::Flagged);
         assert_eq!(pending.final_filename.as_deref(), Some(corrected_name));
         assert_eq!(
@@ -5585,11 +5611,17 @@ mod tests {
                 ev.harvest.dates.len(),
                 ev.thin
             );
+            let doc_type = ev
+                .doc_type
+                .as_deref()
+                .filter(|doc_type| !doc_type.trim().is_empty())
+                .filter(|doc_type| !doc_type.eq_ignore_ascii_case("unknown"))
+                .unwrap_or("document");
             match slm
                 .name_document(
                     crate::slm::Tier::Primary,
                     &ev.bundle,
-                    ev.doc_type.as_deref().unwrap_or("unknown"),
+                    doc_type,
                     &ev.language,
                     None,
                 )
@@ -5612,7 +5644,14 @@ mod tests {
                         out.description
                     );
                     eprintln!("  date: {:?} source: {:?}", out.date, out.date_source);
-                    match checker.check(&out, &ev.harvest, &meta_dates, &modified_iso, None) {
+                    match checker.check_with_doc_type(
+                        &out,
+                        &ev.harvest,
+                        &meta_dates,
+                        &modified_iso,
+                        None,
+                        Some(doc_type),
+                    ) {
                         Ok(v) => {
                             eprintln!("  ACCEPTED -> {:?} flags={:?}", v.base_name, v.soft_flags)
                         }
@@ -7432,7 +7471,7 @@ server.serve_forever()
         assert!(job.flag_reason.is_none());
         assert_eq!(
             job.final_filename.as_deref(),
-            Some("2024-03-05 Acme Corporation Invoice March.pdf")
+            Some("2024-03-05 document Acme Corporation Invoice March.pdf")
         );
 
         // The flagged manifest was replaced in place, keeping its identity.

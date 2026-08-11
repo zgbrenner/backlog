@@ -702,7 +702,7 @@ impl SlmLane {
                 // llama.cpp's grammar enforces `maxLength` by refusing to emit
                 // another character, so a cap set *at* the checker's limit stops
                 // the model mid-word and hands the checker a fragment. Measured
-                // with subject capped at 80 and description at 200: every
+                // with subject capped at 300 and description at 320: every
                 // proposal came back at exactly the cap — subjects ending
                 // `"Cobalt Ridge Analyt,"` and `"Taxpayer / "`, descriptions
                 // ending `"The return was "`. The second sentence-fragment then
@@ -733,17 +733,17 @@ impl SlmLane {
                 // cut on 45% of documents is strictly worse than a flagged trim
                 // at a word boundary, which is all `SUBJECT_TRUNCATED` ever was.
                 //
-                // 95 is not a guess: it is the whole filename budget. `compose`
-                // builds `"YYYY-MM-DD " + subject` and needs
-                // `FILENAME_TAIL_RESERVE` on top, so with `max_filename_len` at
-                // 120 the subject can be 120 - 11 - 14 = 95 characters and still
-                // never hit `TooLong`. The word ceiling in `checker.rs` is what
-                // actually constrains the answer now; this is the backstop that
-                // keeps a pathological one composable.
+                // 300 is tuned to prevent silent mid-word truncation while still
+                // fitting the default filename budget. `compose` builds
+                // `"YYYY-MM-DD " + subject` and adds `FILENAME_TAIL_RESERVE` on top;
+                // with `max_filename_len` at 180, the subject can be 300
+                // characters and still never hit `TooLong` before downstream
+                // checks. The word ceiling in `checker.rs` is the trust boundary
+                // that limits verbosity.
                 "subject": {
                     "type": "string",
                     "minLength": 8,
-                    "maxLength": 95
+                    "maxLength": 300
                 },
                 "description": {
                     "type": "string",
@@ -849,11 +849,13 @@ impl SlmLane {
         // said the opposite. Re-run `e2e_real_batch` over the whole sample and
         // compare the party buckets; ten documents will mislead you.
         //
-        // Known noise this leaves behind: `SUBJECT_TRUNCATED` fires on 35 of 40,
-        // because the model writes past eight words and the checker trims at a
-        // word boundary. That is the flagged, clean outcome replacing a silent
-        // mid-word cut, but it is loud. See docs/KNOWN_ISSUES.md item 0h.
-        // No "Today's date" line, deliberately. Nothing downstream consumes it —
+            // Known noise this leaves behind: `SUBJECT_TRUNCATED` fires on many
+            // documents because the model writes past the trusted word ceiling and
+            // the checker trims at a word boundary. That keeps the filename
+            // behavior explicit.
+            // This is the flagged, clean outcome replacing a silent
+            // mid-word cut, but it is loud. See docs/KNOWN_ISSUES.md item 0h.
+            // No "Today's date" line, deliberately. Nothing downstream consumes it —
         // the checker computes its own now() for the future-date ceiling, and the
         // metadata fallback comes from the file's mtime — so the only thing the
         // line ever did was hand a weak model a concrete, salient date string
@@ -893,13 +895,13 @@ impl SlmLane {
              Document language: {language}. Classified type: {doc_type}.\n\
              Do not reveal reasoning. Return only the requested JSON object.\n\
              Rules:\n\
-             - date: extract the date written IN the document body (for example a letter date, filing date, or effective date), formatted YYYY-MM-DD. Never invent a date that is not present in the text. Use none only if the body contains no date at all.\n\
-             - date_source: use document when the date appears in the body text; use metadata only when the body has no date of its own; use none when no date exists.\n\
-             - subject: exactly `<short form> - <party>`, at most 8 words. <short form> is the document's own short identifier: its form number if it shows one, otherwise its document type in a few words, never a full legal title. <party> is the one party the document belongs to, copied exactly from the document text, named once and never omitted.\n\
+              - date: extract the date written IN the document body (for example a letter date, filing date, or effective date), formatted YYYY-MM-DD. Never invent a date that is not present in the text. If there are multiple body dates, choose the date that appears on the first 1500 chars or the one you judge best reflects the effective date. Use none only if the body contains no date at all.\n\
+              - date_source: use document when the date appears in the body text; use metadata only when the body has no date of its own; use none when no date exists.\n\
+             - subject: start with the document type, then the phrase that distinguishes this file from others. At most 48 words.\n\
              - subject: every word of the subject must come from this document. Add nothing else — no tax year, no EIN, no address, no generic word such as Document or Scan, and never the labels Taxpayer or Entity.\n\
-             - description: exactly ONE sentence, 15 to 200 characters, adding useful information beyond the subject. It must end with a single full stop. Do not write a second sentence, and do not stop mid-sentence.\n\
-             - description: begin with the document type or action itself, for example `Shareholder's register transferring 40,000 shares to John Smith.` — never open with `The document`, `This document`, or `The file`.\n\
-             Never invent dates, parties, or facts."
+             - description: exactly ONE sentence, 15 to 320 characters, adding useful information beyond the subject. It must end with a single full stop. Do not write a second sentence, and do not stop mid-sentence. Include what this document is, who is involved, what changed, why this matters, and the key outcome.\n\
+             - description: begin with the document type or action itself, for example `Shareholder's register transferring 40,000 shares to John Smith.` — never open with `The document`, `This document`, `This is`, `This was`, `The file`, `Details`, `Outlines`, `Summary`, or `Contains`. Do not include dates in the description (including month/day/year text).\n\
+              Never invent dates, parties, or facts."
         );
         let notes = naming_notes.trim();
         if !notes.is_empty() {
@@ -1172,13 +1174,13 @@ mod tests {
             "en",
             "invoice",
             "Use short client names.",
-            Some("subject exceeded eight words"),
+            Some("subject has too many words"),
         );
         let notes_at = prompt
             .find("\nOperator preferences (apply them only where they do not conflict with the rules above):\nUse short client names.")
             .expect("operator section present");
         let violation_at = prompt
-            .find("\nA prior proposal was rejected by the deterministic validator: subject exceeded eight words. Correct that exact problem.")
+            .find("\nA prior proposal was rejected by the deterministic validator: subject has too many words. Correct that exact problem.")
             .expect("violation note present");
         assert!(
             notes_at < violation_at,

@@ -66,9 +66,9 @@ of the same rules.
 | `DATE_OUT_OF_RANGE` | The date is before 1800 or more than about 13 months in the future — almost always a misread scan. **Type the date printed on the document.** |
 | `DATE_NOT_IN_EVIDENCE` | BackLog will not put a date on a file unless it can point at that exact date in the document text or in the file's own properties. It could not. This is the anti-hallucination rule. **Open the document, find the date printed on it, and type that.** If the document genuinely has no date, keep the file-modified date BackLog prefilled. If the field is unexpectedly blank, open the original file's **Properties** in File Explorer and enter its **Modified** date before filing. |
 | `BAD_DATE_SOURCE` | BackLog could not record where the date came from. Every date has to be traceable to the document or the file's properties. **Type the date printed on the document.** |
-| `BAD_SUBJECT` | The subject was empty, too short, too long, generic (`Scanned Document`, `New Microsoft Word Document`), contained characters SharePoint forbids, or looked like an identifier rather than a description. **Write a short subject: what this document is, in two to ten words.** |
-| `BAD_DESCRIPTION` | The description was too short, too long, more than one sentence, or just repeated the subject. **Write one sentence saying what this document is and who it is from.** |
-| `TOO_LONG` | Date plus subject plus extension exceeded the filename length limit (120 characters by default). **Write a shorter subject.** |
+| `BAD_SUBJECT` | The subject was empty, too short, too long, generic (`Scanned Document`, `New Microsoft Word Document`), contained characters SharePoint forbids, or looked like an identifier rather than a description. **Write a short subject: what this document is, in two to forty-eight words, and start with the document type when possible.** |
+| `BAD_DESCRIPTION` | The description was too short, too long, more than one sentence, or just repeated the subject. **Write one sentence saying what this document is, who the parties are, what happened, and do not include dates.** |
+| `TOO_LONG` | Date plus subject plus extension exceeded the filename length limit (180 characters by default). **Write a shorter subject.** |
 
 ## 3. Notes on a file that *was* named
 
@@ -94,7 +94,7 @@ These do not stop anything. They ride along on the manifest and land in the
 | `SUBJECT_EXT_STRIPPED` | A file extension (`.pdf`) was removed from the subject. |
 | `SUBJECT_TRAILING_DATE_STRIPPED` | A date or bare year was removed from the END of the subject, because the filename already starts with the validated date and a second copy is only noise. |
 | `SUBJECT_DANGLING_TAIL_STRIPPED` | A clause fragment the model left dangling at the end of the subject ("… shall", "… - Effective") was removed. A trim, never an addition; the full wording is still in the description. |
-| `SUBJECT_TRUNCATED` | The suggested subject ran past the ten-word limit a filename can carry, so it was cut to the first ten words — the form number and the party, which is what a filename is for — and any trailing separator left dangling by the cut was removed too. A trim, never an addition: nothing was invented, and the full wording is still in the file's description. |
+| `SUBJECT_TRUNCATED` | The suggested subject ran past the forty-eight-word limit a filename can carry, so it was cut to the first forty-eight words — the document type, form number and party, which is what a filename is for — and any trailing separator left dangling by the cut was removed too. A trim, never an addition: nothing was invented, and the full wording is still in the file's description. |
 | `DESCRIPTION_TRIMMED_TO_ONE_SENTENCE` | The description ran past one sentence, or was cut off mid-sentence, so it was trimmed back to its first complete sentence. Also a trim, never an addition. |
 | `HUMAN_CORRECTED` | You corrected this file's name by hand in Needs Review. Recorded so the index shows which names were human-chosen. |
 

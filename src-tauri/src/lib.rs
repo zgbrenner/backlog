@@ -1704,9 +1704,128 @@ fn claim_single_instance() -> bool {
     true
 }
 
+#[cfg(windows)]
+extern "system" fn find_backlog_window(hwnd: isize, lparam: isize) -> i32 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetWindowTextLengthW(hwnd: isize) -> i32;
+        fn GetWindowTextW(hwnd: isize, buffer: *mut u16, max_count: i32) -> i32;
+    }
+    let Some(found) = (unsafe { (lparam as *mut Option<isize>).as_mut() }) else {
+        return 0;
+    };
+    if found.is_some() {
+        return 0;
+    }
+    let len = unsafe { GetWindowTextLengthW(hwnd) };
+    if len <= 0 {
+        return 1;
+    }
+    let mut buf = vec![0u16; (len + 1) as usize];
+    let got = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if got <= 0 {
+        return 1;
+    }
+    let title = String::from_utf16_lossy(&buf[..got as usize]);
+    if title.to_lowercase().contains("backlog") {
+        *found = Some(hwnd);
+        return 0;
+    }
+    1
+}
+
+#[cfg(windows)]
+fn focus_existing_backlog_window() {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn FindWindowW(class_name: *const u16, window_name: *const u16) -> isize;
+        fn EnumWindows(enum_proc: Option<extern "system" fn(isize, isize) -> i32>, lparam: isize) -> i32;
+        fn IsIconic(hwnd: isize) -> i32;
+        fn ShowWindow(hwnd: isize, cmd_show: i32) -> i32;
+        fn SetWindowPos(
+            hwnd: isize,
+            hWndInsertAfter: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+        fn AllowSetForegroundWindow(dw_process_id: u32) -> i32;
+        fn SetForegroundWindow(hwnd: isize) -> i32;
+    }
+    const SW_RESTORE: i32 = 9;
+    const SW_SHOW: i32 = 5;
+    const RETRY_ATTEMPTS: usize = 12;
+    const RETRY_WAIT: Duration = Duration::from_millis(100);
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_SHOWWINDOW: u32 = 0x0040;
+    const ASFW_ANY: u32 = u32::MAX;
+    const HWND_TOP: isize = -1;
+
+    let title: Vec<u16> = "BackLog"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: pointers are valid for the duration of the call and Win32 keeps
+    // the returned HWND stable for the UI thread that owns the window.
+    let mut hwnd = 0;
+    for _ in 0..RETRY_ATTEMPTS {
+        hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+        if hwnd == 0 {
+            let mut fallback: Option<isize> = None;
+            // SAFETY: callback follows the documented API shape and never
+            // dereferences user data after it is set or out of bounds.
+            let _ = unsafe {
+                EnumWindows(
+                    Some(find_backlog_window),
+                    &mut fallback as *mut Option<isize> as isize,
+                )
+            };
+            if let Some(found) = fallback {
+                hwnd = found;
+            }
+        }
+        if hwnd != 0 {
+            break;
+        }
+        std::thread::sleep(RETRY_WAIT);
+    }
+    if hwnd == 0 {
+        return;
+    }
+
+    for _ in 0..RETRY_ATTEMPTS {
+        let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+        if unsafe { IsIconic(hwnd) } != 0 {
+            let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+        } else {
+            let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+        }
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW,
+            )
+        };
+        if unsafe { SetForegroundWindow(hwnd) } != 0 {
+            return;
+        }
+        std::thread::sleep(RETRY_WAIT);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     if !claim_single_instance() {
+        #[cfg(windows)]
+        focus_existing_backlog_window();
         return;
     }
     let notice: Arc<Mutex<Option<StartupNotice>>> = Arc::new(Mutex::new(None));

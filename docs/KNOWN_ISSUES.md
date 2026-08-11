@@ -71,7 +71,7 @@ run because widening evidence can also increase model latency and ambiguity.
 
 ## 5. `SUBJECT_TRUNCATED` is noisy
 
-The checker safely trims subjects over ten words, but the model often writes
+The checker safely trims subjects over forty-eight words, but the model often writes
 past that limit, so the flag appears frequently and is less useful for
 triage. The shipped filename remains valid; this is an observability problem.
 Changing the word limit or suppressing the flag for complete
@@ -263,3 +263,4 @@ see `docs/SIZING.md`.
 corpus either (`date_source` was 29/30 in all four measured configurations).
 That is a saturated corpus rather than evidence of no effect, and it is why a
 stratified hard corpus is the blocking next step.
+
