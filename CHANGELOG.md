@@ -15,6 +15,20 @@ field of `latest.json` should quote it.
 > because the pre-0.2.0 history was squashed. Treat it as an accurate summary
 > of *what the code does now*, not as a commit-by-commit record.
 
+## [0.10.4] - 2026-08-11
+
+### Changed
+
+- Description cleanup also removes grounded payment-due date clauses before
+  revalidation, while incomplete clauses still fail closed to Needs Review.
+- Suggested subjects now reject a party or matter word when it contradicts a
+  unique adjacent phrase in the document evidence.
+
+### Fixed
+
+- Descriptions ending in a dangling auxiliary such as `was.` can no longer be
+  filed as complete sentences.
+
 ## [0.10.3] - 2026-08-11
 
 ### Changed
