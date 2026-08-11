@@ -313,7 +313,7 @@ const REASON_COPY: Record<string, { title: string; why: string; next: string }> 
     title: "The one-sentence description was not usable",
     why: "The description was too short, too long, more than one sentence, or just repeated the "
       + "subject.",
-    next: "Write one sentence below saying what this document is and who it is from.",
+    next: "Write one sentence saying what this document is, who the parties are, and what changed.",
   },
   TOO_LONG: {
     title: "The name came out too long",
@@ -384,8 +384,8 @@ const UNDO_SECONDS = 10;
  *  authority: for a HUMAN it deliberately does not enforce the word count
  *  (checker.rs gates that on Source::Model), so these counters advise and only
  *  the genuinely impossible cases disable Approve. */
-const SUBJECT_WORDS = [2, 10] as const;
-const DESCRIPTION_CHARS = [15, 200] as const;
+const SUBJECT_WORDS = [2, 48] as const;
+const DESCRIPTION_CHARS = [15, 320] as const;
 
 // ---------------------------------------------------------------------------
 // Small DOM helpers
@@ -468,7 +468,8 @@ function friendlyError(raw: string): { message: string; raw: string | null } {
       "That subject cannot be used in a file name. Try a few plain words describing the document."],
     [/^description invalid:/i,
       "The description has to be one sentence, ending in a full stop, "
-      + `between ${DESCRIPTION_CHARS[0]} and ${DESCRIPTION_CHARS[1]} characters.`],
+      + `between ${DESCRIPTION_CHARS[0]} and ${DESCRIPTION_CHARS[1]} characters. `
+      + "It should state what this document is and name the parties before this document."],
     [/composed filename too long/i,
       "Date plus subject is too long for a file name. Try a shorter subject."],
     [/no longer flagged|already moved on|already been dismissed/i,
@@ -1844,7 +1845,8 @@ function buildReviewCard(job: Job): ReviewCard {
             <span class="lbl">Dates found in the document:</span>
           </div>
           <label class="wide">One-sentence description
-            <input name="description" placeholder="One sentence, ending in a full stop."
+            <input name="description"
+              placeholder="One sentence, what this is, who it is between, and what changed. No dates."
               autocomplete="off" aria-describedby="c-desc-${short}">
             <span class="counter" id="c-desc-${short}"></span>
           </label>
