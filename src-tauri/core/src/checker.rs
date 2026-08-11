@@ -1615,8 +1615,7 @@ fn description_has_dangling_tail(description: &str) -> bool {
     else {
         return false;
     };
-    DANGLING_TAIL_WORDS.contains(&last.as_str())
-        || DANGLING_PAIR_HEADS.contains(&last.as_str())
+    DANGLING_TAIL_WORDS.contains(&last.as_str()) || DANGLING_PAIR_HEADS.contains(&last.as_str())
 }
 
 /// Does the proposed subject actually come from the document?
