@@ -1610,8 +1610,7 @@ fn description_has_dangling_tail(description: &str) -> bool {
     let without_terminal = description.trim_end_matches(['.', '!', '?', '。', '！', '？']);
     let Some(last) = without_terminal
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .next_back()
+        .rfind(|word| !word.is_empty())
         .map(str::to_lowercase)
     else {
         return false;
